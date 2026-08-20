@@ -1,0 +1,24 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.env
+.env.*
+!.env.example
+config.yaml
+config.local.yaml
+*.local.yaml
+/state.json
+/state.json.lock
+/state.json.tmp-*
+/admin-ui.token
+/attachments/
+*.log
+.DS_Store
+
+# Machine-local operator workbench and AI client state. Public contributor
+# guidance lives in the repository-root AGENTS.md and CLAUDE.md instead.
+/.showtalk-private/
+/.agents/
+/.claude/
+/USER_TODO.md
