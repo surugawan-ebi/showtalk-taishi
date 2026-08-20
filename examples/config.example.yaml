@@ -1,0 +1,134 @@
+# ShowTalk Taishi configuration example.
+#
+# Environment references are resolved at startup. Keep tokens, local workspace
+# paths, and channel IDs outside this file so the example is safe to commit.
+
+version: 1
+
+gateway:
+  state_file: "${TAISHI_STATE_FILE}"
+  # Optional. Defaults to an attachments directory next to state_file.
+  # attachment_dir: "${TAISHI_ATTACHMENT_DIR}"
+  agent_message_max_hops: 4
+  # Local management UI. It always listens on 127.0.0.1 and is never exposed
+  # to the LAN. Open the localhost URL printed at Gateway startup; the first
+  # loopback visit establishes an owner-only HttpOnly browser session.
+  admin_ui:
+    enabled: true
+    port: 4781
+
+slack:
+  socket_mode: true
+  app_token: "${SLACK_APP_TOKEN}"
+  bot_token: "${SLACK_BOT_TOKEN}"
+  approver_user_ids:
+    - "${SLACK_APPROVER_USER_ID}"
+
+adapters:
+  codex:
+    type: codex-app-server
+    command: "${CODEX_COMMAND}"
+    transport: stdio
+    # Optional: low, medium, high, xhigh, etc. Omit to use Codex defaults.
+    # reasoning_effort: medium
+    # These are also optional. Omit them to inherit the Codex App Server/thread
+    # settings used by Codex App and CLI; set them only for a Taishi override.
+    # approval_policy: on-request
+    # approvals_reviewer: auto_review
+    # sandbox: workspace-write
+    # Parent-process credentials are denied by default. Deliberately name any
+    # additional build/runtime variable this Koe really needs.
+    env_passthrough: []
+
+agents:
+  implementer:
+    adapter: codex
+    # Optional Koe-specific overrides. The localhost admin UI can update these
+    # for the next turn without restarting the Gateway.
+    # model: gpt-5.3-codex
+    # reasoning_effort: medium
+    # Optional existing backend task/session to make canonical at startup.
+    # Valid only when conversation_scope is channel (the default).
+    # adapter_session_id: "019f0000-0000-7000-8000-000000000000"
+    workspace:
+      path: "${IMPLEMENTER_WORKSPACE}"
+    slack:
+      channel_id: "${SLACK_CHANNEL_IMPLEMENTER}"
+      # Optional generic session-mapping mode: channel (default) shares one
+      # backend thread across the channel; slack_thread maps each Slack root to
+      # a separate backend thread. Replies under one root stay together.
+      conversation_scope: channel
+      # Optional short human-facing alias for agent.list/agent.send. Call names,
+      # Canonical IDs and call names must be globally unique after Unicode NFKC
+      # + lowercase normalization and cannot collide with each other.
+      call_name: "実装係"
+      # Optional per-channel message identity. icon_url must be an HTTPS image
+      # Slack can fetch; use icon_emoji instead when a Slack emoji is preferred.
+      display_name: "Implementer Koe"
+      icon_emoji: ":hammer_and_wrench:"
+    # Explicit outbound allowlist. Each target is another persistent Koe whose
+    # Slack channel will show the visit; this is not a Codex internal sub-agent.
+    consultations:
+      reviewer:
+        scope: |-
+          Review implementation changes for correctness, maintainability,
+          compatibility, error handling, and tests. Report evidence-based
+          findings without modifying the implementation.
+    role: |
+      You are the implementation Koe (voice) in ShowTalk Taishi.
+      Prefer the smallest change that satisfies the requested behavior.
+      Run relevant checks and report remaining risks clearly.
+
+  # Internal reviewer pattern: use the product workspace and channel scope so
+  # the reviewer can inspect the product and retain one channel-wide context.
+  reviewer:
+    adapter: codex
+    workspace:
+      path: "${IMPLEMENTER_WORKSPACE}"
+    slack:
+      channel_id: "${SLACK_CHANNEL_REVIEWER}"
+      conversation_scope: channel
+      call_name: "レビュー係"
+      display_name: "Reviewer Koe"
+      # icon_url: "https://cdn.example.org/taishi-reviewer.png"
+      # Trusted operator instructions for turns started through ShowTalk only.
+      # Direct Codex App turns on the same persistent thread do not receive it.
+      persona: |
+        You are a strict adversarial reviewer in ShowTalk.
+        Lead with concrete findings, separate blocking defects from optional
+        improvements, and report PASS when the evidence supports it.
+    role: |
+      You are the persistent coding agent for the reviewer workspace.
+      Preserve continuity with the existing backend thread and repository context.
+
+  # External/blind reviewer pattern: instead use a fixed reviewer-hub workspace,
+  # set conversation_scope to slack_thread, and omit adapter_session_id. Each
+  # Slack root then gets a separate backend thread; only the explicitly delegated
+  # information plus fixed role/project sources in that hub are available.
+
+permissions:
+  defaults:
+    slack:
+      own_channel:
+        read: allow
+        write: allow
+      agent_channels:
+        read: allow
+        write: approval
+      other_channels:
+        read: deny
+        write: deny
+    agents:
+      # Applies only within each source Koe's consultations allowlist. It does
+      # not permit sends to unregistered targets or enable all-to-all routing.
+      send: allow
+
+  agents:
+    implementer:
+      slack:
+        agent_channels:
+          write: allow
+    reviewer:
+      slack:
+        agent_channels:
+          write: approval

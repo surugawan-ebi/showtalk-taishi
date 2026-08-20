@@ -1,0 +1,60 @@
+{
+  "name": "showtalk-taishi",
+  "version": "0.0.1",
+  "private": true,
+  "packageManager": "npm@11.16.0",
+  "description": "A self-hosted Slack switchboard for local AI coding agents.",
+  "keywords": [
+    "slack",
+    "codex",
+    "mcp",
+    "coding-agent",
+    "multi-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/surugawan-ebi/showtalk-taishi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/surugawan-ebi/showtalk-taishi/issues"
+  },
+  "homepage": "https://github.com/surugawan-ebi/showtalk-taishi#readme",
+  "type": "module",
+  "bin": {
+    "taishi": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "slack/manifest.yaml",
+    "examples/config.example.yaml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "node --import tsx src/cli.ts start",
+    "doctor": "node --import tsx src/cli.ts doctor",
+    "smoke:codex-mcp": "node --import tsx scripts/smoke-codex-mcp.ts",
+    "smoke:codex-agent-send": "node --import tsx scripts/smoke-codex-agent-send.ts",
+    "smoke:codex-resume": "node --import tsx scripts/smoke-codex-resume.ts",
+    "smoke:codex": "npm run smoke:codex-mcp && npm run smoke:codex-agent-send && npm run smoke:codex-resume",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "verify": "npm run check && npm test && npm run build && npm pack --dry-run --json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@slack/bolt": "^5.0.0",
+    "@slack/types": "^3.0.0",
+    "@slack/web-api": "^8.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  }
+}
