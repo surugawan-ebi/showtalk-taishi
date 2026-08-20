@@ -167,7 +167,6 @@ export class CodexAppServerClient {
         this.#rememberTimedOutRequest(id);
         reject(new Error(`Codex app-server request timed out: ${method}`));
       }, this.#options.requestTimeoutMs);
-      timeout.unref();
       this.#pending.set(id, { resolve, reject, timeout });
     });
     try {
@@ -414,7 +413,6 @@ function waitForChildExit(
       child.off("exit", onExit);
       resolve(false);
     }, timeoutMs);
-    timeout.unref();
     child.once("exit", onExit);
   });
 }

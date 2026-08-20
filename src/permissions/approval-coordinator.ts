@@ -142,7 +142,6 @@ export class PermissionApprovalCoordinator {
       resolveDecision = resolve;
     });
     const timer = setTimeout(() => this.#settle(requestId, "deny"), this.#timeoutMs);
-    timer.unref();
     const abortListener =
       signal === undefined ? undefined : () => this.#settle(requestId, "deny");
     this.#pending.set(requestId, {
