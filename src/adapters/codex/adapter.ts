@@ -6,8 +6,10 @@ import type {
   AgentAdapter,
   AgentApproval,
   AgentCapabilities,
+  AgentChoiceAnswer,
   AgentDefinition,
   AgentEvent,
+  AgentGitApprovalInputResponse,
   AgentStatus,
   AgentUserInputResponse,
   CreateSessionRequest,
@@ -15,19 +17,23 @@ import type {
   ResumeSessionRequest,
   SendMessageRequest,
 } from "../../core/index.js";
-import type {
-  ApprovalsReviewer,
-  CodexThread,
-  CodexTurn,
-  CommandApprovalDecision,
-  FileChangeApprovalDecision,
-  PermissionsApprovalResponse,
-  RpcError,
-  RpcId,
-  ToolRequestUserInputResponse,
-  ThreadResumeParams,
-  ThreadStartParams,
-  TurnStartParams,
+import {
+  CodexRpcError,
+  type ApprovalsReviewer,
+  type CodexAdditionalContextEntry,
+  type CodexThread,
+  type CodexTurn,
+  type CommandApprovalDecision,
+  type FileChangeApprovalDecision,
+  type PermissionsApprovalResponse,
+  type RpcError,
+  type RpcId,
+  type ToolRequestUserInputResponse,
+  type ThreadResumeParams,
+  type ThreadStartParams,
+  type ThreadTurnsListParams,
+  type ThreadTurnsListResponse,
+  type TurnStartParams,
 } from "./protocol.js";
 import type { ServerRequestEvent } from "./app-server-client.js";
 import {
@@ -36,6 +42,11 @@ import {
   validateWorkspaceGitPlanQuestion,
 } from "./workspace-git-approval.js";
 import type { WorkspaceGitApprovalPlan } from "../../core/index.js";
+import {
+  looksLikeWorkspaceGitApproval,
+  validateOrdinaryChoiceRequest,
+  type ValidatedChoiceQuestion,
+} from "./structured-input.js";
 
 const MAX_AGENT_MESSAGE_CHARS = 128_000;
 const MAX_EVENT_JSON_CHARS = 64_000;
@@ -43,6 +54,10 @@ const MAX_QUEUED_EVENTS = 256;
 const MAX_QUEUED_DELTA_CHARS = 128_000;
 const MAX_COALESCED_DELTA_CHARS = 32_000;
 const SHOWTALK_SLACK_PERSONA_CONTEXT_KEY = "showtalk_taishi.slack_persona";
+const SHOWTALK_PAGINATED_THREAD_CONTEXT_KEY =
+  "showtalk_taishi.paginated_thread_compatibility";
+const SHOWTALK_GIT_APPROVAL_CONTINUATION_CONTEXT_KEY =
+  "showtalk_taishi.git_approval_continuation";
 const SHOWTALK_KOE_CONSULTATION_INSTRUCTIONS = [
   "ShowTalk Taishi Koe consultation rules:",
   "- Codex internal subagents run inside the current Codex task. They are not Slack channels or ShowTalk Koe.",
@@ -56,6 +71,10 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "ShowTalk Taishi Git approval routing rules:",
   "- A Git approval belongs to the Koe that called workspace-git prepare_* and to the Slack thread that started that same turn.",
   "- When workspace-git returns awaiting_human_approval, immediately call request_user_input in that same turn with exactly two options named `承認して実行` and `拒否・保留`.",
+  "- A `承認して実行` answer returned from that exact request_user_input is a fresh authenticated human decision. It is not the assistant approving its own plan, even though App Server resumes the same turn after the human interaction.",
+  "- After `承認して実行`, continue the resumed turn instead of ending with prose or deferring execution to another user message. Re-read the exact workspace-git operation status, record and verify approval through workspace-git's private boundary, then call the matching execute_approved_* tool exactly once when operation ID, full plan hash, worktree, HEAD/snapshot or PR state, scope, and expiry still match.",
+  "- One App Server turn has a pre-approval phase and a post-approval phase separated by the blocking request_user_input. A generic rule that forbids autonomous prepare-and-execute in one turn applies to the pre-approval phase; it does not require another Slack message after the bound human response. The post-approval phase may execute only the exact approved plan.",
+  "- If the answer is `拒否・保留`, or revalidation is stale, mismatched, expired, rejected, already executed, or inconclusive, do not approve or execute and report the exact blocker.",
   "- Never use agent.send, slack.post, or slack.reply to ask another Koe or channel to display, relay, approve, or reconstruct a Git approval.",
   "- If the exact plan is unbound, expired, or invalidated by a Gateway restart, inspect status and re-run the matching workspace-git prepare_* operation in this Koe's current turn before requesting approval. Never reconstruct authority from IDs or prose.",
   "- get_git_operation_status never binds an approval plan, even when it reports awaiting_human_approval. Only a fresh prepare_* completion observed in this same turn can be approved.",
@@ -66,7 +85,11 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
 export interface CodexAppServer {
   startThread(params: ThreadStartParams): Promise<CodexThread>;
   resumeThread(params: ThreadResumeParams): Promise<CodexThread>;
-  readThread(threadId: string): Promise<CodexThread>;
+  readThread(threadId: string, includeTurns?: boolean): Promise<CodexThread>;
+  listThreadTurns(
+    threadId: string,
+    params?: ThreadTurnsListParams,
+  ): Promise<ThreadTurnsListResponse>;
   unsubscribeThread(threadId: string): Promise<void>;
   startTurn(params: TurnStartParams): Promise<CodexTurn>;
   interruptTurn(threadId: string, turnId: string): Promise<void>;
@@ -90,13 +113,16 @@ interface PendingApproval {
     | "item/permissions/requestApproval";
   readonly sessionId: string;
   readonly requestedPermissions?: Readonly<Record<string, JsonValue>>;
+  readonly availableDecisions?: readonly AgentApproval["decision"][];
   readonly expiresAt: number;
   readonly expirationTimer: NodeJS.Timeout;
 }
 
-interface PendingUserInput {
+interface PendingGitUserInput {
+  readonly kind: "git_approval";
   readonly rpcId: RpcId;
   readonly sessionId: string;
+  readonly turnId: string;
   readonly questionId: string;
   readonly approveLabel: "承認して実行";
   readonly rejectLabel: "拒否・保留";
@@ -105,12 +131,36 @@ interface PendingUserInput {
   readonly expirationTimer: NodeJS.Timeout;
 }
 
+interface ApprovedGitExecutionWatch {
+  readonly plan: WorkspaceGitApprovalPlan;
+  readonly executeStartedItemIds: Set<string>;
+  readonly executeCompletedItemIds: Set<string>;
+  readonly executeFailedItemIds: Set<string>;
+  readonly operationStatuses: Set<string>;
+  continuationStarted: boolean;
+  duplicateExecutionReported: boolean;
+}
+
+interface PendingChoiceUserInput {
+  readonly kind: "choice";
+  readonly rpcId: RpcId;
+  readonly sessionId: string;
+  readonly questions: readonly ValidatedChoiceQuestion[];
+  readonly answers: Map<string, readonly string[]>;
+  currentQuestionIndex: number;
+  readonly expiresAt: number;
+  readonly expirationTimer: NodeJS.Timeout;
+}
+
+type PendingUserInput = PendingGitUserInput | PendingChoiceUserInput;
+
 interface PendingUserInputBinding {
   readonly rpcId: RpcId;
   readonly serverRequest: ServerRequestEvent;
   readonly sessionId: string;
   readonly turnId: string;
   readonly queue: AsyncEventQueue;
+  readonly receivedAt: number;
   readonly expirationTimer: NodeJS.Timeout;
 }
 
@@ -126,6 +176,8 @@ export interface CodexAdapterOptions {
   /** Same-turn transport-ordering grace for requestUserInput before prepare completion. */
   gitPlanBindingGraceMs?: number;
   terminalWatchdogMs?: number;
+  /** Maximum consecutive failures to reconcile the exact owned turn. */
+  terminalWatchdogMaxRetries?: number;
   ambiguousStartRetryMs?: number;
   externalTurnPollMs?: number;
   externalTurnWaitMs?: number;
@@ -161,6 +213,7 @@ export class CodexAdapter implements AgentAdapter {
     approvalTimeoutMs: number;
     gitPlanBindingGraceMs: number;
     terminalWatchdogMs: number;
+    terminalWatchdogMaxRetries: number;
     ambiguousStartRetryMs: number;
     externalTurnPollMs: number;
     externalTurnWaitMs: number;
@@ -177,11 +230,21 @@ export class CodexAdapter implements AgentAdapter {
     readonly WorkspaceGitApprovalPlan[]
   >();
   readonly #gitApprovalRecoveryTurns = new Set<string>();
+  readonly #approvedGitExecutionBySession = new Map<
+    string,
+    ApprovedGitExecutionWatch
+  >();
   readonly #activeQueues = new Map<string, AsyncEventQueue>();
+  readonly #deferredServerRequestsBySession = new Map<
+    string,
+    ServerRequestEvent[]
+  >();
   readonly #startedItems = new Map<string, Record<string, unknown>>();
   readonly #loadedSessions = new Set<string>();
   readonly #resumeParamsBySession = new Map<string, ThreadResumeParams>();
   readonly #slackPersonasBySession = new Map<string, string>();
+  readonly #legacyPaginatedCompatibilitySessions = new Set<string>();
+  #turnPaginationSupported: boolean | undefined;
   #transportFailed = false;
 
   constructor(client: CodexAppServer, options: CodexAdapterOptions = {}) {
@@ -205,6 +268,7 @@ export class CodexAdapter implements AgentAdapter {
       approvalTimeoutMs: options.approvalTimeoutMs ?? 30 * 60 * 1_000,
       gitPlanBindingGraceMs: options.gitPlanBindingGraceMs ?? 2_000,
       terminalWatchdogMs: options.terminalWatchdogMs ?? 5 * 60 * 1_000,
+      terminalWatchdogMaxRetries: options.terminalWatchdogMaxRetries ?? 4,
       ambiguousStartRetryMs: options.ambiguousStartRetryMs ?? 100,
       externalTurnPollMs: options.externalTurnPollMs ?? 1_000,
       externalTurnWaitMs: options.externalTurnWaitMs ?? 30 * 60 * 1_000,
@@ -213,6 +277,8 @@ export class CodexAdapter implements AgentAdapter {
       this.#options.approvalTimeoutMs < 1 ||
       this.#options.gitPlanBindingGraceMs < 1 ||
       this.#options.terminalWatchdogMs < 1 ||
+      !Number.isSafeInteger(this.#options.terminalWatchdogMaxRetries) ||
+      this.#options.terminalWatchdogMaxRetries < 1 ||
       this.#options.ambiguousStartRetryMs < 1 ||
       this.#options.externalTurnPollMs < 1 ||
       this.#options.externalTurnWaitMs < 1
@@ -237,6 +303,15 @@ export class CodexAdapter implements AgentAdapter {
     } else {
       this.#options.reasoningEffort = reasoningEffort;
     }
+  }
+
+  /** Ends process-local streams during an intentional Gateway shutdown. */
+  shutdown(): void {
+    if (this.#transportFailed) return;
+    this.#failActiveStreams(
+      new Error("ShowTalk Taishi is shutting down the Codex adapter"),
+      true,
+    );
   }
 
   async createSession(request: CreateSessionRequest): Promise<AdapterSession> {
@@ -271,7 +346,7 @@ export class CodexAdapter implements AgentAdapter {
 
   async resumeSession(request: ResumeSessionRequest): Promise<AdapterSession> {
     const params = this.#buildResumeParams(request.agent, request.adapterSessionId);
-    const thread = await this.#client.resumeThread(params);
+    const thread = await this.#resumeThreadWithCompatibility(params);
     this.#statuses.set(thread.id, "idle");
     this.#loadedSessions.add(thread.id);
     this.#resumeParamsBySession.set(thread.id, params);
@@ -302,6 +377,12 @@ export class CodexAdapter implements AgentAdapter {
     this.#activeQueues.set(session.id, queue);
     let terminal = false;
     let failed = false;
+    let ownedTurnId: string | undefined;
+    let clientUserMessageId = randomUUID();
+    const deferredNotifications: Array<{
+      readonly method: string;
+      readonly params: unknown;
+    }> = [];
     let reconciliationFailures = 0;
     let terminalWatchdog: NodeJS.Timeout | undefined;
     const clearTerminalWatchdog = () => {
@@ -311,7 +392,7 @@ export class CodexAdapter implements AgentAdapter {
     const scheduleTerminalWatchdog = (delayMs = this.#options.terminalWatchdogMs) => {
       clearTerminalWatchdog();
       terminalWatchdog = setTimeout(() => {
-        void this.#reconcileTurnStatus(session.id, queue).then((result) => {
+        void this.#reconcileTurnStatus(session.id, queue).then(async (result) => {
           if (result === "terminal") {
             this.#rejectPendingUserInputBindings(
               session.id,
@@ -323,9 +404,51 @@ export class CodexAdapter implements AgentAdapter {
             this.#removePendingApprovals(session.id);
             this.#removePendingUserInputs(session.id);
             this.#removeWorkspaceGitPlans(session.id);
+            this.#removeGitApprovalRecoveryTurns(session.id);
             this.#removeStartedItems(session.id);
           } else if (!terminal && result === "retry") {
             reconciliationFailures += 1;
+            if (
+              reconciliationFailures >=
+              this.#options.terminalWatchdogMaxRetries
+            ) {
+              const turnId = this.#activeTurns.get(session.id);
+              let interrupted = false;
+              if (turnId !== undefined) {
+                try {
+                  await this.#client.interruptTurn(session.id, turnId);
+                  interrupted = true;
+                } catch {
+                  // Closing the transport is the fail-closed fallback below.
+                }
+              }
+              if (!interrupted) {
+                this.#transportFailed = true;
+                await this.#client.close().catch(() => undefined);
+              }
+              terminal = true;
+              this.#activeTurns.delete(session.id);
+              this.#runningSessions.delete(session.id);
+              this.#statuses.set(session.id, "failed");
+              this.#rejectPendingUserInputBindings(
+                session.id,
+                queue,
+                "The Codex turn could not be reconciled with thread/read",
+              );
+              this.#removePendingApprovals(session.id);
+              this.#removePendingUserInputs(session.id);
+              this.#removeWorkspaceGitPlans(session.id);
+              this.#removeGitApprovalRecoveryTurns(session.id);
+              this.#removeStartedItems(session.id);
+              queue.push({
+                type: "error",
+                code: "CODEX_TURN_RECONCILIATION_FAILED",
+                message: "Codex stopped reporting the exact ShowTalk-owned turn",
+              });
+              queue.push({ type: "status.changed", status: "failed" });
+              queue.close();
+              return;
+            }
             scheduleTerminalWatchdog(
               Math.min(
                 this.#options.terminalWatchdogMs * 2 ** reconciliationFailures,
@@ -339,8 +462,40 @@ export class CodexAdapter implements AgentAdapter {
         });
       }, delayMs);
     };
-    const unsubscribeNotification = this.#client.onNotification((method, params) => {
+    const claimOwnedTurn = (turnId: string): void => {
+      if (ownedTurnId !== undefined && ownedTurnId !== turnId) {
+        throw new Error(
+          `Codex turn ownership conflict: ${ownedTurnId} != ${turnId}`,
+        );
+      }
+      ownedTurnId = turnId;
+      this.#activeTurns.set(session.id, turnId);
+      this.#flushDeferredServerRequests(session.id, turnId);
+    };
+    const processNotification = (method: string, params: unknown) => {
       if (!belongsToThread(params, session.id)) return;
+      if (isTurnScopedNotification(method)) {
+        const notifiedTurnId = notificationTurnId(params);
+        if (notifiedTurnId === undefined) return;
+        if (ownedTurnId === undefined) {
+          if (notificationClientUserMessageId(params) === clientUserMessageId) {
+            try {
+              claimOwnedTurn(notifiedTurnId);
+            } catch (error) {
+              queue.fail(error);
+              return;
+            }
+          } else {
+            if (deferredNotifications.length >= 512) {
+              queue.fail(new Error("Codex emitted too many uncorrelated turn notifications"));
+              return;
+            }
+            deferredNotifications.push({ method, params });
+            return;
+          }
+        }
+        if (notifiedTurnId !== ownedTurnId) return;
+      }
       const notification = asRecord(params);
       if (
         method === "serverRequest/resolved" &&
@@ -352,7 +507,9 @@ export class CodexAdapter implements AgentAdapter {
       const item = asRecord(notification?.item);
       if (method === "item/started" && typeof item?.id === "string") {
         this.#startedItems.set(itemKey(session.id, item.id), item);
+        this.#observeApprovedGitExecution(session.id, item, queue);
       } else if (method === "item/completed" && typeof item?.id === "string") {
+        this.#observeApprovedGitExecution(session.id, item, queue);
         const startedItem = this.#startedItems.get(itemKey(session.id, item.id));
         try {
           const capture = captureWorkspaceGitPlan(params, startedItem);
@@ -378,23 +535,96 @@ export class CodexAdapter implements AgentAdapter {
         this.#startedItems.delete(itemKey(session.id, item.id));
       }
       const turn = asRecord(notification?.turn);
-      if (method === "turn/started" && typeof turn?.id === "string") {
-        this.#activeTurns.set(session.id, turn.id);
-      }
       const event = normalizeNotification(method, params);
-      if (event !== undefined) queue.push(event);
+      if (method !== "turn/completed" && event !== undefined) queue.push(event);
       if (method === "turn/completed") {
         this.#rejectPendingUserInputBindings(
           session.id,
           queue,
           "The Codex turn completed before its workspace-git plan could be bound",
         );
-        terminal = true;
         clearTerminalWatchdog();
         this.#activeTurns.delete(session.id);
-        this.#runningSessions.delete(session.id);
         const status = turnStatus(params);
+        const approvedGit = this.#approvedGitExecutionBySession.get(session.id);
+        if (approvedGit !== undefined) {
+          this.#observeApprovedGitTurnSnapshot(approvedGit, turn, queue);
+        }
+        const executeCompleted =
+          approvedGit !== undefined &&
+          approvedGit.executeCompletedItemIds.size > 0;
+        const executeFailedOrIncomplete =
+          approvedGit !== undefined &&
+          (approvedGit.executeFailedItemIds.size > 0 ||
+            [...approvedGit.executeStartedItemIds].some(
+              (itemId) =>
+                !approvedGit.executeCompletedItemIds.has(itemId) &&
+                !approvedGit.executeFailedItemIds.has(itemId),
+            ));
+        const operationTerminal =
+          approvedGit !== undefined &&
+          [...approvedGit.operationStatuses].some(isTerminalGitOperationStatus);
+        const finalItemsComplete = hasFullTurnItems(turn);
+        if (
+          status === "idle" &&
+          approvedGit !== undefined &&
+          !executeCompleted &&
+          !executeFailedOrIncomplete &&
+          !operationTerminal &&
+          finalItemsComplete &&
+          !approvedGit.continuationStarted
+        ) {
+          approvedGit.continuationStarted = true;
+          ownedTurnId = undefined;
+          this.#statuses.set(session.id, "starting");
+          this.#removePendingApprovals(session.id);
+          this.#removePendingUserInputs(session.id);
+          this.#removeWorkspaceGitPlans(session.id);
+          this.#removeGitApprovalRecoveryTurns(session.id);
+          this.#removeStartedItems(session.id);
+          queue.push({ type: "status.changed", status: "starting" });
+          startApprovedGitContinuation(approvedGit);
+          return;
+        }
+        if (approvedGit !== undefined && executeFailedOrIncomplete) {
+          queue.push({
+            type: "error",
+            code: "GIT_APPROVAL_EXECUTION_INCOMPLETE",
+            message:
+              "承認済みGit実行が失敗したか、完了状態を確認できませんでした。" +
+              "同じoperationは自動再実行していません。",
+          });
+        } else if (
+          approvedGit !== undefined &&
+          !executeCompleted &&
+          !operationTerminal &&
+          !finalItemsComplete
+        ) {
+          queue.push({
+            type: "error",
+            code: "GIT_APPROVAL_FINAL_STATE_INCOMPLETE",
+            message:
+              "承認後ターンの完全な最終item一覧を確認できないため、" +
+              "二重実行を避けて自動継続を停止しました。",
+          });
+        } else if (
+          approvedGit !== undefined &&
+          !executeCompleted &&
+          !operationTerminal
+        ) {
+          queue.push({
+            type: "error",
+            code: "GIT_APPROVAL_EXECUTION_NOT_OBSERVED",
+            message:
+              "承認後のGit実行が確認できませんでした。" +
+              "自動継続は1回で停止し、同じoperationを再実行していません。",
+          });
+        }
+        terminal = true;
+        this.#runningSessions.delete(session.id);
         this.#statuses.set(session.id, status);
+        if (event !== undefined) queue.push(event);
+        this.#approvedGitExecutionBySession.delete(session.id);
         this.#removePendingApprovals(session.id);
         this.#removePendingUserInputs(session.id);
         this.#removeWorkspaceGitPlans(session.id);
@@ -402,16 +632,80 @@ export class CodexAdapter implements AgentAdapter {
         this.#removeStartedItems(session.id);
         queue.close();
       }
-    });
+    };
+    const startApprovedGitContinuation = (
+      approvedGit: ApprovedGitExecutionWatch,
+    ): void => {
+      clientUserMessageId = randomUUID();
+      void this.#client
+        .startTurn({
+          threadId: session.id,
+          clientUserMessageId,
+          input: [
+            {
+              type: "text",
+              text:
+                "Continue the exact workspace-git operation already approved " +
+                "through ShowTalk's bound Slack structured input. Revalidate and " +
+                "execute that exact plan now, or report the exact fail-closed blocker. " +
+                "Do not request another approval merely because this is a continuation.",
+              text_elements: [],
+            },
+          ],
+          ...slackTurnAdditionalContext(
+            this.#slackPersonasBySession.get(session.id),
+            this.#legacyPaginatedCompatibilitySessions.has(session.id),
+            approvedGit.plan,
+          ),
+          ...(this.#options.approvalPolicy === undefined
+            ? {}
+            : { approvalPolicy: this.#options.approvalPolicy }),
+          ...(this.#options.approvalsReviewer === undefined
+            ? {}
+            : { approvalsReviewer: this.#options.approvalsReviewer }),
+          ...(this.#options.model === undefined
+            ? {}
+            : { model: this.#options.model }),
+          ...(this.#options.reasoningEffort === undefined
+            ? {}
+            : { effort: this.#options.reasoningEffort }),
+        })
+        .then((turn) => {
+          if (ownedTurnId !== undefined && ownedTurnId !== turn.id) {
+            throw new Error(
+              `Codex turn ownership conflict: ${ownedTurnId} != ${turn.id}`,
+            );
+          }
+          claimOwnedTurn(turn.id);
+          if (terminal) return;
+          this.#statuses.set(session.id, "running");
+          queue.push({ type: "status.changed", status: "running" });
+          const pending = deferredNotifications.splice(0);
+          for (const notification of pending) {
+            processNotification(notification.method, notification.params);
+          }
+          if (!terminal) scheduleTerminalWatchdog();
+        })
+        .catch((error: unknown) => {
+          queue.fail(
+            error instanceof Error
+              ? error
+              : new Error("Could not continue the approved Git operation"),
+          );
+        });
+    };
+    const unsubscribeNotification = this.#client.onNotification(processNotification);
 
     try {
       this.#statuses.set(session.id, "starting");
       queue.push({ type: "status.changed", status: "starting" });
       const turn = await this.#client.startTurn({
         threadId: session.id,
+        clientUserMessageId,
         input: buildTurnInput(request),
-        ...slackPersonaAdditionalContext(
+        ...slackTurnAdditionalContext(
           this.#slackPersonasBySession.get(session.id),
+          this.#legacyPaginatedCompatibilitySessions.has(session.id),
         ),
         ...(this.#options.approvalPolicy === undefined
           ? {}
@@ -424,11 +718,27 @@ export class CodexAdapter implements AgentAdapter {
           ? {}
           : { effort: this.#options.reasoningEffort }),
       });
+      if (ownedTurnId !== undefined && ownedTurnId !== turn.id) {
+        const notifiedTurnId = ownedTurnId;
+        await Promise.allSettled([
+          this.#client.interruptTurn(session.id, notifiedTurnId),
+          this.#client.interruptTurn(session.id, turn.id),
+        ]);
+        this.#transportFailed = true;
+        await this.#client.close().catch(() => undefined);
+        throw new Error(
+          `Codex turn ownership conflict: ${notifiedTurnId} != ${turn.id}`,
+        );
+      }
+      claimOwnedTurn(turn.id);
       if (!terminal) {
-        this.#activeTurns.set(session.id, turn.id);
         this.#statuses.set(session.id, "running");
         queue.push({ type: "status.changed", status: "running" });
-        scheduleTerminalWatchdog();
+        const pending = deferredNotifications.splice(0);
+        for (const notification of pending) {
+          processNotification(notification.method, notification.params);
+        }
+        if (!terminal) scheduleTerminalWatchdog();
       }
       for await (const event of queue) yield event;
     } catch (error) {
@@ -466,7 +776,12 @@ export class CodexAdapter implements AgentAdapter {
         "The Slack turn ended before its workspace-git plan could be bound",
       );
       this.#removeWorkspaceGitPlans(session.id);
+      this.#approvedGitExecutionBySession.delete(session.id);
       this.#removeStartedItems(session.id);
+      this.#rejectDeferredServerRequests(
+        session.id,
+        "The exact ShowTalk-owned Codex turn ended before the request was correlated",
+      );
       clearTerminalWatchdog();
       unsubscribeNotification();
       await this.#unsubscribeSession(session.id);
@@ -496,6 +811,14 @@ export class CodexAdapter implements AgentAdapter {
       }
       throw new Error(`Approval request expired: ${approval.requestId}`);
     }
+    if (
+      pending.availableDecisions !== undefined &&
+      !pending.availableDecisions.includes(approval.decision)
+    ) {
+      throw new Error(
+        `Approval decision is not available for this request: ${approval.decision}`,
+      );
+    }
     const decision = mapApprovalDecision(approval.decision);
     try {
       this.#respondToPendingApproval(pending, decision);
@@ -519,15 +842,31 @@ export class CodexAdapter implements AgentAdapter {
       throw new Error(`Unknown structured input request: ${response.requestId}`);
     }
     if (Date.now() >= pending.expiresAt) {
-      this.#settleUserInput(response.requestId, pending, "reject");
+      this.#expireUserInput(response.requestId, pending);
       throw new Error(`Structured input request expired: ${response.requestId}`);
     }
-    this.#settleUserInput(response.requestId, pending, response.optionId);
-    this.#statuses.set(session.id, "running");
-    this.#activeQueues.get(session.id)?.push({
-      type: "status.changed",
-      status: "running",
-    });
+    if ("cancelled" in response) {
+      this.#cancelUserInput(response.requestId, pending);
+      this.#resumeAfterUserInput(session.id);
+      return;
+    }
+    if (pending.kind === "git_approval") {
+      if (!("optionId" in response)) {
+        throw new Error("Git approval requires one fixed approval decision");
+      }
+      this.#settleGitUserInput(response.requestId, pending, response.optionId);
+      this.#resumeAfterUserInput(session.id);
+      return;
+    }
+    if (!("answer" in response)) {
+      throw new Error("Ordinary structured input requires one question answer");
+    }
+    const completed = this.#acceptChoiceAnswer(
+      response.requestId,
+      pending,
+      response.answer,
+    );
+    if (completed) this.#resumeAfterUserInput(session.id);
   }
 
   async status(session: AdapterSession): Promise<AgentStatus> {
@@ -564,7 +903,7 @@ export class CodexAdapter implements AgentAdapter {
       }
       if (storedStatus !== "active") {
         if (this.#loadedSessions.has(sessionId)) return;
-        const thread = await this.#client.resumeThread(
+        const thread = await this.#resumeThreadWithCompatibility(
           this.#resumeParamsBySession.get(sessionId) ?? { threadId: sessionId },
         );
         this.#loadedSessions.add(sessionId);
@@ -619,7 +958,33 @@ export class CodexAdapter implements AgentAdapter {
         ? {}
         : { config: this.#options.threadConfig }),
       developerInstructions: codexDeveloperInstructions(agent.role),
+      excludeTurns: true,
     };
+  }
+
+  async #resumeThreadWithCompatibility(
+    params: ThreadResumeParams,
+  ): Promise<CodexThread> {
+    if (this.#legacyPaginatedCompatibilitySessions.has(params.threadId)) {
+      return this.#client.resumeThread(withoutExcludeTurns(params));
+    }
+    try {
+      const thread = await this.#client.resumeThread(params);
+      this.#legacyPaginatedCompatibilitySessions.delete(params.threadId);
+      this.#legacyPaginatedCompatibilitySessions.delete(thread.id);
+      return thread;
+    } catch (error) {
+      if (
+        params.excludeTurns !== true ||
+        !isPaginatedThreadsUnsupported(error)
+      ) {
+        throw error;
+      }
+      const thread = await this.#client.resumeThread(withoutExcludeTurns(params));
+      this.#legacyPaginatedCompatibilitySessions.add(params.threadId);
+      this.#legacyPaginatedCompatibilitySessions.add(thread.id);
+      return thread;
+    }
   }
 
   #rememberSlackPersona(sessionId: string, persona: string | undefined): void {
@@ -635,10 +1000,38 @@ export class CodexAdapter implements AgentAdapter {
     const params = asRecord(serverRequest.params);
     const sessionId = typeof params?.threadId === "string" ? params.threadId : undefined;
     const queue = sessionId === undefined ? undefined : this.#activeQueues.get(sessionId);
-    if (sessionId === undefined || queue === undefined) {
+    const requestTurnId = typeof params?.turnId === "string" ? params.turnId : undefined;
+    const activeTurnId =
+      sessionId === undefined ? undefined : this.#activeTurns.get(sessionId);
+    if (
+      sessionId !== undefined &&
+      queue !== undefined &&
+      requestTurnId !== undefined &&
+      activeTurnId === undefined &&
+      this.#runningSessions.has(sessionId)
+    ) {
+      const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
+      if (deferred.length >= 64) {
+        this.#client.respondError(serverRequest.id, {
+          code: -32603,
+          message: "Too many Codex requests arrived before exact turn correlation",
+        });
+        return;
+      }
+      deferred.push(serverRequest);
+      this.#deferredServerRequestsBySession.set(sessionId, deferred);
+      return;
+    }
+    if (
+      sessionId === undefined ||
+      queue === undefined ||
+      requestTurnId === undefined ||
+      requestTurnId !== activeTurnId
+    ) {
       this.#client.respondError(serverRequest.id, {
         code: -32601,
-        message: "ShowTalk Taishi cannot handle this server request outside an active turn",
+        message:
+          "ShowTalk Taishi cannot handle this server request outside its exact active turn",
       });
       return;
     }
@@ -660,6 +1053,28 @@ export class CodexAdapter implements AgentAdapter {
     }
 
     const requestId = `codex:${randomUUID()}`;
+    const availableDecisions = availableApprovalDecisions(
+      serverRequest.method,
+      serverRequest.params,
+    );
+    if (availableDecisions !== undefined && availableDecisions.length === 0) {
+      if (serverRequest.method === "item/commandExecution/requestApproval") {
+        this.#client.respondToCommandApproval(serverRequest.id, "cancel");
+      } else if (serverRequest.method === "item/fileChange/requestApproval") {
+        this.#client.respondToFileChangeApproval(serverRequest.id, "cancel");
+      } else {
+        this.#client.respondToPermissionsApproval(serverRequest.id, {
+          permissions: {},
+          scope: "turn",
+        });
+      }
+      queue.push({
+        type: "error",
+        code: "UNSUPPORTED_APPROVAL_DECISIONS",
+        message: "Codex offered no approval decision that ShowTalk can safely present",
+      });
+      return;
+    }
     const itemId = typeof params?.itemId === "string" ? params.itemId : undefined;
     const item =
       itemId === undefined ? undefined : this.#startedItems.get(itemKey(sessionId, itemId));
@@ -687,6 +1102,7 @@ export class CodexAdapter implements AgentAdapter {
       ...(serverRequest.method === "item/permissions/requestApproval"
         ? { requestedPermissions: requestedPermissions(serverRequest.params) }
         : {}),
+      ...(availableDecisions === undefined ? {} : { availableDecisions }),
       expiresAt: Date.now() + this.#options.approvalTimeoutMs,
       expirationTimer,
     });
@@ -705,7 +1121,32 @@ export class CodexAdapter implements AgentAdapter {
             ? fileChangeSummary(serverRequest.params, item)
             : permissionsSummary(serverRequest.params),
       details: toJsonValue({ request: serverRequest.params, item: item ?? null }),
+      ...(availableDecisions === undefined ? {} : { availableDecisions }),
     });
+  }
+
+  #flushDeferredServerRequests(sessionId: string, turnId: string): void {
+    const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
+    this.#deferredServerRequestsBySession.delete(sessionId);
+    for (const request of deferred) {
+      const params = asRecord(request.params);
+      if (params?.turnId === turnId) {
+        this.#handleServerRequest(request);
+      } else {
+        this.#client.respondError(request.id, {
+          code: -32601,
+          message: "Codex request belongs to another turn",
+        });
+      }
+    }
+  }
+
+  #rejectDeferredServerRequests(sessionId: string, message: string): void {
+    const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
+    this.#deferredServerRequestsBySession.delete(sessionId);
+    for (const request of deferred) {
+      this.#client.respondError(request.id, { code: -32601, message });
+    }
   }
 
   #handleUserInputRequest(
@@ -713,21 +1154,37 @@ export class CodexAdapter implements AgentAdapter {
     sessionId: string,
     queue: AsyncEventQueue,
     allowBindingWait = true,
+    receivedAt = Date.now(),
   ): void {
     let requestTurnId: string | undefined;
+    let mustUseGitApprovalPath = looksLikeWorkspaceGitApproval(serverRequest.params);
     try {
       const params = toolRequestUserInputParams(serverRequest.params);
       requestTurnId = params.turnId;
       if (params.threadId !== sessionId) {
         throw new Error("Structured input thread does not match the active session");
       }
-      const question = validateWorkspaceGitPlanQuestion(serverRequest.params);
       const planKey = turnKey(sessionId, params.turnId);
       const plans = this.#workspaceGitPlansByTurn.get(planKey) ?? [];
+      if (plans.length > 0) mustUseGitApprovalPath = true;
       if (plans.length === 0 && allowBindingWait) {
-        this.#waitForWorkspaceGitPlan(serverRequest, sessionId, params.turnId, queue);
+        this.#waitForWorkspaceGitPlan(
+          serverRequest,
+          sessionId,
+          params.turnId,
+          queue,
+          receivedAt,
+        );
         return;
       }
+      if (
+        plans.length === 0 &&
+        !mustUseGitApprovalPath
+      ) {
+        this.#handleOrdinaryChoiceRequest(serverRequest, sessionId, queue, receivedAt);
+        return;
+      }
+      const question = validateWorkspaceGitPlanQuestion(serverRequest.params);
       if (plans.length !== 1) {
         throw new Error(
           plans.length === 0
@@ -739,9 +1196,11 @@ export class CodexAdapter implements AgentAdapter {
       const planExpiry = Date.parse(plan.expiresAt);
       const now = Date.now();
       const timeoutMs = Math.min(
-        this.#options.approvalTimeoutMs,
+        this.#options.approvalTimeoutMs - (now - receivedAt),
         planExpiry - now,
-        question.autoResolutionMs ?? Number.POSITIVE_INFINITY,
+        question.autoResolutionMs === undefined
+          ? Number.POSITIVE_INFINITY
+          : receivedAt + question.autoResolutionMs - now,
       );
       if (!Number.isFinite(planExpiry) || timeoutMs <= 0) {
         throw new Error("The workspace-git plan has already expired");
@@ -750,9 +1209,9 @@ export class CodexAdapter implements AgentAdapter {
       const requestId = `codex-input:${randomUUID()}`;
       const expirationTimer = setTimeout(() => {
         const pending = this.#pendingUserInputs.get(requestId);
-        if (pending === undefined) return;
+        if (pending === undefined || pending.kind !== "git_approval") return;
         try {
-          this.#settleUserInput(requestId, pending, "reject");
+          this.#settleGitUserInput(requestId, pending, "reject");
         } catch (error) {
           queue.fail(error);
           return;
@@ -767,8 +1226,10 @@ export class CodexAdapter implements AgentAdapter {
       }, timeoutMs);
       expirationTimer.unref();
       this.#pendingUserInputs.set(requestId, {
+        kind: "git_approval",
         rpcId: serverRequest.id,
         sessionId,
+        turnId: params.turnId,
         questionId: question.questionId,
         approveLabel: question.approveLabel,
         rejectLabel: question.rejectLabel,
@@ -789,6 +1250,21 @@ export class CodexAdapter implements AgentAdapter {
         plan,
       });
     } catch (error) {
+      if (!mustUseGitApprovalPath) {
+        const reason = publicStructuredInputError(error);
+        this.#client.respondError(serverRequest.id, {
+          code: -32602,
+          message: `UNSUPPORTED_STRUCTURED_INPUT: ${reason}`,
+        });
+        queue.push({
+          type: "error",
+          message:
+            "この入力形式はSlackでは安全に表示できません。" +
+            "通常の文章で質問し直してください。",
+          code: "UNSUPPORTED_STRUCTURED_INPUT",
+        });
+        return;
+      }
       this.#rejectUnboundGitApproval(
         serverRequest,
         sessionId,
@@ -799,11 +1275,82 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
+  #handleOrdinaryChoiceRequest(
+    serverRequest: ServerRequestEvent,
+    sessionId: string,
+    queue: AsyncEventQueue,
+    receivedAt: number,
+  ): void {
+    try {
+      const request = validateOrdinaryChoiceRequest(serverRequest.params);
+      if (request.threadId !== sessionId) {
+        throw new Error("Structured input thread does not match the active session");
+      }
+      const now = Date.now();
+      const timeoutMs = Math.min(
+        this.#options.approvalTimeoutMs - (now - receivedAt),
+        request.autoResolutionMs === undefined
+          ? Number.POSITIVE_INFINITY
+          : receivedAt + request.autoResolutionMs - now,
+      );
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new Error("Structured input request has already expired");
+      }
+      const requestId = `codex-choice:${randomUUID()}`;
+      const expirationTimer = setTimeout(() => {
+        const pending = this.#pendingUserInputs.get(requestId);
+        if (pending === undefined || pending.kind !== "choice") return;
+        try {
+          this.#expireUserInput(requestId, pending);
+        } catch (error) {
+          queue.fail(error);
+          return;
+        }
+        this.#statuses.set(sessionId, "running");
+        queue.push({ type: "status.changed", status: "running" });
+        queue.push({
+          type: "error",
+          message: "選択肢への回答待ちが期限切れになりました。",
+          code: "STRUCTURED_INPUT_EXPIRED",
+        });
+      }, timeoutMs);
+      expirationTimer.unref();
+      const pending: PendingChoiceUserInput = {
+        kind: "choice",
+        rpcId: serverRequest.id,
+        sessionId,
+        questions: request.questions,
+        answers: new Map(),
+        currentQuestionIndex: 0,
+        expiresAt: now + timeoutMs,
+        expirationTimer,
+      };
+      this.#pendingUserInputs.set(requestId, pending);
+      this.#statuses.set(sessionId, "waiting_for_input");
+      queue.push({ type: "status.changed", status: "waiting_for_input" });
+      this.#pushCurrentChoice(requestId, pending, queue);
+    } catch (error) {
+      const reason = publicStructuredInputError(error);
+      this.#client.respondError(serverRequest.id, {
+        code: -32602,
+        message: `UNSUPPORTED_STRUCTURED_INPUT: ${reason}`,
+      });
+      queue.push({
+        type: "error",
+        message:
+          "この入力形式はSlackでは安全に表示できません。" +
+          "通常の文章で質問し直してください。",
+        code: "UNSUPPORTED_STRUCTURED_INPUT",
+      });
+    }
+  }
+
   #waitForWorkspaceGitPlan(
     serverRequest: ServerRequestEvent,
     sessionId: string,
     turnId: string,
     queue: AsyncEventQueue,
+    receivedAt: number,
   ): void {
     const key = rpcKey(serverRequest.id);
     if (this.#pendingUserInputBindings.has(key)) {
@@ -813,12 +1360,22 @@ export class CodexAdapter implements AgentAdapter {
       const pending = this.#pendingUserInputBindings.get(key);
       if (pending === undefined) return;
       this.#pendingUserInputBindings.delete(key);
-      this.#rejectUserInputBinding(
+      if (looksLikeWorkspaceGitApproval(pending.serverRequest.params)) {
+        this.#rejectUserInputBinding(
+          pending.serverRequest,
+          pending.sessionId,
+          pending.turnId,
+          pending.queue,
+          new Error("No exact workspace-git plan arrived for this structured request"),
+        );
+        return;
+      }
+      this.#handleUserInputRequest(
         pending.serverRequest,
         pending.sessionId,
-        pending.turnId,
         pending.queue,
-        new Error("No exact workspace-git plan arrived for this structured request"),
+        false,
+        pending.receivedAt,
       );
     }, this.#options.gitPlanBindingGraceMs);
     expirationTimer.unref();
@@ -828,6 +1385,7 @@ export class CodexAdapter implements AgentAdapter {
       sessionId,
       turnId,
       queue,
+      receivedAt,
       expirationTimer,
     });
   }
@@ -842,6 +1400,7 @@ export class CodexAdapter implements AgentAdapter {
         pending.sessionId,
         pending.queue,
         false,
+        pending.receivedAt,
       );
     }
   }
@@ -913,13 +1472,25 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
-  #failActiveStreams(error: Error): void {
+  #failActiveStreams(error: Error, intentionalShutdown = false): void {
     this.#transportFailed = true;
     for (const [sessionId, queue] of this.#activeQueues) {
-      this.#statuses.set(sessionId, "failed");
-      queue.fail(error);
+      if (intentionalShutdown) {
+        this.#statuses.set(sessionId, "interrupted");
+        queue.push({ type: "status.changed", status: "interrupted" });
+        queue.close();
+      } else {
+        this.#statuses.set(sessionId, "failed");
+        queue.fail(error);
+      }
     }
     this.#activeQueues.clear();
+    for (const sessionId of this.#deferredServerRequestsBySession.keys()) {
+      this.#rejectDeferredServerRequests(
+        sessionId,
+        "Codex app-server transport closed before exact turn correlation",
+      );
+    }
     this.#activeTurns.clear();
     this.#runningSessions.clear();
     this.#loadedSessions.clear();
@@ -937,6 +1508,7 @@ export class CodexAdapter implements AgentAdapter {
     this.#pendingUserInputBindings.clear();
     this.#workspaceGitPlansByTurn.clear();
     this.#gitApprovalRecoveryTurns.clear();
+    this.#approvedGitExecutionBySession.clear();
     this.#startedItems.clear();
   }
 
@@ -979,16 +1551,216 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
-  #settleUserInput(
+  #settleGitUserInput(
     requestId: string,
-    pending: PendingUserInput,
-    optionId: AgentUserInputResponse["optionId"],
+    pending: PendingGitUserInput,
+    optionId: AgentGitApprovalInputResponse["optionId"],
   ): void {
     clearTimeout(pending.expirationTimer);
     this.#pendingUserInputs.delete(requestId);
     const label = optionId === "approve" ? pending.approveLabel : pending.rejectLabel;
+    if (optionId === "approve") {
+      this.#approvedGitExecutionBySession.set(pending.sessionId, {
+        plan: pending.plan,
+        executeStartedItemIds: new Set(),
+        executeCompletedItemIds: new Set(),
+        executeFailedItemIds: new Set(),
+        operationStatuses: new Set(),
+        continuationStarted: false,
+        duplicateExecutionReported: false,
+      });
+    } else {
+      this.#approvedGitExecutionBySession.delete(pending.sessionId);
+    }
+    try {
+      this.#client.respondToUserInput(pending.rpcId, {
+        answers: { [pending.questionId]: { answers: [label] } },
+      });
+    } catch (error) {
+      this.#approvedGitExecutionBySession.delete(pending.sessionId);
+      throw error;
+    }
+  }
+
+  #observeApprovedGitExecution(
+    sessionId: string,
+    item: Record<string, unknown>,
+    queue: AsyncEventQueue,
+  ): void {
+    const watch = this.#approvedGitExecutionBySession.get(sessionId);
+    if (watch === undefined) return;
+    this.#observeApprovedGitItem(watch, item, queue);
+  }
+
+  #observeApprovedGitTurnSnapshot(
+    watch: ApprovedGitExecutionWatch,
+    turn: Record<string, unknown> | undefined,
+    queue: AsyncEventQueue,
+  ): void {
+    if (!hasFullTurnItems(turn)) return;
+    const items = turn?.items;
+    if (!Array.isArray(items)) return;
+    for (const candidate of items) {
+      const item = asRecord(candidate);
+      if (item !== undefined) this.#observeApprovedGitItem(watch, item, queue);
+    }
+  }
+
+  #observeApprovedGitItem(
+    watch: ApprovedGitExecutionWatch,
+    item: Record<string, unknown>,
+    queue: AsyncEventQueue,
+  ): void {
+    if (isExactWorkspaceGitExecution(item, watch.plan)) {
+      if (typeof item.id !== "string") return;
+      const outcome = exactWorkspaceGitExecutionOutcome(item, watch.plan);
+      if (
+        item.status === "completed" &&
+        item.error == null &&
+        (outcome === undefined || outcome === "applied" || outcome === "executed")
+      ) {
+        watch.executeCompletedItemIds.add(item.id);
+      } else if (
+        item.status === "failed" ||
+        item.error != null ||
+        outcome === "partial" ||
+        outcome === "failed" ||
+        outcome === "outcome_uncertain"
+      ) {
+        watch.executeFailedItemIds.add(item.id);
+      } else {
+        watch.executeStartedItemIds.add(item.id);
+      }
+      const executionIds = new Set([
+        ...watch.executeStartedItemIds,
+        ...watch.executeCompletedItemIds,
+        ...watch.executeFailedItemIds,
+      ]);
+      if (executionIds.size <= 1 || watch.duplicateExecutionReported) return;
+      watch.duplicateExecutionReported = true;
+      queue.push({
+        type: "error",
+        code: "GIT_APPROVAL_EXECUTION_REPLAY",
+        message:
+          "同じ承認済みGit operationへの複数回の実行要求を検出しました。" +
+          "workspace-gitの再実行防止結果を確認してください。",
+      });
+      return;
+    }
+    const operationStatus = exactWorkspaceGitOperationStatus(item, watch.plan);
+    if (operationStatus !== undefined) {
+      watch.operationStatuses.add(operationStatus);
+    }
+  }
+
+  #acceptChoiceAnswer(
+    requestId: string,
+    pending: PendingChoiceUserInput,
+    answer: AgentChoiceAnswer,
+  ): boolean {
+    const question = pending.questions[pending.currentQuestionIndex];
+    if (question === undefined || answer.questionId !== question.id) {
+      throw new Error("Structured input answer does not match the current question");
+    }
+    let value: string;
+    if ("optionId" in answer && answer.optionId !== undefined) {
+      const option = question.options.find(
+        (candidate) => candidate.id === answer.optionId,
+      );
+      if (option === undefined) {
+        throw new Error("Structured input answer is not one of the displayed options");
+      }
+      value = option.appServerLabel;
+    } else {
+      if (!question.allowsOther || !("text" in answer)) {
+        throw new Error("This structured input question does not allow free text");
+      }
+      value = answer.text.trim();
+      if (value.length < 1 || value.length > 1_000) {
+        throw new Error("Structured input free text must be between 1 and 1000 characters");
+      }
+    }
+    pending.answers.set(question.appServerQuestionId, Object.freeze([value]));
+    pending.currentQuestionIndex += 1;
+    if (pending.currentQuestionIndex < pending.questions.length) {
+      const queue = this.#activeQueues.get(pending.sessionId);
+      if (queue === undefined) {
+        this.#cancelUserInput(requestId, pending);
+        throw new Error("Structured input turn is no longer active");
+      }
+      this.#pushCurrentChoice(requestId, pending, queue);
+      return false;
+    }
+
+    clearTimeout(pending.expirationTimer);
+    this.#pendingUserInputs.delete(requestId);
     this.#client.respondToUserInput(pending.rpcId, {
-      answers: { [pending.questionId]: { answers: [label] } },
+      answers: Object.fromEntries(
+        [...pending.answers].map(([questionId, answers]) => [
+          questionId,
+          { answers },
+        ]),
+      ),
+    });
+    return true;
+  }
+
+  #pushCurrentChoice(
+    requestId: string,
+    pending: PendingChoiceUserInput,
+    queue: AsyncEventQueue,
+  ): void {
+    const question = pending.questions[pending.currentQuestionIndex];
+    if (question === undefined) {
+      throw new Error("Structured input has no current question");
+    }
+    queue.push({
+      type: "choice.requested",
+      requestId,
+      question: {
+        id: question.id,
+        header: question.header,
+        prompt: question.prompt,
+        options: question.options.map(({ id, label, description }) => ({
+          id,
+          label,
+          description,
+        })),
+        allowsOther: question.allowsOther,
+      },
+    });
+  }
+
+  #expireUserInput(requestId: string, pending: PendingUserInput): void {
+    if (pending.kind === "git_approval") {
+      this.#settleGitUserInput(requestId, pending, "reject");
+      return;
+    }
+    this.#cancelUserInput(requestId, pending, "Structured input request expired");
+  }
+
+  #cancelUserInput(
+    requestId: string,
+    pending: PendingUserInput,
+    reason = "Structured input could not be displayed",
+  ): void {
+    if (pending.kind === "git_approval") {
+      this.#settleGitUserInput(requestId, pending, "reject");
+      return;
+    }
+    clearTimeout(pending.expirationTimer);
+    this.#pendingUserInputs.delete(requestId);
+    this.#client.respondError(pending.rpcId, {
+      code: -32000,
+      message: reason,
+    });
+  }
+
+  #resumeAfterUserInput(sessionId: string): void {
+    this.#statuses.set(sessionId, "running");
+    this.#activeQueues.get(sessionId)?.push({
+      type: "status.changed",
+      status: "running",
     });
   }
 
@@ -1057,23 +1829,60 @@ export class CodexAdapter implements AgentAdapter {
     sessionId: string,
     queue: AsyncEventQueue,
   ): Promise<"active" | "terminal" | "retry"> {
+    const ownedTurnId = this.#activeTurns.get(sessionId);
+    if (ownedTurnId === undefined) return "retry";
+    if (this.#turnPaginationSupported !== false) {
+      try {
+        const page = await this.#client.listThreadTurns(sessionId, {
+          limit: 50,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        });
+        this.#turnPaginationSupported = true;
+        const turn = page.data.find(({ id }) => id === ownedTurnId);
+        if (turn === undefined) return "retry";
+        if (turn.status === "inProgress") {
+          return "active";
+        }
+        if (
+          turn.status === "completed" ||
+          turn.status === "interrupted" ||
+          turn.status === "failed"
+        ) {
+          this.#activeTurns.delete(sessionId);
+          const status = agentStatusForTurn(turn);
+          this.#statuses.set(sessionId, status);
+          queue.push({ type: "status.changed", status });
+          queue.close();
+          return "terminal";
+        }
+        return "retry";
+      } catch (error) {
+        if (!isPaginatedThreadsUnsupported(error)) return "retry";
+        this.#turnPaginationSupported = false;
+      }
+    }
+
+    // Some App Server builds advertise thread/turns/list in their generated
+    // schema while the selected backend still rejects paginated_threads. In
+    // that compatibility mode, aggregate active is conservative: it never
+    // declares our turn complete while any turn remains active.
     try {
       const thread = await this.#client.readThread(sessionId);
-      const status = asRecord(thread.status);
-      if (status?.type === "active") {
-        return "active";
-      }
-      if (status?.type === "idle") {
+      const status = threadStatusType(thread);
+      if (status === "active") return "active";
+      if (status === "idle" || status === "notLoaded") {
         this.#activeTurns.delete(sessionId);
         this.#statuses.set(sessionId, "idle");
         queue.push({ type: "status.changed", status: "idle" });
         queue.close();
         return "terminal";
       }
-      if (status?.type === "notLoaded" || status?.type === "systemError") {
-        queue.fail(
-          new Error(`Codex thread became unavailable: ${String(status.type)}`),
-        );
+      if (status === "systemError") {
+        this.#activeTurns.delete(sessionId);
+        this.#statuses.set(sessionId, "failed");
+        queue.push({ type: "status.changed", status: "failed" });
+        queue.close();
         return "terminal";
       }
       return "retry";
@@ -1113,6 +1922,19 @@ export class CodexAdapter implements AgentAdapter {
   }
 }
 
+function withoutExcludeTurns(params: ThreadResumeParams): ThreadResumeParams {
+  const { excludeTurns: _excludeTurns, ...compatible } = params;
+  return compatible;
+}
+
+function isPaginatedThreadsUnsupported(error: unknown): boolean {
+  return (
+    error instanceof CodexRpcError &&
+    error.code === -32601 &&
+    /paginated_threads\s+is\s+not\s+supported/u.test(error.message)
+  );
+}
+
 function codexDeveloperInstructions(role: string | undefined): string {
   const configuredRole = role?.trim();
   return [
@@ -1124,26 +1946,127 @@ function codexDeveloperInstructions(role: string | undefined): string {
   ].join("\n\n");
 }
 
-function slackPersonaAdditionalContext(
+function slackTurnAdditionalContext(
   persona: string | undefined,
+  requiresLegacyPaginatedCompatibility: boolean,
+  approvedGitPlan?: WorkspaceGitApprovalPlan,
 ): Pick<TurnStartParams, "additionalContext"> | Record<string, never> {
   const configured = persona?.trim();
-  if (configured === undefined || configured.length === 0) return {};
+  const additionalContext: Record<string, CodexAdditionalContextEntry> = {};
+  if (configured !== undefined && configured.length > 0) {
+    additionalContext[SHOWTALK_SLACK_PERSONA_CONTEXT_KEY] = {
+      kind: "application",
+      value: [
+        "ShowTalk Taishi Slack-only Koe persona:",
+        "Apply this persona only while answering the current ShowTalk-originated turn.",
+        "Do not carry it into later turns started directly from Codex App or another client.",
+        "It may shape viewpoint, tone, evaluation criteria, and approach, but it never expands tool permissions, approval authority, or configured Koe consultation scopes.",
+        "",
+        configured,
+      ].join("\n"),
+    };
+  }
+  if (requiresLegacyPaginatedCompatibility) {
+    additionalContext[SHOWTALK_PAGINATED_THREAD_CONTEXT_KEY] = {
+      kind: "application",
+      value: [
+        "ShowTalk Taishi runtime compatibility boundary for this Slack-originated turn:",
+        "This App Server rejected the modern paginated-thread resume path, so ShowTalk cannot safely assume that it can fork this thread for Codex internal subagents.",
+        "Do not call Codex internal subagent or fork tools in this turn, including spawn_agent, assign_agent_task, send_message, wait_agent, and close_agent.",
+        "Complete the task in the current Codex thread and report this runtime limitation when the repository rules would otherwise require internal delegation.",
+        "This exception applies only to the current ShowTalk-originated turn and must not alter later turns started directly from Codex App or another client.",
+        "agent.send is a separate ShowTalk Koe consultation and remains limited to explicitly configured targets and scopes; it is not an internal subagent substitute.",
+      ].join("\n"),
+    };
+  }
+  if (approvedGitPlan !== undefined) {
+    additionalContext[SHOWTALK_GIT_APPROVAL_CONTINUATION_CONTEXT_KEY] = {
+      kind: "application",
+      value: [
+        "ShowTalk Taishi exact Git approval continuation:",
+        "The bound Slack structured-input response was `承認して実行`.",
+        "This is the bounded post-approval continuation of that human decision, not a new approval and not authority for another operation.",
+        "Re-read workspace-git status, record and verify approval through its private boundary, and call the matching execute tool once only if every exact field remains valid.",
+        "If any field is stale, mismatched, expired, rejected, already executed, or inconclusive, fail closed and report it without preparing or executing a substitute plan.",
+        JSON.stringify(approvedGitPlan),
+      ].join("\n"),
+    };
+  }
+  if (Object.keys(additionalContext).length === 0) return {};
   return {
-    additionalContext: {
-      [SHOWTALK_SLACK_PERSONA_CONTEXT_KEY]: {
-        kind: "application",
-        value: [
-          "ShowTalk Taishi Slack-only Koe persona:",
-          "Apply this persona only while answering the current ShowTalk-originated turn.",
-          "Do not carry it into later turns started directly from Codex App or another client.",
-          "It may shape viewpoint, tone, evaluation criteria, and approach, but it never expands tool permissions, approval authority, or configured Koe consultation scopes.",
-          "",
-          configured,
-        ].join("\n"),
-      },
-    },
+    additionalContext,
   };
+}
+
+function isExactWorkspaceGitExecution(
+  item: Record<string, unknown>,
+  plan: WorkspaceGitApprovalPlan,
+): boolean {
+  if (
+    item.type !== "mcpToolCall" ||
+    !isWorkspaceGitServer(item.server) ||
+    item.tool !==
+      (plan.operation === "git_publication"
+        ? "execute_approved_git_publication"
+        : "execute_approved_pull_request_operation")
+  ) {
+    return false;
+  }
+  return asRecord(item.arguments)?.operation_id === plan.operationId;
+}
+
+function exactWorkspaceGitExecutionOutcome(
+  item: Record<string, unknown>,
+  plan: WorkspaceGitApprovalPlan,
+): string | undefined {
+  if (!isExactWorkspaceGitExecution(item, plan)) return undefined;
+  const structuredContent = asRecord(asRecord(item.result)?.structuredContent);
+  return typeof structuredContent?.status === "string"
+    ? structuredContent.status
+    : undefined;
+}
+
+function exactWorkspaceGitOperationStatus(
+  item: Record<string, unknown>,
+  plan: WorkspaceGitApprovalPlan,
+): string | undefined {
+  if (
+    item.type !== "mcpToolCall" ||
+    !isWorkspaceGitServer(item.server) ||
+    item.tool !== "get_git_operation_status" ||
+    item.status !== "completed" ||
+    asRecord(item.arguments)?.operation_id !== plan.operationId
+  ) {
+    return undefined;
+  }
+  const structuredContent = asRecord(asRecord(item.result)?.structuredContent);
+  if (structuredContent?.operation_id !== plan.operationId) return undefined;
+  return typeof structuredContent.status === "string"
+    ? structuredContent.status
+    : undefined;
+}
+
+function isWorkspaceGitServer(value: unknown): boolean {
+  return value === "workspace-git" || value === "workspace_git";
+}
+
+function hasFullTurnItems(
+  turn: Record<string, unknown> | undefined,
+): boolean {
+  return turn?.itemsView === "full" && Array.isArray(turn.items);
+}
+
+function isTerminalGitOperationStatus(status: string): boolean {
+  return new Set([
+    "rejected",
+    "expired",
+    "executing",
+    "applied",
+    "executed",
+    "partial",
+    "failed",
+    "outcome_uncertain",
+  ]).has(status);
 }
 
 function gitApprovalBindingErrorMessage(error: unknown): string {
@@ -1160,6 +2083,12 @@ function gitApprovalBindingErrorMessage(error: unknown): string {
     "re-run the matching prepare_* operation in the current turn, and then " +
     "request the fixed structured approval again."
   );
+}
+
+function publicStructuredInputError(error: unknown): string {
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message.slice(0, 500)
+    : "Unsupported ordinary structured input";
 }
 
 function buildTurnInput(request: SendMessageRequest): TurnStartParams["input"] {
@@ -1242,7 +2171,9 @@ function normalizeNotification(method: string, params: unknown): AgentEvent | un
       if (
         item.type === "commandExecution" ||
         item.type === "fileChange" ||
-        item.type === "mcpToolCall"
+        item.type === "mcpToolCall" ||
+        item.type === "dynamicToolCall" ||
+        item.type === "collabAgentToolCall"
       ) {
         return {
           type: "tool.started",
@@ -1268,7 +2199,9 @@ function normalizeNotification(method: string, params: unknown): AgentEvent | un
         typeof item.id === "string" &&
         (item.type === "commandExecution" ||
           item.type === "fileChange" ||
-          item.type === "mcpToolCall")
+          item.type === "mcpToolCall" ||
+          item.type === "dynamicToolCall" ||
+          item.type === "collabAgentToolCall")
       ) {
         return {
           type: "tool.completed",
@@ -1306,6 +2239,8 @@ function toolEventName(item: Record<string, unknown>): string {
   ) {
     return `${item.server}.${item.tool}`;
   }
+  if (item.type === "collabAgentToolCall") return "collabAgent";
+  if (item.type === "dynamicToolCall") return "dynamicTool";
   return typeof item.type === "string" ? item.type : "tool";
 }
 
@@ -1327,6 +2262,42 @@ function turnStatus(params: unknown): AgentStatus {
     default:
       return "idle";
   }
+}
+
+function agentStatusForTurn(turn: CodexTurn): AgentStatus {
+  switch (turn.status) {
+    case "completed":
+      return "idle";
+    case "interrupted":
+      return "interrupted";
+    case "failed":
+      return "failed";
+    default:
+      return "running";
+  }
+}
+
+function notificationTurnId(params: unknown): string | undefined {
+  const record = asRecord(params);
+  if (typeof record?.turnId === "string") return record.turnId;
+  const turn = asRecord(record?.turn);
+  return typeof turn?.id === "string" ? turn.id : undefined;
+}
+
+function notificationClientUserMessageId(params: unknown): string | undefined {
+  const turn = asRecord(asRecord(params)?.turn);
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  for (const itemValue of items) {
+    const item = asRecord(itemValue);
+    if (item?.type === "userMessage" && typeof item.clientId === "string") {
+      return item.clientId;
+    }
+  }
+  return undefined;
+}
+
+function isTurnScopedNotification(method: string): boolean {
+  return method.startsWith("turn/") || method.startsWith("item/") || method === "error";
 }
 
 function isApprovalMethod(
@@ -1427,6 +2398,30 @@ function mapApprovalDecision(
     case "cancel":
       return "cancel";
   }
+}
+
+function availableApprovalDecisions(
+  method: PendingApproval["method"],
+  params: unknown,
+): readonly AgentApproval["decision"][] | undefined {
+  if (method !== "item/commandExecution/requestApproval") return undefined;
+  const raw = asRecord(params)?.availableDecisions;
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) return [];
+  const decisions: AgentApproval["decision"][] = [];
+  for (const decision of raw) {
+    const mapped = decision === "accept"
+      ? "allow_once"
+      : decision === "acceptForSession"
+        ? "allow_session"
+        : decision === "decline"
+          ? "deny"
+          : decision === "cancel"
+            ? "cancel"
+            : undefined;
+    if (mapped !== undefined && !decisions.includes(mapped)) decisions.push(mapped);
+  }
+  return Object.freeze(decisions);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

@@ -12,6 +12,7 @@ test("builds single-use approval actions with scoped routing data", () => {
     requestId: "codex:n:7",
     channelId: "C123",
     rootThreadTs: "100.1",
+    messageTs: "100.2",
     sessionId: "session-1",
   };
   const blocks = buildApprovalBlocks("Run npm test", value);
@@ -28,12 +29,30 @@ test("bounds approval section text after Slack escaping", () => {
     requestId: "codex:n:8",
     channelId: "C123",
     rootThreadTs: "100.1",
+    messageTs: "100.2",
   });
   const section = blocks[0];
   assert.equal(section?.type, "section");
   if (section?.type !== "section" || !("text" in section)) return;
   assert.ok(section.text.text.length <= 3_000);
   assert.doesNotMatch(section.text.text, /<>/u);
+});
+
+test("renders only approval decisions offered by Codex", () => {
+  const blocks = buildApprovalBlocks(
+    "Run npm test",
+    {
+      requestId: "codex:n:9",
+      channelId: "C123",
+      rootThreadTs: "100.1",
+      messageTs: "100.2",
+    },
+    ["allow_once", "cancel"],
+  );
+  const rendered = JSON.stringify(blocks);
+  assert.match(rendered, /taishi\.approval\.allow_once/u);
+  assert.match(rendered, /taishi\.approval\.cancel/u);
+  assert.doesNotMatch(rendered, /allow_session|taishi\.approval\.deny/u);
 });
 
 test("rejects forged or ambiguous approval routing payloads", () => {
@@ -48,6 +67,7 @@ test("rejects forged or ambiguous approval routing payloads", () => {
         requestId: "a",
         channelId: "C1",
         rootThreadTs: "1.1",
+        messageTs: "1.2",
         sessionId: 7,
       }),
     ),
@@ -58,6 +78,7 @@ test("rejects forged or ambiguous approval routing payloads", () => {
         requestId: "a",
         channelId: "C1",
         rootThreadTs: "1.1",
+        messageTs: "1.2",
         targetAgentId: "attacker",
       }),
     ),

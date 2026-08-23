@@ -44,6 +44,7 @@ agents:
   implementer:
     adapter: codex
     # Optional Koe-specific overrides. The localhost admin UI can update these
+    # through an owner-only sidecar without rewriting this operator-owned file.
     # for the next turn without restarting the Gateway.
     # model: gpt-5.3-codex
     # reasoning_effort: medium

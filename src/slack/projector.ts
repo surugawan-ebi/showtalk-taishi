@@ -4,20 +4,34 @@ import type { WebClient } from "@slack/web-api";
 import type { AgentEvent } from "../core/index.js";
 import { buildApprovalBlocks } from "./blocks.js";
 import { buildGitApprovalRecoveryBlocks } from "./git-approval-recovery-blocks.js";
-import { buildWorkspaceGitApprovalBlocks } from "./user-input-blocks.js";
+import { buildChoiceBlocks } from "./choice-blocks.js";
+import {
+  WorkspaceGitApprovalDetailsStore,
+  buildWorkspaceGitApprovalBlocks,
+} from "./user-input-blocks.js";
 import type { SlackMessagePresentation } from "./presentation.js";
-import { formatAgentTextForSlack, splitSlackText } from "./text-format.js";
+import {
+  formatAgentTextForSlack,
+  splitSlackText,
+  utf8ByteLength,
+} from "./text-format.js";
 
 const MAX_RETAINED_AGENT_TEXT = 64_000;
 const MAX_SLACK_MESSAGE_TEXT = 3_800;
+const MAX_SLACK_MESSAGE_UTF8_BYTES = 3_800;
 const MAX_STREAM_AGENT_TEXT = 3_300;
+const MAX_STREAM_AGENT_UTF8_BYTES = 3_300;
+const MAX_COMPACT_STREAM_AGENT_TEXT = 1_200;
+const MAX_COMPACT_STREAM_AGENT_UTF8_BYTES = 1_200;
 const MAX_FINAL_AGENT_TEXT = 12_000;
+const MAX_FINAL_AGENT_UTF8_BYTES = 12_000;
 const MAX_FINAL_CHUNK_BODY = 3_000;
+const MAX_FINAL_CHUNK_UTF8_BYTES = 3_000;
 const MAX_FINAL_CHUNKS = 4;
 const MAX_ACTIVE_TOOL_CALLS = 256;
 const MAX_SETTLED_TOOL_CALL_IDS = 512;
-const UPDATE_INTERVAL_MS = 1_200;
-const HEARTBEAT_INTERVAL_MS = 5_000;
+const UPDATE_INTERVAL_MS = 30_000;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 const WORKING_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 
 type HeartbeatScheduler = (
@@ -31,22 +45,26 @@ export interface SlackThreadProjectorOptions {
   readonly now?: () => number;
   readonly heartbeatScheduler?: HeartbeatScheduler;
   readonly maxFinalChunks?: number;
+  readonly gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
 }
 
 export class SlackThreadProjector {
   readonly #client: WebClient;
   readonly #channelId: string;
   readonly #rootThreadTs: string;
+  readonly #sourceUserId: string | undefined;
   readonly #sourceUserMention: string | undefined;
   readonly #presentation: SlackMessagePresentation;
   readonly #now: () => number;
   readonly #heartbeatScheduler: HeartbeatScheduler;
   readonly #maxFinalChunks: number;
+  readonly #gitApprovalDetailsStore: WorkspaceGitApprovalDetailsStore | undefined;
   readonly #startedAtMs: number;
   #messageTs: string | undefined;
   #text = "";
   #lastPostedText = "";
   #lastUpdateAt = 0;
+  #lastHeartbeatAttemptAt = 0;
   #sessionId: string | undefined;
   #toolStartedCount = 0;
   #toolCompletedCount = 0;
@@ -63,8 +81,12 @@ export class SlackThreadProjector {
   #completion: Promise<void> | undefined;
   #finalReplyMessages: string[] | undefined;
   #finalReplyPublishedCount = 0;
+  #activityFinalMessages: string[] | undefined;
+  #activityFinalPublishedCount = 0;
   #messageProjectionDisabled = false;
+  #compactActivityProjection = false;
   #turnActivityStarted = false;
+  #terminalErrorPosted = false;
   #cancelHeartbeat: (() => void) | undefined;
   #activityWriteTail: Promise<void> = Promise.resolve();
   readonly #activeTools = new Set<string>();
@@ -79,6 +101,7 @@ export class SlackThreadProjector {
     this.#client = client;
     this.#channelId = channelId;
     this.#rootThreadTs = rootThreadTs;
+    this.#sourceUserId = options.sourceUserId;
     this.#sourceUserMention = options.sourceUserId === undefined
       ? undefined
       : formatSlackUserMention(options.sourceUserId);
@@ -87,6 +110,7 @@ export class SlackThreadProjector {
     this.#heartbeatScheduler =
       options.heartbeatScheduler ?? scheduleHeartbeat;
     this.#maxFinalChunks = options.maxFinalChunks ?? MAX_FINAL_CHUNKS;
+    this.#gitApprovalDetailsStore = options.gitApprovalDetailsStore;
     if (
       !Number.isSafeInteger(this.#maxFinalChunks) ||
       this.#maxFinalChunks < 1 ||
@@ -127,26 +151,22 @@ export class SlackThreadProjector {
         if (event.text !== undefined) {
           this.#text = appendBounded("", event.text, MAX_RETAINED_AGENT_TEXT);
         }
-        await this.#upsertAgentMessage();
+        if (this.#activityUpdateDue()) await this.#upsertAgentMessage();
         break;
       case "approval.requested":
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
-        await this.#post(
-          event.summary,
-          buildApprovalBlocks(event.summary, {
-            requestId: event.requestId,
-            channelId: this.#channelId,
-            rootThreadTs: this.#rootThreadTs,
-            ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
-          }),
-          true,
-        );
+        await this.#postApproval(event);
         break;
       case "user_input.requested":
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
         await this.#postUserInput(event);
+        break;
+      case "choice.requested":
+        this.#turnActivityStarted = true;
+        await this.#upsertAgentMessage();
+        await this.#postChoice(event);
         break;
       case "git_approval.reprepare_required":
         this.#turnActivityStarted = true;
@@ -175,15 +195,14 @@ export class SlackThreadProjector {
         if (
           recorded &&
           (event.isError === true ||
-            this.#runningToolCount() === 0 ||
-            this.#messageTs === undefined ||
-            this.#now() - this.#lastUpdateAt >= UPDATE_INTERVAL_MS)
+            this.#activityUpdateDue())
         ) {
           await this.#upsertAgentMessage();
         }
         break;
       }
       case "error":
+        this.#terminalErrorPosted = true;
         await this.#upsertAgentMessage();
         await this.#post(`:warning: ${event.message}`, undefined, true);
         break;
@@ -191,10 +210,17 @@ export class SlackThreadProjector {
         if (
           event.status === "starting" ||
           event.status === "running" ||
-          event.status === "waiting_for_approval"
+          event.status === "waiting_for_approval" ||
+          event.status === "waiting_for_input"
         ) {
           this.#turnActivityStarted = true;
-          await this.#upsertAgentMessage();
+          if (
+            event.status === "waiting_for_approval" ||
+            event.status === "waiting_for_input" ||
+            this.#activityUpdateDue()
+          ) {
+            await this.#upsertAgentMessage();
+          }
         }
         break;
     }
@@ -253,28 +279,85 @@ export class SlackThreadProjector {
     assertSafeSlackMessage(text);
     if (text === this.#lastPostedText) return;
     if (this.#messageTs === undefined) {
+      const { result, postedText } = await this.#postActivityMessage(text);
+      if (typeof result.ts !== "string") {
+        this.#messageProjectionDisabled = true;
+        throw new Error("Slack did not return a timestamp for Koe activity");
+      }
+      this.#messageTs = result.ts;
+      this.#lastPostedText = postedText;
+      this.#lastUpdateAt = this.#now();
+      return;
+    }
+    const postedText = await this.#updateActivityMessage(text);
+    this.#lastPostedText = postedText;
+    this.#lastUpdateAt = this.#now();
+  }
+
+  async #postActivityMessage(text: string): Promise<{
+    readonly result: Awaited<ReturnType<WebClient["chat"]["postMessage"]>>;
+    readonly postedText: string;
+  }> {
+    try {
       const result = await this.#client.chat.postMessage({
         channel: this.#channelId,
         thread_ts: this.#rootThreadTs,
         text,
         ...this.#presentation,
       });
-      if (typeof result.ts !== "string") {
-        this.#messageProjectionDisabled = true;
-        throw new Error("Slack did not return a timestamp for Koe activity");
+      return { result, postedText: text };
+    } catch (error) {
+      if (!isSlackMessageTooLong(error)) throw error;
+      const compactText = this.#compactActivityMessage();
+      try {
+        const result = await this.#client.chat.postMessage({
+          channel: this.#channelId,
+          thread_ts: this.#rootThreadTs,
+          text: compactText,
+          ...this.#presentation,
+        });
+        return { result, postedText: compactText };
+      } catch (retryError) {
+        if (isSlackMessageTooLong(retryError)) {
+          this.#messageProjectionDisabled = true;
+        }
+        throw retryError;
       }
-      this.#messageTs = result.ts;
-      this.#lastPostedText = text;
-      this.#lastUpdateAt = this.#now();
-      return;
     }
-    await this.#client.chat.update({
-      channel: this.#channelId,
-      ts: this.#messageTs,
-      text,
-    });
-    this.#lastPostedText = text;
-    this.#lastUpdateAt = this.#now();
+  }
+
+  async #updateActivityMessage(text: string): Promise<string> {
+    try {
+      await this.#client.chat.update({
+        channel: this.#channelId,
+        ts: this.#messageTs!,
+        text,
+      });
+      return text;
+    } catch (error) {
+      if (!isSlackMessageTooLong(error)) throw error;
+      const compactText = this.#compactActivityMessage();
+      try {
+        await this.#client.chat.update({
+          channel: this.#channelId,
+          ts: this.#messageTs!,
+          text: compactText,
+        });
+        return compactText;
+      } catch (retryError) {
+        if (isSlackMessageTooLong(retryError)) {
+          this.#messageProjectionDisabled = true;
+        }
+        throw retryError;
+      }
+    }
+  }
+
+  #compactActivityMessage(): string {
+    this.#compactActivityProjection = true;
+    const text = this.#renderActivityMessage();
+    assertSafeSlackMessage(text);
+    return text;
   }
 
   #recordToolStart(toolCallId: string, name: string): boolean {
@@ -341,21 +424,41 @@ export class SlackThreadProjector {
   }
 
   #renderActivityMessage(): string {
-    const agentText = formatAgentTextForSlack(this.#text, MAX_STREAM_AGENT_TEXT);
     const toolProgress = this.#renderToolProgress();
+    const separator = toolProgress.length === 0 ? "" : "\n\n";
+    const maxAgentText = this.#compactActivityProjection
+      ? MAX_COMPACT_STREAM_AGENT_TEXT
+      : MAX_STREAM_AGENT_TEXT;
+    const maxAgentUtf8Bytes = this.#compactActivityProjection
+      ? MAX_COMPACT_STREAM_AGENT_UTF8_BYTES
+      : MAX_STREAM_AGENT_UTF8_BYTES;
+    const agentText = formatAgentTextForSlack(
+      this.#text,
+      Math.min(
+        maxAgentText,
+        MAX_SLACK_MESSAGE_TEXT - separator.length - toolProgress.length,
+      ),
+      Math.min(
+        maxAgentUtf8Bytes,
+        MAX_SLACK_MESSAGE_UTF8_BYTES -
+          utf8ByteLength(separator) -
+          utf8ByteLength(toolProgress),
+      ),
+    );
     if (agentText.length === 0) return toolProgress;
     if (toolProgress.length === 0) return agentText;
-    return `${agentText}\n\n${toolProgress}`;
+    return `${agentText}${separator}${toolProgress}`;
   }
 
   async #publishFinalMessagesToActivity(): Promise<void> {
     if (this.#finalMessagesPublished || this.#messageProjectionDisabled) return;
-    this.#finalMessagesPublished = true;
-
-    const messages = this.#renderFinalMessages();
+    this.#activityFinalMessages ??= this.#renderFinalMessages();
+    const messages = this.#activityFinalMessages;
     const toolProgress = this.#renderToolProgress();
     await this.#upsertPrimaryMessage(messages[0] ?? toolProgress);
-    for (const message of messages.slice(1)) {
+    while (this.#activityFinalPublishedCount < messages.length - 1) {
+      const message = messages[this.#activityFinalPublishedCount + 1];
+      if (message === undefined) break;
       const result = await this.#client.chat.postMessage({
         channel: this.#channelId,
         thread_ts: this.#rootThreadTs,
@@ -365,13 +468,23 @@ export class SlackThreadProjector {
       if (typeof result.ts !== "string") {
         throw new Error("Slack did not return a timestamp for Koe continuation");
       }
+      this.#activityFinalPublishedCount += 1;
     }
+    this.#finalMessagesPublished = true;
   }
 
   #renderFinalMessages(): string[] {
 
-    const agentText = formatAgentTextForSlack(this.#text, MAX_FINAL_AGENT_TEXT);
-    const allChunks = splitSlackText(agentText, MAX_FINAL_CHUNK_BODY);
+    const agentText = formatAgentTextForSlack(
+      this.#text,
+      MAX_FINAL_AGENT_TEXT,
+      MAX_FINAL_AGENT_UTF8_BYTES,
+    );
+    const allChunks = splitSlackText(
+      agentText,
+      MAX_FINAL_CHUNK_BODY,
+      MAX_FINAL_CHUNK_UTF8_BYTES,
+    );
     let chunks = allChunks.slice(0, this.#maxFinalChunks);
     if (allChunks.length > this.#maxFinalChunks && chunks.length > 0) {
       chunks[chunks.length - 1] = `${chunks.at(-1)}\n\n_(Response truncated in Slack.)_`;
@@ -416,6 +529,13 @@ export class SlackThreadProjector {
 
   async #publishFinalReply(): Promise<void> {
     if (this.#finalMessagesPublished || this.#sourceUserMention === undefined) return;
+
+    if (this.#terminalErrorPosted && this.#text.trim().length === 0) {
+      // The actionable error already notified the source user. Do not append a
+      // contradictory generic success message to a failed, text-less turn.
+      this.#finalMessagesPublished = true;
+      return;
+    }
 
     if (this.#finalReplyMessages === undefined) {
       const messages = this.#renderFinalMessages();
@@ -523,8 +643,11 @@ export class SlackThreadProjector {
     }`;
   }
 
-  #runningToolCount(): number {
-    return this.#activeTools.size + this.#overflowRunningToolCount;
+  #activityUpdateDue(): boolean {
+    return (
+      this.#messageTs === undefined ||
+      this.#now() - this.#lastUpdateAt >= UPDATE_INTERVAL_MS
+    );
   }
 
   #syncHeartbeat(): void {
@@ -539,8 +662,12 @@ export class SlackThreadProjector {
     }
     if (this.#cancelHeartbeat !== undefined) return;
 
-    const elapsedSinceUpdate = Math.max(0, this.#now() - this.#lastUpdateAt);
-    const delayMs = Math.max(0, HEARTBEAT_INTERVAL_MS - elapsedSinceUpdate);
+    const lastActivityAt = Math.max(
+      this.#lastUpdateAt,
+      this.#lastHeartbeatAttemptAt,
+    );
+    const elapsedSinceActivity = Math.max(0, this.#now() - lastActivityAt);
+    const delayMs = Math.max(0, HEARTBEAT_INTERVAL_MS - elapsedSinceActivity);
     this.#cancelHeartbeat = this.#heartbeatScheduler(async () => {
       this.#cancelHeartbeat = undefined;
       if (
@@ -550,8 +677,13 @@ export class SlackThreadProjector {
       ) {
         return;
       }
+      this.#lastHeartbeatAttemptAt = this.#now();
       try {
-        await this.#upsertAgentMessage();
+        if (
+          this.#now() - this.#lastUpdateAt >= HEARTBEAT_INTERVAL_MS
+        ) {
+          await this.#upsertAgentMessage();
+        }
       } catch {
         // Heartbeats are best-effort. Event and final-response projection must
         // continue even if a cosmetic Slack update fails.
@@ -618,12 +750,116 @@ export class SlackThreadProjector {
     if (typeof posted.ts !== "string") {
       throw new Error("Slack did not return a timestamp for Git approval UI");
     }
-    const blocks = buildWorkspaceGitApprovalBlocks(event.prompt, event.plan, {
+    const routing = {
       version: 1,
       requestId: event.requestId,
       channelId: this.#channelId,
       rootThreadTs: this.#rootThreadTs,
       messageTs: posted.ts,
+    } as const;
+    const canToggleDetails = this.#gitApprovalDetailsStore !== undefined;
+    const blocks = buildWorkspaceGitApprovalBlocks(
+      event.prompt,
+      event.plan,
+      routing,
+      {
+        pathsExpanded: !canToggleDetails,
+        allowPathToggle: canToggleDetails,
+        bodyExpanded: !canToggleDetails,
+        allowBodyToggle: canToggleDetails,
+      },
+    );
+    this.#gitApprovalDetailsStore?.remember({
+      prompt: event.prompt,
+      plan: event.plan,
+      routing,
+      fallbackText: fallback,
+      display: {
+        pathsExpanded: !canToggleDetails,
+        bodyExpanded: !canToggleDetails,
+      },
+      ...(this.#sourceUserMention === undefined
+        ? {}
+        : { sourceUserMention: this.#sourceUserMention }),
+    });
+    try {
+      await this.#client.chat.update({
+        channel: this.#channelId,
+        ts: posted.ts,
+        text: fallback,
+        blocks:
+          this.#sourceUserMention === undefined
+            ? blocks
+            : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+      });
+    } catch (error) {
+      this.#gitApprovalDetailsStore?.forget(routing);
+      throw error;
+    }
+  }
+
+  async #postApproval(
+    event: Extract<AgentEvent, { type: "approval.requested" }>,
+  ): Promise<void> {
+    const fallback = this.#formatActionableMessage(
+      event.summary,
+      this.#sourceUserMention !== undefined,
+    );
+    const posted = await this.#client.chat.postMessage({
+      channel: this.#channelId,
+      thread_ts: this.#rootThreadTs,
+      text: fallback,
+      mrkdwn: this.#sourceUserMention !== undefined,
+      ...this.#presentation,
+    });
+    if (typeof posted.ts !== "string") {
+      throw new Error("Slack did not return a timestamp for approval UI");
+    }
+    const blocks = buildApprovalBlocks(event.summary, {
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      messageTs: posted.ts,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+    }, event.availableDecisions);
+    await this.#client.chat.update({
+      channel: this.#channelId,
+      ts: posted.ts,
+      text: fallback,
+      blocks:
+        this.#sourceUserMention === undefined
+          ? blocks
+          : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+    });
+  }
+
+  async #postChoice(
+    event: Extract<AgentEvent, { type: "choice.requested" }>,
+  ): Promise<void> {
+    const fallback = this.#formatActionableMessage(
+      `選択してください: ${event.question.header}`,
+      this.#sourceUserMention !== undefined,
+    );
+    const posted = await this.#client.chat.postMessage({
+      channel: this.#channelId,
+      thread_ts: this.#rootThreadTs,
+      text: fallback,
+      mrkdwn: this.#sourceUserMention !== undefined,
+      ...this.#presentation,
+    });
+    if (typeof posted.ts !== "string") {
+      throw new Error("Slack did not return a timestamp for structured choice UI");
+    }
+    const blocks = buildChoiceBlocks(event.question, {
+      version: 1,
+      requestId: event.requestId,
+      questionId: event.question.id,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      messageTs: posted.ts,
+      ...(this.#sourceUserId === undefined
+        ? {}
+        : { responderUserId: this.#sourceUserId }),
     });
     await this.#client.chat.update({
       channel: this.#channelId,
@@ -678,6 +914,7 @@ export class SlackThreadProjector {
     const body = formatAgentTextForSlack(
       text,
       MAX_SLACK_MESSAGE_TEXT - suffix.length,
+      MAX_SLACK_MESSAGE_UTF8_BYTES - utf8ByteLength(suffix),
     );
     if (body.length === 0) return suffix.trimStart();
     return `${body}${suffix}`;
@@ -739,7 +976,25 @@ function appendBounded(current: string, addition: string, limit: number): string
 }
 
 function assertSafeSlackMessage(text: string): void {
-  if (text.length > MAX_SLACK_MESSAGE_TEXT) {
+  if (
+    text.length > MAX_SLACK_MESSAGE_TEXT ||
+    utf8ByteLength(text) > MAX_SLACK_MESSAGE_UTF8_BYTES
+  ) {
     throw new Error("Slack Koe response exceeded the safe message limit");
   }
+}
+
+function isSlackMessageTooLong(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const record = error as {
+    readonly code?: unknown;
+    readonly data?: { readonly error?: unknown };
+    readonly message?: unknown;
+  };
+  return (
+    record.data?.error === "msg_too_long" ||
+    record.code === "msg_too_long" ||
+    (typeof record.message === "string" &&
+      /\bmsg_too_long\b/u.test(record.message))
+  );
 }

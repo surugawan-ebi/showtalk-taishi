@@ -67,8 +67,8 @@ scope.
 
 - Slack messages and replies streamed from durable Codex threads;
 - channel-wide or Slack-thread-scoped conversation mapping;
-- command, file-change, structured-input, and exact Git-plan approvals in
-  Block Kit;
+- ordinary structured choices plus command, file-change, and exact Git-plan
+  approvals in Block Kit;
 - Status, Interrupt, and approver-only Gateway restart controls;
 - multi-image and audio attachment ingress, plus permission-checked file
   delivery back to Slack;

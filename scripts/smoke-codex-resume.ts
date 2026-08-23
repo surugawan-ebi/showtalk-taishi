@@ -79,6 +79,7 @@ const createSmokeRuntime = () =>
       presentPermissionApproval: async () => {
         throw new Error("The Codex resume smoke must not request human approval");
       },
+      settlePermissionApproval: async () => undefined,
     }),
   });
 const runTurn = async (runtime: RunningTaishi, text: string): Promise<string> => {

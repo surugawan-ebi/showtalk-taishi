@@ -261,14 +261,19 @@ export class Gateway {
       throw error;
     } finally {
       try {
-        if (session !== undefined && completedNormally) {
+        if (session !== undefined) {
           const current = this.#registry.requireSession(session.id);
           if (
             current.status === "starting" ||
             current.status === "running" ||
-            current.status === "waiting_for_approval"
+            current.status === "waiting_for_approval" ||
+            current.status === "waiting_for_input"
           ) {
-            this.#registry.updateSessionStatus(session.id, "idle", this.#timestamp());
+            this.#registry.updateSessionStatus(
+              session.id,
+              completedNormally ? "idle" : "interrupted",
+              this.#timestamp(),
+            );
             await this.#onStateChanged();
           }
         }
@@ -634,7 +639,8 @@ function classifyActiveTurn(
   if (
     status !== "starting" &&
     status !== "running" &&
-    status !== "waiting_for_approval"
+    status !== "waiting_for_approval" &&
+    status !== "waiting_for_input"
   ) {
     return undefined;
   }

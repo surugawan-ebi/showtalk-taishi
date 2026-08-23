@@ -42,6 +42,19 @@ plan before requesting approval again.
 Selecting `承認して実行` resumes the original Codex request. The resumed turn
 must still use workspace-git's status, approval, and execute boundaries;
 ShowTalk does not directly perform the Git write from a Slack callback.
+The bound Slack button response is the fresh human approval boundary, so the
+resumed Codex turn must not stop with an acknowledgement or defer the exact
+approved operation to another user message. It revalidates, records and
+confirms approval, and calls the matching `execute_approved_*` tool once when
+the immutable plan still matches. Rejection, expiry, mismatch, an already
+rejected or executed operation, or an inconclusive state remains fail-closed.
+If the approved turn nevertheless ends before the exact execute tool is
+observed, ShowTalk first checks the complete final App Server item snapshot.
+Only when it contains neither an execute attempt nor a terminal workspace-git
+status does ShowTalk start one bounded continuation turn carrying the same
+in-memory binding. Failed, incomplete, already terminal, or incompletely loaded
+results are never retried automatically. A second non-executing completion is
+surfaced as an error.
 
 ## Attachments
 

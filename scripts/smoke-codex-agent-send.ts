@@ -76,6 +76,7 @@ const runtime = await createRuntime(config, {
     presentPermissionApproval: async () => {
       throw new Error("The Codex agent.send smoke must not request human approval");
     },
+    settlePermissionApproval: async () => undefined,
   }),
 });
 

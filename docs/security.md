@@ -60,11 +60,14 @@ The MCP Streamable HTTP server:
   callers do not share mutable identity state;
 - never accepts source Agent ID, hop depth, or causation ID as tool arguments.
 
-MCP JSON-RPC request identity is combined with the authenticated Agent and tool
-name to deduplicate retried side-effecting calls in the current runtime. A retry
-with matching arguments receives the same in-flight or completed result; reuse
-with different arguments is rejected. The bounded cache is process-local, so
-Taishi does not promise restart-spanning exactly-once execution.
+MCP JSON-RPC request identity is combined with the authenticated Agent, tool,
+canonical arguments, and the process-local active Gateway turn to deduplicate
+retried side-effecting calls. JSON-RPC IDs are only client-local, so reconnects
+and separate backend threads may reuse them with different arguments without
+colliding. Outside a live Gateway-owned turn, an exact request-ID and argument
+match may still be treated as a retry within the bounded cache. The cache is
+process-local, so Taishi does not promise restart-spanning exactly-once
+execution.
 
 The per-Koe MCP server is injected into both new and resumed Codex threads as
 a required server. Taishi does not write its bearer token to `config.yaml`, the
@@ -112,10 +115,17 @@ because they are the explicit operator-managed purpose of the screen.
 When any editable value is backed by an environment reference, the projection
 shows the raw `${NAME}` expression instead of the resolved value.
 
-Writes carry the source YAML's SHA-256 revision, reject stale updates, preserve
-unchanged environment-reference nodes, validate the complete candidate against
-the normal schema, and replace only an owner-private regular file using a
-same-directory atomic rename. Saving does not hot-patch the running registry.
+Writes carry a composite SHA-256 revision of `config.yaml` and the management
+sidecar, reject stale updates, and validate the complete merged candidate
+against the normal schema. The UI never writes `config.yaml`; it stores only
+allowlisted Koe fields in owner-only `admin-config-overrides.v1.json` beside
+runtime state. Each entry is bound to the hash of its raw canonical value.
+Unrelated operator edits are preserved, while a same-field edit is an explicit
+fail-closed conflict. The sidecar schema cannot address tokens, adapter
+commands, permissions, or environment pass-through settings and never stores
+resolved credential values. Sidecar updates use a same-directory synchronized
+temporary file and atomic rename. Saving does not hot-patch the running
+registry.
 The separate restart action enters the existing Supervisor drain-and-replace
 path after its HTTP response completes; it never sends a process signal.
 
@@ -164,10 +174,13 @@ spool directories with owner-only permissions. A serialized per-Koe 1 GiB
 spool quota bounds persistent disk use. Unsupported formats are not downloaded.
 
 Koe-originated uploads accept only relative paths beneath that Koe's
-configured workspace. Resolution checks the real workspace and target paths,
-rejects workspace-external symlinks, and allows only regular supported image or
-audio files. Uploads occur only after Slack write policy allows them. Model text
-is never scanned for paths to upload implicitly.
+configured workspace. Every symbolic-link component is rejected; the canonical
+file and each parent directory are checked again around descriptor-based reads,
+and immutable bytes are captured before Slack upload. Only regular supported
+image or audio files are allowed. A process-wide byte lease bounds concurrent
+captures until Slack finishes or compensates the upload. Uploads occur only
+after Slack write policy allows them. Model text is never scanned for paths to
+upload implicitly.
 
 Interactive payloads are parsed with strict action prefixes, key sets, size
 limits, channel binding, and request IDs. Only configured approver Slack user
@@ -209,6 +222,21 @@ remains authoritative: after the structured answer, Codex must re-read status,
 record the exact approval, verify the approved state, and call the matching
 `execute_approved_*` tool once. workspace-git performs its own hash, expiry,
 snapshot/worktree or PR HEAD/state revalidation before any external write.
+The authenticated structured answer is a human interaction boundary inside
+the resumed App Server turn. It is not assistant self-approval, and an accepted
+exact plan must not be deferred merely because prepare and execute appear in
+the same App Server turn. A rejection or failed revalidation never reaches the
+execute boundary.
+
+If the Codex turn ends after the bound approval but before the exact execute
+tool is observed, the Adapter reconciles the complete final turn item snapshot.
+It starts at most one continuation turn only when no execute attempt and no
+terminal workspace-git status is present. It does not create a new approval,
+change scope, or select another operation. Missing execution after that bounded
+continuation, incomplete final items, and failed or unfinished execute calls are
+reported as errors and are not retried. Already rejected, executing, applied,
+partial, failed, outcome-uncertain, or expired operations are terminal and are
+not replayed.
 
 This means v0.1 still trusts the resumed Codex turn to coordinate the private
 approval-record step. Taishi does not possess a model-isolated workspace-git
@@ -216,6 +244,16 @@ decision broker. Operators whose threat model includes a malicious model
 should approve through Codex App until a dedicated authenticated broker can
 atomically bind the Slack decision to workspace-git's operation ID and plan
 hash without model mediation.
+
+Ordinary structured questions are classified only after the bounded
+same-turn Git-plan race window. They use a separate Slack action namespace and
+carry only opaque request-local question/option IDs plus message routing.
+Model-provided labels and prompts are displayed but never placed in action
+values. A direct Slack question is answerable only by the user who started the
+turn; a Koe-to-Koe question without a source user falls back to configured
+operators. Secret questions are not projected. Free text is accepted only
+when the App Server question explicitly allows `Other`, is length bounded,
+and is returned as an answer—not as approval authority.
 
 Status inspection is available to members who can see the Koe channel.
 
@@ -302,10 +340,11 @@ with owner-only modes. Writes are serialized and atomically renamed. Taishi
 holds an exclusive adjacent lock for the runtime lifetime and rejects a second
 live process that targets the same state file; a dead-PID lock can be recovered.
 
-Pending approvals and structured Git choices are bound to live RPC/tool
-requests and remain in memory. They are single-use, expire, and resolve to
-denial or rejection during shutdown. After a
-restart, stale `starting`, `running`, and `waiting_for_approval` statuses become
+Pending approvals, structured Git choices, and ordinary structured questions
+are bound to live RPC/tool requests and remain in memory. They are single-use,
+expire, and resolve to denial, rejection, or cancellation during shutdown.
+After a restart, stale `starting`, `running`, `waiting_for_approval`, and
+`waiting_for_input` statuses become
 `interrupted`; the persistent Codex thread can then be resumed by the next
 message.
 

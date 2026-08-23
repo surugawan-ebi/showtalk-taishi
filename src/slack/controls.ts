@@ -7,6 +7,7 @@ export type ConversationControlAction = "status" | "interrupt" | "restart";
 export interface ConversationControlActionValue {
   readonly channelId: string;
   readonly rootThreadTs: string;
+  readonly messageTs: string;
 }
 
 const MAX_ACTION_VALUE_LENGTH = 512;
@@ -88,11 +89,13 @@ export function parseConversationControlActionValue(
   const record = parsed as Record<string, unknown>;
   const keys = Object.keys(record);
   if (
-    keys.length !== 2 ||
+    keys.length !== 3 ||
     !keys.includes("channelId") ||
     !keys.includes("rootThreadTs") ||
+    !keys.includes("messageTs") ||
     countLiteralKey(value, "channelId") !== 1 ||
-    countLiteralKey(value, "rootThreadTs") !== 1
+    countLiteralKey(value, "rootThreadTs") !== 1 ||
+    countLiteralKey(value, "messageTs") !== 1
   ) {
     throw invalidActionValue();
   }
@@ -107,7 +110,9 @@ function validateActionValue(
     typeof value.channelId !== "string" ||
     !CHANNEL_ID_PATTERN.test(value.channelId) ||
     typeof value.rootThreadTs !== "string" ||
-    !ROOT_THREAD_TS_PATTERN.test(value.rootThreadTs)
+    !ROOT_THREAD_TS_PATTERN.test(value.rootThreadTs) ||
+    typeof value.messageTs !== "string" ||
+    !ROOT_THREAD_TS_PATTERN.test(value.messageTs)
   ) {
     throw invalidActionValue();
   }
@@ -115,6 +120,7 @@ function validateActionValue(
   return {
     channelId: value.channelId,
     rootThreadTs: value.rootThreadTs,
+    messageTs: value.messageTs,
   };
 }
 

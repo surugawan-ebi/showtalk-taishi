@@ -50,6 +50,7 @@ export interface CodexThread {
   sessionId?: string;
   name?: string | null;
   ephemeral?: boolean;
+  historyMode?: "legacy" | "paginated";
   status?: unknown;
   turns?: CodexTurn[];
 }
@@ -126,10 +127,27 @@ export interface ThreadResumeParams {
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   config?: Readonly<Record<string, CodexJsonValue>>;
   developerInstructions?: string;
+  /** Avoid full-history hydration and support paginated Codex App threads. */
+  excludeTurns?: boolean;
+}
+
+export interface ThreadTurnsListParams {
+  readonly cursor?: string | null;
+  readonly limit?: number | null;
+  readonly sortDirection?: "asc" | "desc" | null;
+  readonly itemsView?: "notLoaded" | "summary" | "full" | null;
+}
+
+export interface ThreadTurnsListResponse {
+  readonly data: readonly CodexTurn[];
+  readonly nextCursor: string | null;
+  readonly backwardsCursor: string | null;
 }
 
 export interface TurnStartParams {
   threadId: string;
+  /** Correlates this client-owned turn before the turn/start response arrives. */
+  clientUserMessageId?: string | null;
   input: CodexUserInput[];
   /** Per-turn client context. Unlike thread settings, this is not sticky. */
   additionalContext?: Readonly<Record<string, CodexAdditionalContextEntry>>;
@@ -160,6 +178,8 @@ export interface CommandApprovalRequest {
   command?: string | null;
   cwd?: string | null;
   commandActions?: unknown[] | null;
+  /** Ordered choices the App Server allows this client to present. */
+  availableDecisions?: readonly unknown[] | null;
 }
 
 export interface FileChangeApprovalRequest {

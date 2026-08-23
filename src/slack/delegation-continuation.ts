@@ -15,6 +15,7 @@ import { formatAgentTextForSlack } from "./text-format.js";
 const MAX_FALLBACK_RESULT_TEXT = 3_000;
 
 export interface UserInputProjectionFailure {
+  readonly kind: "git_approval" | "choice" | "approval";
   readonly sessionId: string;
   readonly channelId: string;
   readonly rootThreadTs: string;
@@ -61,10 +62,18 @@ export async function projectDelegationContinuation(
         await projector.project(result.event);
       } catch (error) {
         if (
-          result.event.type === "user_input.requested" &&
+          (result.event.type === "user_input.requested" ||
+            result.event.type === "choice.requested" ||
+            result.event.type === "approval.requested") &&
           onUserInputProjectionFailure !== undefined
         ) {
           await onUserInputProjectionFailure({
+            kind:
+              result.event.type === "user_input.requested"
+                ? "git_approval"
+                : result.event.type === "approval.requested"
+                  ? "approval"
+                  : "choice",
             sessionId: result.sessionId,
             channelId: result.conversation.channelId,
             rootThreadTs: result.conversation.rootThreadTs,

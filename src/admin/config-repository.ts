@@ -1,6 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { isMap, parseDocument, type Document } from "yaml";
 
@@ -8,6 +7,17 @@ import {
   expandEnvironmentReferences,
   ConfigError,
 } from "../config/loader.js";
+import {
+  AdminOverrideConflictError,
+  AdminOverrideError,
+  adminConfigRevision,
+  adminOverridesPath,
+  applyAdminOverrides,
+  buildAdminOverrides,
+  loadAdminOverrides,
+  serializeAdminOverrides,
+  writeAdminOverrides,
+} from "../config/admin-overrides.js";
 import { taishiConfigSchema, type TaishiConfig } from "../config/schema.js";
 
 export interface AdminSlackConfig {
@@ -55,16 +65,28 @@ export class AdminConfigConflictError extends Error {
 export class YamlAdminConfigRepository {
   readonly #path: string;
   readonly #environment: NodeJS.ProcessEnv;
+  readonly #configuredOverridesPath: string | undefined;
   #writeQueue: Promise<void> = Promise.resolve();
 
-  constructor(path: string, environment: NodeJS.ProcessEnv = process.env) {
+  constructor(
+    path: string,
+    environment: NodeJS.ProcessEnv = process.env,
+    overridesPath?: string,
+  ) {
     this.#path = resolve(path);
     this.#environment = environment;
+    this.#configuredOverridesPath =
+      overridesPath === undefined ? undefined : resolve(overridesPath);
   }
 
   async read(): Promise<AdminConfigSnapshot> {
     const loaded = await this.#loadDocument();
-    return snapshotFromConfig(loaded.config, loaded.source, loaded.document);
+    return snapshotFromConfig(
+      loaded.config,
+      loaded.canonicalSource,
+      loaded.overrideSource,
+      loaded.document,
+    );
   }
 
   async save(update: AdminConfigUpdate): Promise<AdminConfigSnapshot> {
@@ -82,7 +104,7 @@ export class YamlAdminConfigRepository {
 
   async #saveExclusive(update: AdminConfigUpdate): Promise<AdminConfigSnapshot> {
     const loaded = await this.#loadDocument();
-    if (revisionOf(loaded.source) !== update.revision) {
+    if (loaded.revision !== update.revision) {
       throw new AdminConfigConflictError(
         "The configuration changed after this page was loaded. Reload and try again.",
       );
@@ -113,54 +135,106 @@ export class YamlAdminConfigRepository {
       applyAgentUpdate(loaded.document, incoming, current);
     }
 
-    const nextSource = loaded.document.toString({ lineWidth: 0 });
-    validateConfigSource(nextSource, this.#environment);
-    await atomicWrite(this.#path, nextSource, update.revision);
+    validateConfigValue(loaded.document.toJS(), this.#environment);
+    const nextOverrides = buildAdminOverrides(
+      loaded.baseDocument,
+      loaded.document,
+      configuredIds,
+    );
+    const nextOverrideSource = serializeAdminOverrides(nextOverrides);
+    const currentCanonicalSource = await readFile(this.#path, "utf8");
+    if (currentCanonicalSource !== loaded.canonicalSource) {
+      throw new AdminConfigConflictError(
+        "The operator configuration changed while admin settings were being saved. Reload and try again.",
+      );
+    }
+    try {
+      await writeAdminOverrides(
+        loaded.overridePath,
+        nextOverrideSource,
+        loaded.overrideSource,
+      );
+    } catch (error) {
+      throw mapAdminOverrideError(error);
+    }
     return this.read();
   }
 
   async #loadDocument(): Promise<{
-    source: string;
+    canonicalSource: string;
+    overrideSource: string;
+    overridePath: string;
+    revision: string;
+    baseDocument: Document;
     document: Document;
     config: TaishiConfig;
   }> {
-    let source: string;
+    let canonicalSource: string;
     try {
-      source = await readFile(this.#path, "utf8");
+      canonicalSource = await readFile(this.#path, "utf8");
     } catch (error) {
       throw new ConfigError(`Unable to read configuration file: ${this.#path}`, error);
     }
-    const document = parseDocument(source);
-    if (document.errors.length > 0) {
+    const baseDocument = parseDocument(canonicalSource);
+    if (baseDocument.errors.length > 0) {
       throw new ConfigError(
         `Invalid YAML in configuration file: ${this.#path}`,
-        document.errors[0],
+        baseDocument.errors[0],
       );
     }
-    const config = validateConfigValue(document.toJS(), this.#environment);
-    return { source, document, config };
+    const baseConfig = validateConfigValue(baseDocument.toJS(), this.#environment);
+    const overridePath =
+      this.#configuredOverridesPath ??
+      adminOverridesPath(baseConfig.gateway.state_file);
+    try {
+      const overrides = await loadAdminOverrides(overridePath);
+      const document = applyAdminOverrides(baseDocument, overrides.file);
+      const config = validateConfigValue(document.toJS(), this.#environment);
+      return {
+        canonicalSource,
+        overrideSource: overrides.source,
+        overridePath,
+        revision: adminConfigRevision(canonicalSource, overrides.source),
+        baseDocument,
+        document,
+        config,
+      };
+    } catch (error) {
+      throw mapAdminOverrideError(error);
+    }
   }
 }
 
 function snapshotFromConfig(
   config: TaishiConfig,
-  source: string,
+  canonicalSource: string,
+  overrideSource: string,
   document: Document,
 ): AdminConfigSnapshot {
   return {
-    revision: revisionOf(source),
+    revision: adminConfigRevision(canonicalSource, overrideSource),
     available_adapters: Object.keys(config.adapters),
     agents: Object.entries(config.agents).map(([id, agent]) => ({
       id,
       adapter: agent.adapter,
       ...(config.adapters[agent.adapter]?.model === undefined
         ? {}
-        : { adapter_model: config.adapters[agent.adapter]!.model }),
+        : {
+            adapter_model: rawString(
+              document,
+              ["adapters", agent.adapter, "model"],
+              config.adapters[agent.adapter]!.model!,
+            ),
+          }),
       ...(config.adapters[agent.adapter]?.reasoning_effort === undefined
         ? {}
         : {
             adapter_reasoning_effort:
-              config.adapters[agent.adapter]!.reasoning_effort,
+              rawString(
+                document,
+                ["adapters", agent.adapter, "reasoning_effort"],
+                config.adapters[agent.adapter]!.reasoning_effort!,
+              ),
           }),
       ...(agent.adapter_session_id === undefined
         ? {}
@@ -171,10 +245,24 @@ function snapshotFromConfig(
               agent.adapter_session_id,
             ),
           }),
-      ...(agent.model === undefined ? {} : { model: agent.model }),
+      ...(agent.model === undefined
+        ? {}
+        : {
+            model: rawString(
+              document,
+              ["agents", id, "model"],
+              agent.model,
+            ),
+          }),
       ...(agent.reasoning_effort === undefined
         ? {}
-        : { reasoning_effort: agent.reasoning_effort }),
+        : {
+            reasoning_effort: rawString(
+              document,
+              ["agents", id, "reasoning_effort"],
+              agent.reasoning_effort,
+            ),
+          }),
       workspace_path: rawString(
         document,
         ["agents", id, "workspace", "path"],
@@ -380,17 +468,6 @@ function cleanOptional(value: string | undefined): string | undefined {
   return trimmed.length === 0 ? undefined : trimmed;
 }
 
-function validateConfigSource(
-  source: string,
-  environment: NodeJS.ProcessEnv,
-): TaishiConfig {
-  const document = parseDocument(source);
-  if (document.errors.length > 0) {
-    throw new ConfigError("The updated configuration is not valid YAML", document.errors[0]);
-  }
-  return validateConfigValue(document.toJS(), environment);
-}
-
 function validateConfigValue(
   value: unknown,
   environment: NodeJS.ProcessEnv,
@@ -406,46 +483,12 @@ function validateConfigValue(
   return result.data;
 }
 
-function revisionOf(source: string): string {
-  return createHash("sha256").update(source).digest("hex");
-}
-
-async function atomicWrite(
-  path: string,
-  source: string,
-  expectedRevision: string,
-): Promise<void> {
-  const metadata = await lstat(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new ConfigError("The configuration path must be a regular file, not a symlink");
+function mapAdminOverrideError(error: unknown): Error {
+  if (error instanceof AdminOverrideConflictError) {
+    return new AdminConfigConflictError(error.message);
   }
-  if ((metadata.mode & 0o077) !== 0) {
-    throw new ConfigError(
-      "The configuration file must not be readable or writable by group or other users",
-    );
+  if (error instanceof AdminOverrideError) {
+    return new ConfigError(error.message, error);
   }
-  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
-    throw new ConfigError("The configuration file must be owned by the Gateway user");
-  }
-  const temporaryPath = join(
-    dirname(path),
-    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
-  );
-  try {
-    await writeFile(temporaryPath, source, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: metadata.mode & 0o777,
-    });
-    const currentSource = await readFile(path, "utf8");
-    if (revisionOf(currentSource) !== expectedRevision) {
-      throw new AdminConfigConflictError(
-        "The configuration changed while it was being saved. Reload and try again.",
-      );
-    }
-    await rename(temporaryPath, path);
-  } catch (error) {
-    await unlink(temporaryPath).catch(() => undefined);
-    throw error;
-  }
+  return error instanceof Error ? error : new Error(String(error));
 }

@@ -1,7 +1,13 @@
 import { readFile } from "node:fs/promises";
 
-import { parse as parseYaml } from "yaml";
+import { parseDocument, type Document } from "yaml";
 
+import {
+  AdminOverrideError,
+  adminOverridesPath,
+  applyAdminOverrides,
+  loadAdminOverrides,
+} from "./admin-overrides.js";
 import { taishiConfigSchema, type TaishiConfig } from "./schema.js";
 
 const ENV_REFERENCE = /\$\{([A-Z_][A-Z0-9_]*)\}/g;
@@ -16,6 +22,7 @@ export class ConfigError extends Error {
 export async function loadConfig(
   path: string,
   environment: NodeJS.ProcessEnv = process.env,
+  options: { readonly adminOverridesPath?: string } = {},
 ): Promise<TaishiConfig> {
   let source: string;
   try {
@@ -24,13 +31,36 @@ export async function loadConfig(
     throw new ConfigError(`Unable to read configuration file: ${path}`, error);
   }
 
-  let document: unknown;
-  try {
-    document = parseYaml(source);
-  } catch (error) {
-    throw new ConfigError(`Invalid YAML in configuration file: ${path}`, error);
+  const baseDocument = parseDocument(source);
+  if (baseDocument.errors.length > 0) {
+    throw new ConfigError(
+      `Invalid YAML in configuration file: ${path}`,
+      baseDocument.errors[0],
+    );
   }
 
+  const baseConfig = validateConfig(baseDocument.toJS(), environment);
+  const overridePath =
+    options.adminOverridesPath ?? adminOverridesPath(baseConfig.gateway.state_file);
+  let effectiveDocument: Document = baseDocument;
+  try {
+    const overrides = await loadAdminOverrides(overridePath);
+    if (overrides.file.overrides.length > 0) {
+      effectiveDocument = applyAdminOverrides(baseDocument, overrides.file);
+    }
+  } catch (error) {
+    if (error instanceof AdminOverrideError) {
+      throw new ConfigError(`Unable to apply admin settings: ${error.message}`, error);
+    }
+    throw error;
+  }
+  return validateConfig(effectiveDocument.toJS(), environment);
+}
+
+function validateConfig(
+  document: unknown,
+  environment: NodeJS.ProcessEnv,
+): TaishiConfig {
   const expanded = expandEnvironmentReferences(document, environment);
   const result = taishiConfigSchema.safeParse(expanded);
   if (!result.success) {

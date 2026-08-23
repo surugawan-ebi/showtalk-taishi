@@ -1,19 +1,42 @@
+import { Buffer } from "node:buffer";
+
 const MARKDOWN_LINK = /\[([^\]\r\n]{0,256})\]\(\s*(<[^>\r\n]{1,2048}>|[^)\s\r\n]{1,2048})\s*\)/gu;
 const INCOMPLETE_LOCAL_LINK = /\[([^\]\r\n]{0,256})\]\(\s*<?(?:\/|file:)[^)\r\n]*$/u;
 const HOME_PATH = /(^|[\s([{"'=])\/(?:Users|home)\/[^/\s]+(?=\/)/gu;
 
 /** Converts the small Markdown subset commonly emitted by coding Agents into
  * safe, readable Slack mrkdwn without exposing local link targets. */
-export function formatAgentTextForSlack(value: string, maxLength: number): string {
+export function formatAgentTextForSlack(
+  value: string,
+  maxLength: number,
+  maxUtf8Bytes = Number.POSITIVE_INFINITY,
+): string {
   if (maxLength <= 0) return "";
-  const escaped = escapeSlackBounded(normalizeMarkdown(value), maxLength);
-  return closeMarkdownCode(escaped.text, maxLength, escaped.truncated);
+  if (maxUtf8Bytes <= 0) return "";
+  const escaped = escapeSlackBounded(
+    normalizeMarkdown(value),
+    maxLength,
+    maxUtf8Bytes,
+  );
+  return closeMarkdownCode(
+    escaped.text,
+    maxLength,
+    maxUtf8Bytes,
+    escaped.truncated,
+  );
 }
 
 /** Splits already escaped Slack mrkdwn without breaking entities, Unicode, or
  * fenced/inline code across message boundaries. */
-export function splitSlackText(value: string, maxLength: number): string[] {
+export function splitSlackText(
+  value: string,
+  maxLength: number,
+  maxUtf8Bytes = Number.POSITIVE_INFINITY,
+): string[] {
   if (maxLength < 32) throw new RangeError("Slack chunk length must be at least 32");
+  if (maxUtf8Bytes < 32) {
+    throw new RangeError("Slack chunk byte length must be at least 32");
+  }
   if (value.length === 0) return [];
 
   const chunks: string[] = [];
@@ -21,14 +44,22 @@ export function splitSlackText(value: string, maxLength: number): string[] {
   let reopen = "";
   while (remaining.length > 0) {
     const rawBudget = Math.max(1, maxLength - reopen.length - 8);
-    const safeLength = preferredSafePrefixLength(remaining, rawBudget);
+    const rawByteBudget = Math.max(
+      1,
+      maxUtf8Bytes - utf8ByteLength(reopen) - 8,
+    );
+    const safeLength = preferredSafePrefixLength(
+      remaining,
+      rawBudget,
+      rawByteBudget,
+    );
     const raw = remaining.slice(0, safeLength);
     remaining = remaining.slice(safeLength);
 
     const body = `${reopen}${raw}`;
     const state = requiredCodeState(body);
     const chunk = `${body}${state.closure}`;
-    if (chunk.length > maxLength) {
+    if (chunk.length > maxLength || utf8ByteLength(chunk) > maxUtf8Bytes) {
       throw new Error("Slack chunk formatting exceeded its configured bound");
     }
     chunks.push(chunk);
@@ -317,9 +348,14 @@ interface EscapedText {
   readonly truncated: boolean;
 }
 
-function escapeSlackBounded(value: string, maxLength: number): EscapedText {
+function escapeSlackBounded(
+  value: string,
+  maxLength: number,
+  maxUtf8Bytes: number,
+): EscapedText {
   const chunks: string[] = [];
   let length = 0;
+  let utf8Bytes = 0;
   for (const character of value) {
     const replacement =
       character === "&"
@@ -329,26 +365,50 @@ function escapeSlackBounded(value: string, maxLength: number): EscapedText {
           : character === ">"
             ? "&gt;"
             : character;
-    if (length + replacement.length > maxLength) {
+    const replacementBytes = utf8ByteLength(replacement);
+    if (
+      length + replacement.length > maxLength ||
+      utf8Bytes + replacementBytes > maxUtf8Bytes
+    ) {
       return { text: chunks.join(""), truncated: true };
     }
     chunks.push(replacement);
     length += replacement.length;
+    utf8Bytes += replacementBytes;
   }
   return { text: chunks.join(""), truncated: false };
 }
 
-function closeMarkdownCode(value: string, maxLength: number, wasTruncated: boolean): string {
+function closeMarkdownCode(
+  value: string,
+  maxLength: number,
+  maxUtf8Bytes: number,
+  wasTruncated: boolean,
+): string {
   let text = value;
   let truncated = wasTruncated;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const closure = requiredCodeClosure(text);
     const suffix = `${truncated ? "…" : ""}${closure}`;
-    if (text.length + suffix.length <= maxLength) return `${text}${suffix}`;
-    text = truncateEscapedText(text, Math.max(0, maxLength - suffix.length));
+    const candidate = `${text}${suffix}`;
+    if (
+      candidate.length <= maxLength &&
+      utf8ByteLength(candidate) <= maxUtf8Bytes
+    ) {
+      return candidate;
+    }
+    text = truncateEscapedText(
+      text,
+      Math.max(0, maxLength - suffix.length),
+      Math.max(0, maxUtf8Bytes - utf8ByteLength(suffix)),
+    );
     truncated = true;
   }
-  return truncateEscapedText(`${text}…${requiredCodeClosure(text)}`, maxLength);
+  return truncateEscapedText(
+    `${text}…${requiredCodeClosure(text)}`,
+    maxLength,
+    maxUtf8Bytes,
+  );
 }
 
 function requiredCodeClosure(value: string): string {
@@ -398,13 +458,25 @@ function requiredCodeState(value: string): CodeContinuation {
   return { closure: "", reopen: "" };
 }
 
-function truncateEscapedText(value: string, maxLength: number): string {
-  if (maxLength <= 0) return "";
+function truncateEscapedText(
+  value: string,
+  maxLength: number,
+  maxUtf8Bytes = Number.POSITIVE_INFINITY,
+): string {
+  if (maxLength <= 0 || maxUtf8Bytes <= 0) return "";
   const chunks = escapedTextChunks(value);
   let output = "";
+  let utf8Bytes = 0;
   for (const chunk of chunks) {
-    if (output.length + chunk.length > maxLength) break;
+    const chunkBytes = utf8ByteLength(chunk);
+    if (
+      output.length + chunk.length > maxLength ||
+      utf8Bytes + chunkBytes > maxUtf8Bytes
+    ) {
+      break;
+    }
     output += chunk;
+    utf8Bytes += chunkBytes;
   }
   return output;
 }
@@ -434,12 +506,24 @@ function escapedTextChunks(value: string): string[] {
   return chunks;
 }
 
-function preferredSafePrefixLength(value: string, maxLength: number): number {
+function preferredSafePrefixLength(
+  value: string,
+  maxLength: number,
+  maxUtf8Bytes = Number.POSITIVE_INFINITY,
+): number {
   const chunks = escapedTextChunks(value);
   let length = 0;
+  let utf8Bytes = 0;
   for (const chunk of chunks) {
-    if (length + chunk.length > maxLength) break;
+    const chunkBytes = utf8ByteLength(chunk);
+    if (
+      length + chunk.length > maxLength ||
+      utf8Bytes + chunkBytes > maxUtf8Bytes
+    ) {
+      break;
+    }
     length += chunk.length;
+    utf8Bytes += chunkBytes;
   }
   if (length === 0) {
     throw new Error("A Slack text token exceeds the configured chunk size");
@@ -449,4 +533,8 @@ function preferredSafePrefixLength(value: string, maxLength: number): number {
   const prefix = value.slice(0, length);
   const newline = prefix.lastIndexOf("\n");
   return newline >= Math.floor(maxLength / 2) ? newline + 1 : length;
+}
+
+export function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
 }

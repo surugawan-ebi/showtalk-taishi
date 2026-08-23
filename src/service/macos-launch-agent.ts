@@ -127,14 +127,40 @@ export async function installMacOSLaunchAgent(
     await context.wait(250);
   }
 
-  await writePrivateFileAtomically(paths.plistPath, plist);
-  const bootstrap = await bootstrapLaunchAgent(context, paths.plistPath);
-  if (bootstrap.code !== 0) {
-    await restorePreviousPlist(paths.plistPath, previousPlist);
-    if (previousStatus.loaded && previousPlist !== undefined) {
-      await bootstrapLaunchAgent(context, paths.plistPath);
+  try {
+    await writePrivateFileAtomically(paths.plistPath, plist);
+    const bootstrap = await bootstrapLaunchAgent(context, paths.plistPath);
+    if (bootstrap.code !== 0) {
+      throw launchctlError("load the LaunchAgent", bootstrap);
     }
-    throw launchctlError("load the LaunchAgent", bootstrap);
+  } catch (error) {
+    const rollbackErrors: unknown[] = [];
+    try {
+      await restorePreviousPlist(paths.plistPath, previousPlist);
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (previousStatus.loaded) {
+      if (previousPlist === undefined) {
+        rollbackErrors.push(
+          new Error("The previous LaunchAgent was loaded without a restorable plist"),
+        );
+      } else if (rollbackErrors.length === 0) {
+        const restored = await bootstrapLaunchAgent(context, paths.plistPath);
+        if (restored.code !== 0) {
+          rollbackErrors.push(
+            launchctlError("restore the previous LaunchAgent", restored),
+          );
+        }
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        "LaunchAgent installation failed and rollback was incomplete",
+      );
+    }
+    throw error;
   }
   return getMacOSLaunchAgentStatus(context);
 }

@@ -305,6 +305,22 @@ test("marks process-local active sessions interrupted after a restart", () => {
           createdAt: "2026-08-11T00:00:00.000Z",
           updatedAt: "2026-08-11T00:02:00.000Z",
         },
+        {
+          id: "session-waiting-input",
+          agentId: "implementer",
+          adapter: "codex",
+          adapterSession: { id: "thread-waiting-input" },
+          status: "waiting_for_input",
+          activeTurn: {
+            type: "slack",
+            channelId: "C1",
+            rootThreadTs: "100.3",
+            messageTs: "100.4",
+            startedAt: "2026-08-11T00:03:00.000Z",
+          },
+          createdAt: "2026-08-11T00:00:00.000Z",
+          updatedAt: "2026-08-11T00:03:00.000Z",
+        },
       ],
       conversations: [],
       primarySessions: [
@@ -337,6 +353,12 @@ test("marks process-local active sessions interrupted after a restart", () => {
         status: "idle",
         activeTurn: undefined,
         updatedAt: "2026-08-11T00:02:00.000Z",
+      },
+      {
+        id: "session-waiting-input",
+        status: "interrupted",
+        activeTurn: undefined,
+        updatedAt: "2026-08-12T00:00:00.000Z",
       },
     ],
   );
@@ -483,7 +505,7 @@ test("preserves thread-scoped Slack bindings without selecting a canonical sessi
         adapter: "codex",
         workspace: { path: "/workspace/external-reviewer" },
         slack: {
-          channel_id: "C-REVIEW",
+          channel_id: "CREVIEW",
           conversation_scope: "slack_thread",
         },
         role: "Review only the supplied evidence",
@@ -507,19 +529,19 @@ test("preserves thread-scoped Slack bindings without selecting a canonical sessi
       agents: [{
         id: "reviewer",
         adapter: "codex",
-        channelId: "C-REVIEW",
+        channelId: "CREVIEW",
         conversationScope: "slack_thread",
       }],
       sessions,
       conversations: [
         {
-          channelId: "C-REVIEW",
+          channelId: "CREVIEW",
           rootThreadTs: "100.1",
           agentId: "reviewer",
           sessionId: "session-a",
         },
         {
-          channelId: "C-REVIEW",
+          channelId: "CREVIEW",
           rootThreadTs: "200.2",
           agentId: "reviewer",
           sessionId: "session-b",
@@ -534,11 +556,11 @@ test("preserves thread-scoped Slack bindings without selecting a canonical sessi
   assert.equal(registry.getAgent("reviewer")?.conversationScope, "slack_thread");
   assert.equal(registry.getPrimarySession("reviewer"), undefined);
   assert.equal(
-    registry.getConversation("C-REVIEW", "100.1")?.sessionId,
+    registry.getConversation("CREVIEW", "100.1")?.sessionId,
     "session-a",
   );
   assert.equal(
-    registry.getConversation("C-REVIEW", "200.2")?.sessionId,
+    registry.getConversation("CREVIEW", "200.2")?.sessionId,
     "session-b",
   );
 });
@@ -565,7 +587,7 @@ test("drops shared root mappings when a Koe migrates to Slack-thread scope", () 
         adapter: "codex",
         workspace: { path: "/workspace/external-reviewer" },
         slack: {
-          channel_id: "C-REVIEW",
+          channel_id: "CREVIEW",
           conversation_scope: "slack_thread",
         },
         role: "Review only the supplied evidence",
@@ -577,7 +599,7 @@ test("drops shared root mappings when a Koe migrates to Slack-thread scope", () 
     version: 1,
     core: {
       version: 1,
-      agents: [{ id: "reviewer", adapter: "codex", channelId: "C-REVIEW" }],
+      agents: [{ id: "reviewer", adapter: "codex", channelId: "CREVIEW" }],
       sessions: [{
         id: "shared-session",
         agentId: "reviewer",
@@ -588,7 +610,7 @@ test("drops shared root mappings when a Koe migrates to Slack-thread scope", () 
         updatedAt: "2026-08-11T00:00:00.000Z",
       }],
       conversations: ["100.1", "200.2"].map((rootThreadTs) => ({
-        channelId: "C-REVIEW",
+        channelId: "CREVIEW",
         rootThreadTs,
         agentId: "reviewer",
         sessionId: "shared-session",
@@ -600,8 +622,8 @@ test("drops shared root mappings when a Koe migrates to Slack-thread scope", () 
   const registry = createRegistry(config, state);
 
   assert.equal(registry.getPrimarySession("reviewer"), undefined);
-  assert.equal(registry.getConversation("C-REVIEW", "100.1"), undefined);
-  assert.equal(registry.getConversation("C-REVIEW", "200.2"), undefined);
+  assert.equal(registry.getConversation("CREVIEW", "100.1"), undefined);
+  assert.equal(registry.getConversation("CREVIEW", "200.2"), undefined);
   assert.equal(registry.listSessions("reviewer").length, 1);
 });
 
@@ -626,7 +648,7 @@ test("moves a Koe to a new Slack channel without carrying old Slack reply roots"
       implementer: {
         adapter: "codex",
         workspace: { path: "/workspace" },
-        slack: { channel_id: "C-NEW", conversation_scope: "channel" },
+        slack: { channel_id: "CNEW", conversation_scope: "channel" },
         role: "Implement",
       },
     },
@@ -659,7 +681,7 @@ test("moves a Koe to a new Slack channel without carrying old Slack reply roots"
   const registry = createRegistry(config, state);
 
   assert.equal(registry.getAgentByChannel("C-OLD"), undefined);
-  assert.equal(registry.requireAgentByChannel("C-NEW").id, "implementer");
+  assert.equal(registry.requireAgentByChannel("CNEW").id, "implementer");
   assert.equal(registry.getConversation("C-OLD", "100.1"), undefined);
   assert.equal(registry.getPrimarySession("implementer"), undefined);
   assert.equal(registry.listSessions("implementer")[0]?.id, "session-shared");

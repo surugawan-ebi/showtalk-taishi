@@ -30,13 +30,13 @@ const config = taishiConfigSchema.parse({
     implementer: {
       adapter: "codex",
       workspace: { path: "/workspace/implementer" },
-      slack: { channel_id: "C-IMPLEMENTER" },
+      slack: { channel_id: "C000IMPLEMENTER" },
       role: "Implement",
     },
     reviewer: {
       adapter: "codex",
       workspace: { path: "/workspace/reviewer" },
-      slack: { channel_id: "C-REVIEWER" },
+      slack: { channel_id: "C000REVIEWER" },
       role: "Review",
     },
   },
@@ -53,7 +53,7 @@ function bind(
     config,
     state,
     {
-      channelId: "C-IMPLEMENTER",
+      channelId: "C000IMPLEMENTER",
       codexThreadId: threadId,
       ...(replace ? { replace: true } : {}),
     },
@@ -72,8 +72,8 @@ test("binds a configured channel to an existing Codex task", () => {
   assert.deepEqual(
     bound.state.core.agents.map(({ id, channelId }) => ({ id, channelId })),
     [
-      { id: "implementer", channelId: "C-IMPLEMENTER" },
-      { id: "reviewer", channelId: "C-REVIEWER" },
+      { id: "implementer", channelId: "C000IMPLEMENTER" },
+      { id: "reviewer", channelId: "C000REVIEWER" },
     ],
   );
 });
@@ -95,7 +95,7 @@ test("rejects a single canonical binding for a Slack-thread-scoped Koe", () => {
 
   assert.throws(
     () => bindCodexThreadState(threadConfig, emptyRuntimeState(), {
-      channelId: "C-IMPLEMENTER",
+      channelId: "C000IMPLEMENTER",
       codexThreadId: "thread-1",
     }),
     /slack_thread.*taishi bind only supports/u,
@@ -126,13 +126,13 @@ test("replace preserves old sessions and repoints all Slack reply locations", ()
       ...first.state.core,
       conversations: [
         {
-          channelId: "C-IMPLEMENTER",
+          channelId: "C000IMPLEMENTER",
           rootThreadTs: "100.1",
           agentId: "implementer",
           sessionId: "core-thread-old",
         },
         {
-          channelId: "C-IMPLEMENTER",
+          channelId: "C000IMPLEMENTER",
           rootThreadTs: "200.2",
           agentId: "implementer",
           sessionId: "core-thread-old",
@@ -189,7 +189,7 @@ test("requires replace when primary and Slack mappings disagree", () => {
       sessions: [...target.state.core.sessions, oldSession],
       conversations: [
         {
-          channelId: "C-IMPLEMENTER",
+          channelId: "C000IMPLEMENTER",
           rootThreadTs: "100.1",
           agentId: "implementer",
           sessionId: oldSession.id,
@@ -209,7 +209,7 @@ test("rejects unknown channels and cross-Agent task reuse", () => {
   assert.throws(
     () =>
       bindCodexThreadState(config, emptyRuntimeState(), {
-        channelId: "C-UNKNOWN",
+        channelId: "C000UNKNOWN",
         codexThreadId: "thread-1",
       }),
     /No configured Koe uses Slack channel/,
@@ -218,7 +218,7 @@ test("rejects unknown channels and cross-Agent task reuse", () => {
   const reviewer = bindCodexThreadState(
     config,
     emptyRuntimeState(),
-    { channelId: "C-REVIEWER", codexThreadId: "thread-shared" },
+    { channelId: "C000REVIEWER", codexThreadId: "thread-shared" },
     { now: () => now, idFactory: () => "core-reviewer" },
   );
   assert.throws(
@@ -242,7 +242,7 @@ test("does not let offline bind contradict a declared adapter session", () => {
   assert.throws(
     () =>
       bindCodexThreadState(declaredConfig, emptyRuntimeState(), {
-        channelId: "C-IMPLEMENTER",
+        channelId: "C000IMPLEMENTER",
         codexThreadId: "thread-other",
       }),
     /update or remove adapter_session_id/,
@@ -269,7 +269,7 @@ test("validates the Codex task before saving and always releases the lock", asyn
     () =>
       bindCodexThread(
         config,
-        { channelId: "C-IMPLEMENTER", codexThreadId: "missing-thread" },
+        { channelId: "C000IMPLEMENTER", codexThreadId: "missing-thread" },
         {
           stateStoreFactory: () => stateStore,
           validateThread: async () => {
@@ -290,7 +290,7 @@ test("keeps the original state usable and releases the lock when save fails", as
     () =>
       bindCodexThread(
         config,
-        { channelId: "C-IMPLEMENTER", codexThreadId: "thread-1" },
+        { channelId: "C000IMPLEMENTER", codexThreadId: "thread-1" },
         {
           stateStoreFactory: () => ({
             async acquireLock() {},
@@ -327,7 +327,7 @@ test("explains that the running service must be stopped before binding", async (
     () =>
       bindCodexThread(
         config,
-        { channelId: "C-IMPLEMENTER", codexThreadId: "thread-1" },
+        { channelId: "C000IMPLEMENTER", codexThreadId: "thread-1" },
         {
           stateStoreFactory: () => ({
             async acquireLock() {

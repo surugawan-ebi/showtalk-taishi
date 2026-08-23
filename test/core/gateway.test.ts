@@ -733,6 +733,27 @@ test("clears running ownership when an adapter stream ends without a terminal st
   assert.equal(registry.getPrimarySession("implementer")?.activeTurn, undefined);
 });
 
+test("clears running ownership when the Gateway consumer cancels its iterator", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "implementer", adapter: "fake", channelId: "C123" });
+  const gateway = new Gateway(registry, [new GatewayAdapter()], {
+    idFactory: () => "session-cancelled",
+  });
+  const iterator = gateway.handleHumanMessage({
+    channelId: "C123",
+    rootThreadTs: "100.1",
+    messageTs: "100.2",
+    text: "Stop projecting",
+  })[Symbol.asyncIterator]();
+
+  assert.equal((await iterator.next()).done, false);
+  await iterator.return?.();
+
+  assert.equal(registry.getPrimarySession("implementer")?.status, "interrupted");
+  assert.equal(registry.getPrimarySession("implementer")?.activeTurn, undefined);
+  assert.equal(gateway.isIdle(), true);
+});
+
 async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {
   const values: T[] = [];
   for await (const value of source) values.push(value);

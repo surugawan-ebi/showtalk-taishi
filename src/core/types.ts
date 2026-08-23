@@ -41,6 +41,7 @@ export type AgentStatus =
   | "starting"
   | "running"
   | "waiting_for_approval"
+  | "waiting_for_input"
   | "interrupted"
   | "failed";
 
@@ -190,9 +191,54 @@ export type WorkspaceGitApprovalPlan =
   | WorkspaceGitEstablishedPublicationApprovalPlan
   | WorkspaceGitPullRequestApprovalPlan;
 
-export interface AgentUserInputResponse {
+export interface AgentGitApprovalInputResponse {
   readonly requestId: string;
   readonly optionId: "approve" | "reject";
+}
+
+export type AgentChoiceAnswer =
+  | {
+      readonly questionId: string;
+      readonly optionId: string;
+      readonly text?: never;
+    }
+  | {
+      readonly questionId: string;
+      readonly text: string;
+      readonly optionId?: never;
+    };
+
+/** One exact answer to the currently displayed ordinary structured question. */
+export interface AgentChoiceInputResponse {
+  readonly requestId: string;
+  readonly answer: AgentChoiceAnswer;
+}
+
+/** Safely releases an App Server request when its interaction cannot be shown. */
+export interface AgentUserInputCancellation {
+  readonly requestId: string;
+  readonly cancelled: true;
+}
+
+export type AgentUserInputResponse =
+  | AgentGitApprovalInputResponse
+  | AgentChoiceInputResponse
+  | AgentUserInputCancellation;
+
+export interface AgentChoiceOption {
+  /** Request-local opaque identifier; never the model-provided label. */
+  readonly id: string;
+  readonly label: string;
+  readonly description: string;
+}
+
+export interface AgentChoiceQuestion {
+  /** Request-local opaque identifier; never the model-provided question ID. */
+  readonly id: string;
+  readonly header: string;
+  readonly prompt: string;
+  readonly options: readonly AgentChoiceOption[];
+  readonly allowsOther: boolean;
 }
 
 export type AgentEvent =
@@ -225,6 +271,7 @@ export type AgentEvent =
       readonly requestId: string;
       readonly summary: string;
       readonly details?: JsonValue;
+      readonly availableDecisions?: readonly AgentApproval["decision"][];
     }
   | {
       readonly type: "user_input.requested";
@@ -235,6 +282,12 @@ export type AgentEvent =
         { readonly id: "reject"; readonly label: "拒否・保留" },
       ];
       readonly plan: WorkspaceGitApprovalPlan;
+    }
+  | {
+      /** Ordinary, non-secret model question. This is not an approval request. */
+      readonly type: "choice.requested";
+      readonly requestId: string;
+      readonly question: AgentChoiceQuestion;
     }
   | {
       /**
@@ -268,4 +321,6 @@ export interface CoreStateSnapshot {
   readonly handledDelegationResults?: readonly string[];
   /** Delayed results that have already started their one permitted next Koe step. */
   readonly usedContinuationDelegations?: readonly string[];
+  /** Recently completed Slack Events API deliveries (durable retry guard). */
+  readonly handledSlackEvents?: readonly string[];
 }

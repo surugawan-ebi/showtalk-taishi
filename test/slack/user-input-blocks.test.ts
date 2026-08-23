@@ -3,9 +3,12 @@ import test from "node:test";
 
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 import {
+  WorkspaceGitApprovalDetailsStore,
   buildWorkspaceGitApprovalBlocks,
   parseUserInputActionValue,
+  parseUserInputBodyVisibility,
   parseUserInputDecision,
+  parseUserInputPathVisibility,
 } from "../../src/slack/user-input-blocks.js";
 
 const plan: WorkspaceGitApprovalPlan = {
@@ -55,6 +58,99 @@ test("renders an exact Git plan while keeping it out of the action value", () =>
   const encoded = "value" in actions.elements[0]! ? actions.elements[0]!.value : undefined;
   assert.equal(encoded, JSON.stringify(routing));
   assert.doesNotMatch(String(encoded), /showtalk-taishi|planHash|operationId/u);
+});
+
+test("collapses changed files and PR body independently without changing approval actions", () => {
+  const collapsed = buildWorkspaceGitApprovalBlocks(
+    "この計画を承認しますか？",
+    plan,
+    routing,
+    {
+      pathsExpanded: false,
+      allowPathToggle: true,
+      bodyExpanded: false,
+      allowBodyToggle: true,
+    },
+  );
+  const collapsedText = JSON.stringify(collapsed);
+  assert.match(collapsedText, /変更ファイル/u);
+  assert.match(collapsedText, /2件/u);
+  assert.match(collapsedText, /変更ファイルを表示/u);
+  assert.doesNotMatch(collapsedText, /src\/core\/gateway\.ts/u);
+  assert.match(collapsedText, /PR本文を表示/u);
+  assert.match(collapsedText, /36文字/u);
+  assert.doesNotMatch(collapsedText, /Show the exact plan before approval/u);
+  assert.match(collapsedText, /承認して実行/u);
+  assert.match(collapsedText, /拒否・保留/u);
+
+  const expanded = buildWorkspaceGitApprovalBlocks(
+    "この計画を承認しますか？",
+    plan,
+    routing,
+    {
+      pathsExpanded: true,
+      allowPathToggle: true,
+      bodyExpanded: false,
+      allowBodyToggle: true,
+    },
+  );
+  const expandedText = JSON.stringify(expanded);
+  assert.match(expandedText, /一覧を閉じる/u);
+  assert.match(expandedText, /src\/core\/gateway\.ts/u);
+  assert.match(expandedText, /README\.md/u);
+  assert.doesNotMatch(expandedText, /Show the exact plan before approval/u);
+  assert.equal(
+    JSON.stringify(expanded.at(-1)),
+    JSON.stringify(collapsed.at(-1)),
+  );
+
+  const bodyExpanded = buildWorkspaceGitApprovalBlocks(
+    "この計画を承認しますか？",
+    plan,
+    routing,
+    {
+      pathsExpanded: false,
+      allowPathToggle: true,
+      bodyExpanded: true,
+      allowBodyToggle: true,
+    },
+  );
+  const bodyExpandedText = JSON.stringify(bodyExpanded);
+  assert.match(bodyExpandedText, /PR本文を閉じる/u);
+  assert.match(bodyExpandedText, /Show the exact plan before approval/u);
+  assert.doesNotMatch(bodyExpandedText, /src\/core\/gateway\.ts/u);
+  assert.equal(
+    JSON.stringify(bodyExpanded.at(-1)),
+    JSON.stringify(collapsed.at(-1)),
+  );
+  assert.equal(parseUserInputBodyVisibility("taishi.git_plan.body.show"), "show");
+  assert.equal(parseUserInputBodyVisibility("taishi.git_plan.body.hide"), "hide");
+  assert.equal(parseUserInputBodyVisibility("taishi.git_plan.body.toggle"), undefined);
+});
+
+test("stores exact approval display details only for their bound Slack message", () => {
+  const store = new WorkspaceGitApprovalDetailsStore();
+  store.remember({
+    prompt: "Review",
+    plan,
+    routing,
+    fallbackText: "Git approval pending",
+    sourceUserMention: "<@U0123456789>",
+    display: { pathsExpanded: false, bodyExpanded: false },
+  });
+
+  assert.equal(store.get(routing)?.plan, plan);
+  store.updateDisplay(routing, { pathsExpanded: true, bodyExpanded: false });
+  assert.deepEqual(store.get(routing)?.display, {
+    pathsExpanded: true,
+    bodyExpanded: false,
+  });
+  assert.equal(
+    store.get({ ...routing, messageTs: "1786654846.000101" }),
+    undefined,
+  );
+  store.forget(routing);
+  assert.equal(store.get(routing), undefined);
 });
 
 test("renders an unborn initial publication without inventing a HEAD", () => {
@@ -115,6 +211,9 @@ test("parses only the two fixed Git decision action IDs", () => {
   assert.equal(parseUserInputDecision("taishi.git_plan.reject"), "reject");
   assert.equal(parseUserInputDecision("taishi.git_plan.allow_session"), undefined);
   assert.equal(parseUserInputDecision("taishi.approval.approve"), undefined);
+  assert.equal(parseUserInputPathVisibility("taishi.git_plan.paths.show"), "show");
+  assert.equal(parseUserInputPathVisibility("taishi.git_plan.paths.hide"), "hide");
+  assert.equal(parseUserInputPathVisibility("taishi.git_plan.paths.open"), undefined);
 });
 
 test("rejects forged, replay-targeted, and ambiguous action payload shapes", () => {

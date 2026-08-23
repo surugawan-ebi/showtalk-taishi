@@ -292,7 +292,9 @@ async function startGatewayWorker(path: string): Promise<number> {
     console.log("ShowTalk Taishi is connected to Slack via Socket Mode.");
     if (adminServer !== undefined) {
       const adminUrl = await adminServer.start();
-      console.log(`ShowTalk Taishi admin UI: ${adminUrl}`);
+      console.log(
+        `ShowTalk Taishi admin UI: ${adminUiUrlForLog(adminUrl)}`,
+      );
     }
     const outcome = await Promise.race([
       stopRequested.then(() => "stop" as const),
@@ -324,6 +326,11 @@ async function startGatewayWorker(path: string): Promise<number> {
 function requireParsedValue<T extends string>(value: T | undefined, name: string): T {
   if (value === undefined) throw new Error(`Missing required option: ${name}`);
   return value;
+}
+
+export function adminUiUrlForLog(adminUrl: string): string {
+  const parsed = new URL(adminUrl);
+  return `${parsed.origin}${parsed.pathname}`;
 }
 
 function printHelp(command?: CliCommand): void {

@@ -61,6 +61,7 @@ export class InMemoryAgentRegistry {
   readonly #activatedSessionIds = new Set<SessionId>();
   readonly #handledDelegationResults = new Set<string>();
   readonly #usedContinuationDelegations = new Set<string>();
+  readonly #handledSlackEvents = new Set<string>();
 
   constructor(snapshot?: CoreStateSnapshot) {
     if (snapshot !== undefined) {
@@ -200,6 +201,21 @@ export class InMemoryAgentRegistry {
     this.#usedContinuationDelegations.delete(delegationId);
   }
 
+  hasHandledSlackEvent(eventId: string): boolean {
+    return this.#handledSlackEvents.has(eventId);
+  }
+
+  recordHandledSlackEvent(eventId: string): void {
+    assertNonEmpty(eventId, "eventId");
+    this.#handledSlackEvents.delete(eventId);
+    this.#handledSlackEvents.add(eventId);
+    while (this.#handledSlackEvents.size > 10_000) {
+      const oldest = this.#handledSlackEvents.values().next().value;
+      if (typeof oldest !== "string") break;
+      this.#handledSlackEvents.delete(oldest);
+    }
+  }
+
   /** Process-local lease shared by human and delegated turns for one Agent. */
   reserveAgentTurn(agentId: AgentId): () => void {
     this.requireAgent(agentId);
@@ -297,6 +313,16 @@ export class InMemoryAgentRegistry {
         `Session ${session.id} uses ${session.adapter}, but ${agent.id} uses ${agent.adapter}`,
       );
     }
+    const existingOwner = [...this.#sessions.values()].find(
+      (existing) =>
+        existing.adapterSession.id === session.adapterSession.id,
+    );
+    if (existingOwner !== undefined) {
+      throw new CoreError(
+        "SESSION_AGENT_MISMATCH",
+        `Adapter session ${session.adapterSession.id} is already owned by Core session ${existingOwner.id}`,
+      );
+    }
 
     this.#sessions.set(session.id, session);
   }
@@ -356,6 +382,17 @@ export class InMemoryAgentRegistry {
   ): AgentSessionRecord {
     assertNonEmpty(adapterSession.id, "adapterSession.id");
     const current = this.requireSession(sessionId);
+    const existingOwner = [...this.#sessions.values()].find(
+      (session) =>
+        session.id !== sessionId &&
+        session.adapterSession.id === adapterSession.id,
+    );
+    if (existingOwner !== undefined) {
+      throw new CoreError(
+        "SESSION_AGENT_MISMATCH",
+        `Adapter session ${adapterSession.id} is already owned by Core session ${existingOwner.id}`,
+      );
+    }
     const updated = { ...current, adapterSession, updatedAt };
     this.#sessions.set(sessionId, updated);
     return updated;
@@ -502,6 +539,7 @@ export class InMemoryAgentRegistry {
       ),
       handledDelegationResults: [...this.#handledDelegationResults],
       usedContinuationDelegations: [...this.#usedContinuationDelegations],
+      handledSlackEvents: [...this.#handledSlackEvents],
     };
   }
 
@@ -530,6 +568,9 @@ export class InMemoryAgentRegistry {
     }
     for (const delegationId of snapshot.usedContinuationDelegations ?? []) {
       this.recordUsedContinuationDelegation(delegationId);
+    }
+    for (const eventId of snapshot.handledSlackEvents ?? []) {
+      this.recordHandledSlackEvent(eventId);
     }
   }
 }
