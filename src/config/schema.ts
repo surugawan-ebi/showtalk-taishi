@@ -48,6 +48,12 @@ const environmentVariableNameSchema = z
       !/^SLACK_.*TOKEN$/iu.test(name),
     "Gateway or Slack token variables cannot be passed through to a Koe",
   );
+const slackUserIdSchema = z
+  .string()
+  .regex(/^[UW][A-Z0-9]{1,127}$/u, "Invalid Slack user ID");
+const slackChannelIdSchema = z
+  .string()
+  .regex(/^[CDG][A-Z0-9]{1,127}$/u, "Invalid Slack channel ID");
 
 const consultationScopeSchema = z
   .string()
@@ -143,7 +149,7 @@ const koeCallNameSchema = z
 
 const slackPresentationSchema = z
   .object({
-    channel_id: z.string().min(1),
+    channel_id: slackChannelIdSchema,
     conversation_scope: conversationScopeSchema.default("channel"),
     call_name: koeCallNameSchema.optional(),
     persona: slackPersonaSchema.optional(),
@@ -194,7 +200,13 @@ export const taishiConfigSchema = z
         socket_mode: z.literal(true),
         app_token: z.string().startsWith("xapp-"),
         bot_token: z.string().startsWith("xoxb-"),
-        approver_user_ids: z.array(z.string().min(1)).min(1),
+        approver_user_ids: z
+          .array(slackUserIdSchema)
+          .min(1)
+          .refine(
+            (ids) => new Set(ids).size === ids.length,
+            "Slack approver user IDs must be unique",
+          ),
       })
       .strict(),
     adapters: z
@@ -256,6 +268,7 @@ export const taishiConfigSchema = z
   .superRefine((config, context) => {
     const channels = new Map<string, string>();
     const adapterSessions = new Map<string, string>();
+    const channelOwnersByNormalizedAddress = new Map<string, string>();
     const idsByNormalizedAddress = new Map<string, string>();
     const callNames = new Map<string, string>();
     for (const [name, agent] of Object.entries(config.agents)) {
@@ -274,7 +287,7 @@ export const taishiConfigSchema = z
       } else {
         idsByNormalizedAddress.set(normalizedId, name);
       }
-      if (!(agent.adapter in config.adapters)) {
+      if (!Object.hasOwn(config.adapters, agent.adapter)) {
         context.addIssue({
           code: "custom",
           path: ["agents", name, "adapter"],
@@ -290,6 +303,10 @@ export const taishiConfigSchema = z
         });
       } else {
         channels.set(agent.slack.channel_id, name);
+        channelOwnersByNormalizedAddress.set(
+          normalizeKoeAddress(agent.slack.channel_id),
+          name,
+        );
       }
       if (agent.slack.call_name !== undefined) {
         const normalized = normalizeKoeAddress(agent.slack.call_name);
@@ -341,6 +358,48 @@ export const taishiConfigSchema = z
             message: `Unknown consultation target: ${target}`,
           });
         }
+      }
+    }
+    for (const [name, agent] of Object.entries(config.agents)) {
+      const addresses = [
+        ["id", name] as const,
+        ...(agent.slack.call_name === undefined
+          ? []
+          : [["call_name", agent.slack.call_name] as const]),
+      ];
+      for (const [field, address] of addresses) {
+        if (/^[cdg][a-z0-9]{1,127}$/u.test(normalizeKoeAddress(address))) {
+          context.addIssue({
+            code: "custom",
+            path:
+              field === "id"
+                ? ["agents", name]
+                : ["agents", name, "slack", "call_name"],
+            message: "Koe addresses must not look like literal Slack channel IDs",
+          });
+        }
+        const channelOwner = channelOwnersByNormalizedAddress.get(
+          normalizeKoeAddress(address),
+        );
+        if (channelOwner !== undefined) {
+          context.addIssue({
+            code: "custom",
+            path:
+              field === "id"
+                ? ["agents", name]
+                : ["agents", name, "slack", "call_name"],
+            message: `Koe address conflicts with Slack channel assigned to: ${channelOwner}`,
+          });
+        }
+      }
+    }
+    for (const policyAgentId of Object.keys(config.permissions.agents)) {
+      if (!Object.hasOwn(config.agents, policyAgentId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["permissions", "agents", policyAgentId],
+          message: `Permission override references unknown Koe: ${policyAgentId}`,
+        });
       }
     }
   });

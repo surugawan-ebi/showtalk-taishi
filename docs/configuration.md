@@ -198,13 +198,23 @@ they are not a hard-coded catalog. Those two changes apply to the Koe's next
 turn without a Gateway restart. Process, Slack routing, workspace, identity,
 persona, role, and permission changes currently require **Gatewayを再起動**.
 
+The UI never rewrites `config.yaml`. Its allowlisted Koe changes are stored in
+the owner-only
+`admin-config-overrides.v1.json` beside the configured runtime state file and
+merged on startup. Each override is bound to a hash of the corresponding raw
+`config.yaml` value. An operator edit to a different setting is adopted, while
+an operator and the UI editing the same setting produces an explicit conflict
+instead of silently choosing one. The sidecar is machine-managed; stop Taishi
+and remove it to return completely to the values in `config.yaml`.
+
 The listener is hard-bound to `127.0.0.1`; it has no LAN exposure setting.
 
 ## Local files
 
-`config.yaml` is user-owned configuration. Runtime mappings and durable
-delegation replay guards are stored in the configured state file, normally under
-`~/.showtalk-taishi/`. Incoming files are stored under
+`config.yaml` is operator-owned configuration and is read-only to the
+management UI. Its owner-only dynamic override sidecar, runtime mappings, and
+durable delegation replay guards are stored beside the configured state file,
+normally under `~/.showtalk-taishi/`. Incoming files are stored under
 `gateway.attachment_dir`, or beside the state file when omitted. These paths
 must remain private and outside Git. Interactive permission and structured Git
 approval requests are process-local rather than persisted in that file.

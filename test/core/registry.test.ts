@@ -114,6 +114,65 @@ test("snapshot round-trips without storage-specific types", () => {
   assert.equal(restored.requireAgentByAddress("レビュー係").id, "reviewer");
 });
 
+test("rejects one backend adapter session being restored for different Koe", () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "one", adapter: "fake", channelId: "C-ONE" });
+  registry.registerAgent({ id: "two", adapter: "fake", channelId: "C-TWO" });
+  registry.addSession({
+    ...session("session-one", "one"),
+    adapterSession: { id: "shared-backend-thread" },
+  });
+
+  assert.throws(
+    () => registry.addSession({
+      ...session("session-two", "two"),
+      adapterSession: { id: "shared-backend-thread" },
+    }),
+    (error) =>
+      error instanceof CoreError && error.code === "SESSION_AGENT_MISMATCH",
+  );
+});
+
+test("rejects one backend thread shared through different adapter aliases", () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "one", adapter: "codex-a", channelId: "C-ONE" });
+  registry.registerAgent({ id: "two", adapter: "codex-b", channelId: "C-TWO" });
+  registry.addSession({
+    ...session("session-one", "one", "codex-a"),
+    adapterSession: { id: "shared-backend-thread" },
+  });
+
+  assert.throws(
+    () => registry.addSession({
+      ...session("session-two", "two", "codex-b"),
+      adapterSession: { id: "shared-backend-thread" },
+    }),
+    (error) =>
+      error instanceof CoreError && error.code === "SESSION_AGENT_MISMATCH",
+  );
+});
+
+test("rejects replacing a session with a backend thread owned through another alias", () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "one", adapter: "codex-a", channelId: "C-ONE" });
+  registry.registerAgent({ id: "two", adapter: "codex-b", channelId: "C-TWO" });
+  registry.addSession({
+    ...session("session-one", "one", "codex-a"),
+    adapterSession: { id: "shared-backend-thread" },
+  });
+  registry.addSession(session("session-two", "two", "codex-b"));
+
+  assert.throws(
+    () => registry.replaceAdapterSession(
+      "session-two",
+      { id: "shared-backend-thread" },
+      now,
+    ),
+    (error) =>
+      error instanceof CoreError && error.code === "SESSION_AGENT_MISMATCH",
+  );
+});
+
 test("durably retains delegation replay guards beyond the former memory bound", () => {
   const registry = new InMemoryAgentRegistry();
   for (let index = 0; index < 1_100; index += 1) {
@@ -141,6 +200,15 @@ test("hydrates legacy state that predates durable delegation replay guards", () 
 
   assert.deepEqual(restored.snapshot().handledDelegationResults, []);
   assert.deepEqual(restored.snapshot().usedContinuationDelegations, []);
+});
+
+test("persists completed Slack event replay guards across restart", () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.recordHandledSlackEvent("Ev123");
+  const restored = new InMemoryAgentRegistry(
+    JSON.parse(JSON.stringify(registry.snapshot())),
+  );
+  assert.equal(restored.hasHandledSlackEvent("Ev123"), true);
 });
 
 test("resolves normalized call names and rejects address collisions", () => {

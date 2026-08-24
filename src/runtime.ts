@@ -30,8 +30,11 @@ import { SlackFrontend } from "./slack/frontend.js";
 import { createSlackMessagePresentation } from "./slack/presentation.js";
 import { FileStateStore, type RuntimeState } from "./state/file-state-store.js";
 import { PermissionEngine } from "./permissions/engine.js";
-import { PermissionApprovalCoordinator } from "./permissions/approval-coordinator.js";
-import type { PermissionApprovalPresentation } from "./permissions/approval-coordinator.js";
+import {
+  PermissionApprovalCoordinator,
+  type PermissionApprovalPresentation,
+  type PermissionApprovalSettlement,
+} from "./permissions/approval-coordinator.js";
 
 const MCP_TOKEN_ENV_VAR = "SHOWTALK_TAISHI_MCP_TOKEN";
 
@@ -64,6 +67,7 @@ export interface TaishiFrontend extends RuntimeSlackPort {
   waitForIdle(): Promise<void>;
   stop(): Promise<void>;
   presentPermissionApproval(request: PermissionApprovalPresentation): Promise<void>;
+  settlePermissionApproval(settlement: PermissionApprovalSettlement): Promise<void>;
 }
 
 export interface CreateRuntimeOptions {
@@ -107,6 +111,7 @@ async function createLockedRuntime(
   const state = await stateStore.load();
   const registry = createRegistry(config, state);
   const clients: CodexAppServerClient[] = [];
+  const codexAdapters: CodexAdapter[] = [];
   const permissions = new PermissionEngine(config.permissions, config.agents);
   const permissionApprovals = new PermissionApprovalCoordinator();
   const mcpService = new RuntimeMcpService(
@@ -180,6 +185,10 @@ async function createLockedRuntime(
           bearerTokenEnvVar: MCP_TOKEN_ENV_VAR,
         }),
       });
+      if (options.onRestartRequested !== undefined) {
+        client.onClose(() => options.onRestartRequested?.());
+      }
+      codexAdapters.push(child);
       codexAdaptersByAgent.set(agentId, child);
       let children = childrenByAdapter.get(agentConfig.adapter);
       if (children === undefined) {
@@ -213,6 +222,11 @@ async function createLockedRuntime(
             operation: "agent.send",
             summary: `Send work from ${source} to ${target}`,
             grantKey: JSON.stringify(["agent.send", source, target]),
+            ...permissionApprovalSlackContext(
+              registry,
+              source,
+              sourceAgent.channelId,
+            ),
           },
           signal,
         );
@@ -239,6 +253,13 @@ async function createLockedRuntime(
       ),
       attachmentRoot,
       permissionApprovals,
+      durableEventLedger: {
+        has: (eventId) => registry.hasHandledSlackEvent(eventId),
+        record: async (eventId) => {
+          registry.recordHandledSlackEvent(eventId);
+          await persist();
+        },
+      },
       ...(options.onRestartRequested === undefined
         ? {}
         : { requestRestart: options.onRestartRequested }),
@@ -249,6 +270,15 @@ async function createLockedRuntime(
     permissionApprovals.setPresenter((request) =>
       frontend.presentPermissionApproval(request),
     );
+    permissionApprovals.setSettlementPresenter(async (settlement) => {
+      await frontend.settlePermissionApproval(settlement).catch((error: unknown) => {
+        console.error(
+          `ShowTalk Taishi could not close a permission approval card: ${
+            error instanceof Error ? error.message : "unknown error"
+          }`,
+        );
+      });
+    });
     mcpService.attach(router, gateway, frontend);
 
     let stopPromise: Promise<void> | undefined;
@@ -303,6 +333,7 @@ async function createLockedRuntime(
           mcpServer,
           permissionApprovals,
           frontend,
+          codexAdapters,
           clients,
           stateStore,
         });
@@ -312,7 +343,8 @@ async function createLockedRuntime(
   } catch (error) {
     const errors: unknown[] = [error];
     mcpService.beginShutdown();
-    permissionApprovals.close();
+    await permissionApprovals.close();
+    for (const adapter of codexAdapters) adapter.shutdown();
     await mcpServer.close().catch((closeError: unknown) => errors.push(closeError));
     const closeResults = await Promise.allSettled(
       clients.map((client) => client.close({ reportAsFailure: false })),
@@ -325,6 +357,22 @@ async function createLockedRuntime(
     }
     throw error;
   }
+}
+
+function permissionApprovalSlackContext(
+  registry: InMemoryAgentRegistry,
+  agentId: string,
+  expectedChannelId: string,
+): { readonly slackContext: { readonly rootThreadTs: string; readonly slackUserId?: string } } | Record<string, never> {
+  if (!registry.hasActiveAgentTurn(agentId)) return {};
+  const turn = registry.getActiveSession(agentId)?.activeTurn;
+  if (turn?.type !== "slack" || turn.channelId !== expectedChannelId) return {};
+  return {
+    slackContext: {
+      rootThreadTs: turn.rootThreadTs,
+      ...(turn.slackUserId === undefined ? {} : { slackUserId: turn.slackUserId }),
+    },
+  };
 }
 
 export async function startFrontendWithStateRollback(
@@ -367,12 +415,14 @@ async function shutdownRuntime(input: {
   readonly mcpServer: AuthenticatedMcpHttpServer;
   readonly permissionApprovals: PermissionApprovalCoordinator;
   readonly frontend: TaishiFrontend;
+  readonly codexAdapters: readonly CodexAdapter[];
   readonly clients: readonly CodexAppServerClient[];
   readonly stateStore: FileStateStore;
 }): Promise<void> {
   const errors: unknown[] = [];
   input.mcpService.beginShutdown();
-  input.permissionApprovals.close();
+  await input.permissionApprovals.close().catch((error: unknown) => errors.push(error));
+  for (const adapter of input.codexAdapters) adapter.shutdown();
 
   await input.mcpServer.close().catch((error: unknown) => errors.push(error));
   const componentResults = await Promise.allSettled([
@@ -739,7 +789,8 @@ function isVolatileSessionStatus(
   return (
     status === "starting" ||
     status === "running" ||
-    status === "waiting_for_approval"
+    status === "waiting_for_approval" ||
+    status === "waiting_for_input"
   );
 }
 

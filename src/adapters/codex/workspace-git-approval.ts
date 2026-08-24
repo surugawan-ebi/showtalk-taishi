@@ -27,6 +27,8 @@ const REJECT_LABEL = "拒否・保留";
 const MAX_PATHS = 100;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_TOTAL_PATH_LENGTH = 30_000;
+const MIN_AUTO_RESOLUTION_MS = 60_000;
+const MAX_AUTO_RESOLUTION_MS = 240_000;
 
 export interface WorkspaceGitPlanCapture {
   readonly turnId: string;
@@ -345,7 +347,8 @@ export function validateWorkspaceGitPlanQuestion(
     autoResolutionMs !== null &&
     (typeof autoResolutionMs !== "number" ||
       !Number.isSafeInteger(autoResolutionMs) ||
-      autoResolutionMs < 1)
+      autoResolutionMs < MIN_AUTO_RESOLUTION_MS ||
+      autoResolutionMs > MAX_AUTO_RESOLUTION_MS)
   ) {
     throw new Error("Git plan approval auto-resolution is invalid");
   }
@@ -365,7 +368,7 @@ export function toolRequestUserInputParams(value: unknown): ToolRequestUserInput
     typeof params.turnId !== "string" ||
     typeof params.itemId !== "string"
   ) {
-    throw new Error("Git plan approval request is missing its turn identity");
+    throw new Error("Structured input request is missing its turn identity");
   }
   return params as unknown as ToolRequestUserInputParams;
 }

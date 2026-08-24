@@ -153,10 +153,13 @@ currently expose an audio input item.
 Slack projection translates normalized agent events into human-readable
 messages, progress updates, and approval blocks. Projected Koe-to-Koe
 activity is marked as output and is never re-ingested as a new instruction.
-An active turn also drives a best-effort five-second heartbeat on the existing
-activity message, even while no tool event is arriving. It shows elapsed time
-and a rotating marker, is serialized with event-driven message updates, and is
-cancelled before final projection so it cannot overwrite the completion state.
+An active turn also drives a best-effort thirty-second heartbeat on the existing
+activity message, even while no tool event is arriving. Intermediate streamed
+text and tool counters are coalesced to the same maximum update frequency. It
+shows elapsed time and a rotating marker, is serialized with event-driven
+message updates, and is cancelled before final projection so it cannot
+overwrite the completion state. Final responses, approvals, and errors remain
+immediate.
 
 Structured Git approvals are a narrow bridge rather than a generic text
 approval parser. The Codex adapter captures one `workspace-git` prepare result
@@ -171,6 +174,16 @@ values carry only an opaque single-use request ID and trusted routing fields.
 The callback is returned to the same App Server JSON-RPC ID. workspace-git,
 not Slack or model prose, remains responsible for private approval state and
 execution-time revalidation.
+
+Ordinary `item/tool/requestUserInput` questions use a separate, non-authorizing
+path. Taishi validates one to three non-secret questions, projects each current
+question as fixed Slack choices, and returns the selected labels together to
+the same App Server RPC. An allowed free-form `Other` answer is collected in a
+Slack modal. These interactions use their own action prefix, are bound to the
+originating channel, thread, message, request, and Slack user, and can never
+approve or reconstruct a workspace-git plan. The short plan-binding grace is
+also applied before classification so a transport-ordering race cannot
+downgrade a malformed same-turn Git approval into an ordinary choice.
 
 The current bridge therefore uses the resumed Codex turn as an approval
 coordinator between the structured answer and workspace-git's private
@@ -248,6 +261,11 @@ Pending plan mirrors, App Server RPC IDs,
 and Slack action request IDs are process-local and are deliberately absent from
 runtime state. A restart invalidates the card instead of reconstructing
 authority from stale state.
+
+Non-Git structured questions are emitted as a distinct normalized event and
+use `waiting_for_input` rather than approval status. Multiple questions are
+answered in order while one App Server RPC remains live; an unsupported or
+secret question is rejected without producing a Git recovery card.
 
 Codex thread IDs remain adapter data. They are persisted by the session registry
 but do not leak into generic Slack or MCP tool contracts.
@@ -353,10 +371,12 @@ The controlling Koe must inspect each returned result, decide whether another
 call is useful, and bound retries or review rounds. Host-owned routing state
 derives nested depth; models cannot submit or reset causation fields.
 `agent.send` is non-idempotent at the semantic task level, while Taishi
-deduplicates transport retries with the host MCP request identity. A busy target
-rejects concurrent independent work. v0.1 also permits only one active turn per
-Koe identity so Agent-scoped MCP authentication cannot make the originating
-conversation ambiguous.
+deduplicates exact transport retries with the host MCP request identity,
+canonical arguments, and the current Gateway-owned turn. JSON-RPC IDs are
+client-local and may restart after a reconnect, so they are never treated as
+Koe-global identities. A busy target rejects concurrent independent work. v0.1
+also permits only one active turn per Koe identity so Agent-scoped MCP
+authentication cannot make the originating conversation ambiguous.
 
 ### MCP server
 
@@ -373,10 +393,12 @@ names retain their `agent.*` prefix:
 presentation and target-selection metadata, not an additional principal.
 
 `slack.post` and `slack.reply` accept optional workspace-relative image/audio
-attachments. Runtime resolution follows symlinks before checking containment,
-accepts only regular supported media files, and applies the same count and size
-limits used by ingress. Slack upload remains subject to the caller's existing
-Slack write policy and any resulting human approval.
+attachments. Runtime resolution rejects symbolic-link path components, verifies
+the canonical file and parent identities around an open file descriptor,
+captures immutable bytes, and accepts only regular supported media files. Count,
+per-file, total, and process-wide concurrent byte limits apply. Slack upload
+remains subject to the caller's existing Slack write policy and any resulting
+human approval.
 
 MCP is a Koe-facing control interface, not a shortcut around policy. Taishi
 binds a Streamable HTTP server to `127.0.0.1` on an ephemeral port. Each Koe
@@ -560,10 +582,14 @@ consultation allowlist. Slack and adapter credentials are never serialized into
 the response. Editable YAML values backed by environment references are returned
 as their `${NAME}` expressions, not as resolved values.
 
-Configuration writes carry the SHA-256 revision read by the page. The server
-rejects stale revisions, applies changes to the YAML document, validates the
-entire environment-expanded schema, and atomically replaces the source file.
-Unchanged environment-reference nodes remain untouched. Every API request
+Configuration writes carry a composite SHA-256 revision of the canonical YAML
+and the current admin sidecar. The server rejects stale revisions, validates the
+complete environment-expanded result, and writes only allowlisted field
+overrides to an owner-only sidecar beside runtime state. It never replaces
+`config.yaml`. Every override records a hash of its raw base value, so unrelated
+operator edits are adopted and same-field edits fail closed instead of being
+silently overwritten or masked. Environment references and credentials remain
+in the operator-owned canonical file. Every API request
 requires a stable random bearer stored in an owner-only file beside runtime
 state. Mutations also require a random page-bound CSRF token, a loopback peer,
 a localhost Host header, and a same-origin browser request.

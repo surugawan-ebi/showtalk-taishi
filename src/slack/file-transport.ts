@@ -83,7 +83,7 @@ export class SlackFileTransport {
   readonly #maxFileBytes: number;
   readonly #maxTotalBytes: number;
   readonly #maxSpoolBytes: number;
-  #downloadTail: Promise<void> = Promise.resolve();
+  readonly #downloadTailsByAgent = new Map<string, Promise<void>>();
 
   constructor(options: SlackFileTransportOptions) {
     if (!/^xoxb-[A-Za-z0-9-]+$/u.test(options.botToken)) {
@@ -117,11 +117,18 @@ export class SlackFileTransport {
   download(
     request: SlackFileDownloadRequest,
   ): Promise<SlackFileDownloadResult> {
-    const operation = this.#downloadTail.then(() => this.#download(request));
-    this.#downloadTail = operation.then(
+    const previous = this.#downloadTailsByAgent.get(request.agentId) ?? Promise.resolve();
+    const operation = previous.then(() => this.#download(request));
+    const tail = operation.then(
       () => undefined,
       () => undefined,
     );
+    this.#downloadTailsByAgent.set(request.agentId, tail);
+    void tail.then(() => {
+      if (this.#downloadTailsByAgent.get(request.agentId) === tail) {
+        this.#downloadTailsByAgent.delete(request.agentId);
+      }
+    });
     return operation;
   }
 

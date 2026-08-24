@@ -268,7 +268,8 @@ export class AgentRouter {
           if (
             completedSession.status === "starting" ||
             completedSession.status === "running" ||
-            completedSession.status === "waiting_for_approval"
+            completedSession.status === "waiting_for_approval" ||
+            completedSession.status === "waiting_for_input"
           ) {
             this.#registry.updateSessionStatus(session.id, "idle", this.#timestamp());
             await this.#onStateChanged();
@@ -301,7 +302,8 @@ export class AgentRouter {
           turnStarted &&
           (current.status === "starting" ||
             current.status === "running" ||
-            current.status === "waiting_for_approval")
+            current.status === "waiting_for_approval" ||
+            current.status === "waiting_for_input")
         ) {
           this.#registry.updateSessionStatus(session.id, "failed", this.#timestamp());
           await this.#onStateChanged();

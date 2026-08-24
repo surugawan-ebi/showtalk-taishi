@@ -9,12 +9,19 @@ export interface ApprovalActionValue {
   readonly requestId: string;
   readonly channelId: string;
   readonly rootThreadTs: string;
+  readonly messageTs: string;
   readonly sessionId?: string;
 }
 
 export function buildApprovalBlocks(
   summary: string,
   value: ApprovalActionValue,
+  availableDecisions: readonly AgentApproval["decision"][] = [
+    "allow_once",
+    "allow_session",
+    "deny",
+    "cancel",
+  ],
 ): KnownBlock[] {
   const encoded = JSON.stringify(value);
   const heading = "*Koe requests permission*\n";
@@ -28,12 +35,24 @@ export function buildApprovalBlocks(
     },
     {
       type: "actions",
-      elements: [
-        approvalButton("Allow once", "allow_once", encoded, "primary"),
-        approvalButton("Allow session", "allow_session", encoded),
-        approvalButton("Deny", "deny", encoded, "danger"),
-        approvalButton("Cancel", "cancel", encoded),
-      ],
+      elements: availableDecisions.map((decision) =>
+        approvalButton(
+          decision === "allow_once"
+            ? "Allow once"
+            : decision === "allow_session"
+              ? "Allow session"
+              : decision === "deny"
+                ? "Deny"
+                : "Cancel",
+          decision,
+          encoded,
+          decision === "allow_once"
+            ? "primary"
+            : decision === "deny"
+              ? "danger"
+              : undefined,
+        )
+      ),
     },
   ];
 }
@@ -106,17 +125,21 @@ export function parseApprovalActionValue(value: string): ApprovalActionValue {
   const keys = Object.keys(record);
   const hasSession = Object.hasOwn(record, "sessionId");
   if (
-    keys.length !== (hasSession ? 4 : 3) ||
+    !Object.hasOwn(record, "messageTs") ||
+    typeof record.messageTs !== "string" ||
+    keys.length !== (hasSession ? 5 : 4) ||
     keys.some(
       (key) =>
         key !== "requestId" &&
         key !== "channelId" &&
         key !== "rootThreadTs" &&
+        key !== "messageTs" &&
         key !== "sessionId",
     ) ||
     countLiteralKey(value, "requestId") !== 1 ||
     countLiteralKey(value, "channelId") !== 1 ||
     countLiteralKey(value, "rootThreadTs") !== 1 ||
+    countLiteralKey(value, "messageTs") !== 1 ||
     (hasSession && countLiteralKey(value, "sessionId") !== 1) ||
     (hasSession &&
       (typeof record.sessionId !== "string" ||
@@ -129,6 +152,7 @@ export function parseApprovalActionValue(value: string): ApprovalActionValue {
     requestId: parsed.requestId,
     channelId: parsed.channelId,
     rootThreadTs: parsed.rootThreadTs,
+    messageTs: record.messageTs,
     ...(typeof record.sessionId === "string" ? { sessionId: record.sessionId } : {}),
   };
 }

@@ -2,11 +2,156 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  cancelUnprojectedNativeApproval,
   parseHumanSlackMessage,
+  parseTrustedApprovalAction,
+  parseTrustedConversationControlAction,
   parseTrustedGitApprovalRecoveryAction,
   parseTrustedGitPlanAction,
+  parseTrustedGitPlanBodyAction,
+  parseTrustedGitPlanPathAction,
+  parseTrustedPermissionAction,
   permissionApprovalPostArguments,
+  permissionApprovalSettlementUpdateArguments,
 } from "../../src/slack/frontend.js";
+
+test("accepts permission and control actions only from their exact Slack message", () => {
+  const route = {
+    channelId: "C0123456789",
+    rootThreadTs: "1786654845.402859",
+    messageTs: "1786654846.000100",
+    operation: "gateway.restart",
+  } as const;
+  const body = {
+    type: "block_actions",
+    api_app_id: "A0123456789",
+    team: { id: "T0123456789" },
+    user: { id: "U0123456789" },
+    channel: { id: route.channelId },
+    message: { ts: route.messageTs, thread_ts: route.rootThreadTs },
+    container: {
+      type: "message",
+      channel_id: route.channelId,
+      message_ts: route.messageTs,
+    },
+  };
+  const approvers = new Set(["U0123456789"]);
+  const permissionAction = {
+    action_id: "taishi.permission.allow_once",
+    value: JSON.stringify({
+      requestId: "permission:one",
+      channelId: route.channelId,
+    }),
+  };
+  assert.equal(
+    parseTrustedPermissionAction(body, permissionAction, approvers, route)
+      .decision,
+    "allow_once",
+  );
+  assert.throws(() =>
+    parseTrustedPermissionAction(
+      { ...body, message: { ...body.message, ts: "1786654846.999999" } },
+      permissionAction,
+      approvers,
+      route,
+    ),
+  );
+
+  const controlAction = {
+    action_id: "taishi.conversation.restart",
+    value: JSON.stringify({
+      channelId: route.channelId,
+      rootThreadTs: route.rootThreadTs,
+      messageTs: route.messageTs,
+    }),
+  };
+  assert.equal(
+    parseTrustedConversationControlAction(body, controlAction, approvers)
+      .operation,
+    "restart",
+  );
+  assert.throws(() =>
+    parseTrustedConversationControlAction(
+      {
+        ...body,
+        container: { ...body.container, message_ts: "1786654846.999999" },
+      },
+      controlAction,
+      approvers,
+    ),
+  );
+});
+
+test("parses a native approval only from its exact Slack message and thread", () => {
+  const approval = {
+    requestId: "approval-1",
+    channelId: "C0123456789",
+    rootThreadTs: "1786654845.402859",
+    messageTs: "1786654846.000100",
+    sessionId: "session-1",
+  } as const;
+  const body = {
+    type: "block_actions",
+    api_app_id: "A0123456789",
+    team: { id: "T0123456789" },
+    user: { id: "U0123456789" },
+    channel: { id: approval.channelId },
+    message: { ts: approval.messageTs, thread_ts: approval.rootThreadTs },
+    container: {
+      type: "message",
+      channel_id: approval.channelId,
+      message_ts: approval.messageTs,
+    },
+  };
+  const action = {
+    action_id: "taishi.approval.allow_once",
+    value: JSON.stringify(approval),
+  };
+
+  assert.deepEqual(
+    parseTrustedApprovalAction(
+      body,
+      action,
+      new Set(["U0123456789"]),
+    ),
+    {
+      decision: "allow_once",
+      approval,
+      source: {
+        userId: "U0123456789",
+        channelId: approval.channelId,
+        rootThreadTs: approval.rootThreadTs,
+        messageTs: approval.messageTs,
+        teamId: "T0123456789",
+        apiAppId: "A0123456789",
+      },
+    },
+  );
+  assert.throws(() =>
+    parseTrustedApprovalAction(
+      { ...body, message: { ...body.message, ts: "1786654846.999999" } },
+      action,
+      new Set(["U0123456789"]),
+    ),
+  );
+  assert.throws(() =>
+    parseTrustedApprovalAction(
+      {
+        ...body,
+        message: { ...body.message, thread_ts: "1786654845.999999" },
+      },
+      action,
+      new Set(["U0123456789"]),
+    ),
+  );
+  assert.throws(() =>
+    parseTrustedApprovalAction(
+      { ...body, user: { id: "UATTACKER" } },
+      action,
+      new Set(["U0123456789"]),
+    ),
+  );
+});
 
 test("accepts ordinary human messages", () => {
   assert.deepEqual(
@@ -149,6 +294,41 @@ test("falls back to a configured approver when no Slack user context exists", ()
   assert.match(JSON.stringify(input.blocks), /<@U999>/u);
 });
 
+test("closes permission cards with unambiguous terminal status", () => {
+  const route = {
+    channelId: "C1",
+    messageTs: "1786554846.000100",
+    rootThreadTs: "1786554845.402859",
+    operation: "gateway.restart",
+  };
+
+  const expired = permissionApprovalSettlementUpdateArguments(route, {
+    requestId: "permission:expired",
+    reason: "expired",
+  });
+  assert.equal(expired.channel, "C1");
+  assert.equal(expired.ts, "1786554846.000100");
+  assert.deepEqual(expired.blocks, []);
+  assert.match(expired.text, /expired/u);
+  assert.match(expired.text, /No action was authorized/u);
+
+  const cancelled = permissionApprovalSettlementUpdateArguments(route, {
+    requestId: "permission:cancelled",
+    reason: "caller_cancelled",
+  });
+  assert.match(cancelled.text, /requesting operation ended/u);
+  assert.match(cancelled.text, /No action was authorized/u);
+
+  const approved = permissionApprovalSettlementUpdateArguments(route, {
+    requestId: "permission:approved",
+    reason: "allow_once",
+    resolvedBySlackUserId: "U0123456789",
+  });
+  assert.match(approved.text, /approved once/u);
+  assert.match(approved.text, /<@U0123456789>/u);
+  assert.match(approved.text, /does not confirm operation completion/u);
+});
+
 test("parses a Git approval callback only from the bound Slack Block source", () => {
   const routing = {
     version: 1,
@@ -197,6 +377,118 @@ test("parses a Git approval callback only from the bound Slack Block source", ()
       { ...body, user: { id: "UATTACKER" } },
       {
         action_id: "taishi.git_plan.approve",
+        value: JSON.stringify(routing),
+      },
+      new Set(["U0123456789"]),
+    ),
+  );
+});
+
+test("parses a Git file-list toggle only from the bound approval message", () => {
+  const routing = {
+    version: 1,
+    requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+    channelId: "C0123456789",
+    rootThreadTs: "1786654845.402859",
+    messageTs: "1786654846.000100",
+  } as const;
+  const body = {
+    type: "block_actions",
+    api_app_id: "A0123456789",
+    team: { id: "T0123456789" },
+    user: { id: "U0123456789" },
+    channel: { id: routing.channelId },
+    message: { ts: routing.messageTs, thread_ts: routing.rootThreadTs },
+    container: {
+      type: "message",
+      channel_id: routing.channelId,
+      message_ts: routing.messageTs,
+    },
+  };
+
+  assert.deepEqual(
+    parseTrustedGitPlanPathAction(
+      body,
+      {
+        action_id: "taishi.git_plan.paths.show",
+        value: JSON.stringify(routing),
+      },
+      new Set(["U0123456789"]),
+    ),
+    {
+      visibility: "show",
+      routing,
+      source: {
+        userId: "U0123456789",
+        channelId: routing.channelId,
+        rootThreadTs: routing.rootThreadTs,
+        messageTs: routing.messageTs,
+        teamId: "T0123456789",
+        apiAppId: "A0123456789",
+      },
+    },
+  );
+  assert.throws(() =>
+    parseTrustedGitPlanPathAction(
+      { ...body, message: { ...body.message, ts: "1786654846.000999" } },
+      {
+        action_id: "taishi.git_plan.paths.hide",
+        value: JSON.stringify(routing),
+      },
+      new Set(["U0123456789"]),
+    ),
+  );
+});
+
+test("parses a Git PR-body toggle only from the bound approval message", () => {
+  const routing = {
+    version: 1,
+    requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+    channelId: "C0123456789",
+    rootThreadTs: "1786654845.402859",
+    messageTs: "1786654846.000100",
+  } as const;
+  const body = {
+    type: "block_actions",
+    api_app_id: "A0123456789",
+    team: { id: "T0123456789" },
+    user: { id: "U0123456789" },
+    channel: { id: routing.channelId },
+    message: { ts: routing.messageTs, thread_ts: routing.rootThreadTs },
+    container: {
+      type: "message",
+      channel_id: routing.channelId,
+      message_ts: routing.messageTs,
+    },
+  };
+
+  assert.deepEqual(
+    parseTrustedGitPlanBodyAction(
+      body,
+      {
+        action_id: "taishi.git_plan.body.show",
+        value: JSON.stringify(routing),
+      },
+      new Set(["U0123456789"]),
+    ),
+    {
+      visibility: "show",
+      routing,
+      source: {
+        userId: "U0123456789",
+        channelId: routing.channelId,
+        rootThreadTs: routing.rootThreadTs,
+        messageTs: routing.messageTs,
+        teamId: "T0123456789",
+        apiAppId: "A0123456789",
+      },
+    },
+  );
+  assert.throws(() =>
+    parseTrustedGitPlanBodyAction(
+      { ...body, message: { ...body.message, ts: "1786654846.000999" } },
+      {
+        action_id: "taishi.git_plan.body.hide",
         value: JSON.stringify(routing),
       },
       new Set(["U0123456789"]),
@@ -257,4 +549,37 @@ test("parses a Git approval recovery callback only from its bound Slack message"
       new Set(["U0123456789"]),
     ),
   );
+});
+
+test("cancels a native approval whose Slack controls could not be displayed", async () => {
+  const calls: unknown[] = [];
+  const gateway = {
+    resolveSessionApproval: async (...args: unknown[]) => {
+      calls.push(args);
+    },
+  };
+
+  assert.equal(
+    await cancelUnprojectedNativeApproval(gateway, "session-1", {
+      type: "approval.requested",
+      requestId: "codex:11111111-1111-4111-8111-111111111111",
+      summary: "Run a command",
+    }),
+    true,
+  );
+  assert.deepEqual(calls, [[
+    "session-1",
+    {
+      requestId: "codex:11111111-1111-4111-8111-111111111111",
+      decision: "cancel",
+    },
+  ]]);
+  assert.equal(
+    await cancelUnprojectedNativeApproval(gateway, "session-1", {
+      type: "message.completed",
+      text: "done",
+    }),
+    false,
+  );
+  assert.equal(calls.length, 1);
 });

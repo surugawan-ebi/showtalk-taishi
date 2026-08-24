@@ -20,6 +20,8 @@ import {
   type RpcRequest,
   type ThreadResumeParams,
   type ThreadStartParams,
+  type ThreadTurnsListParams,
+  type ThreadTurnsListResponse,
   type TurnStartParams,
 } from "./protocol.js";
 
@@ -203,12 +205,22 @@ export class CodexAppServerClient {
     return result.thread;
   }
 
-  async readThread(threadId: string): Promise<CodexThread> {
+  async readThread(threadId: string, includeTurns = false): Promise<CodexThread> {
     const result = await this.request<{ thread: CodexThread }>("thread/read", {
       threadId,
-      includeTurns: false,
+      includeTurns,
     });
     return result.thread;
+  }
+
+  async listThreadTurns(
+    threadId: string,
+    params: ThreadTurnsListParams = {},
+  ): Promise<ThreadTurnsListResponse> {
+    return this.request<ThreadTurnsListResponse>("thread/turns/list", {
+      threadId,
+      ...params,
+    });
   }
 
   async unsubscribeThread(threadId: string): Promise<void> {
@@ -267,9 +279,9 @@ export class CodexAppServerClient {
   }
 
   #handleLine(line: string): void {
-    let message: RpcInboundMessage;
+    let parsed: unknown;
     try {
-      message = JSON.parse(line) as RpcInboundMessage;
+      parsed = JSON.parse(line) as unknown;
     } catch (error) {
       this.#events.emit(
         "protocolError",
@@ -277,8 +289,23 @@ export class CodexAppServerClient {
       );
       return;
     }
+    if (!isRpcMessageRecord(parsed)) {
+      this.#events.emit(
+        "protocolError",
+        new CodexProtocolError("Unknown Codex app-server message shape"),
+      );
+      return;
+    }
+    const message = parsed as unknown as RpcInboundMessage;
 
     if ("id" in message && !("method" in message)) {
+      if (!isRpcId(message.id)) {
+        this.#events.emit(
+          "protocolError",
+          new CodexProtocolError("Codex app-server response has an invalid id"),
+        );
+        return;
+      }
       const pending = this.#pending.get(message.id);
       if (!pending) {
         const tombstone = this.#timedOutRequestIds.get(message.id);
@@ -296,6 +323,12 @@ export class CodexAppServerClient {
       this.#pending.delete(message.id);
       clearTimeout(pending.timeout);
       if ("error" in message) {
+        if (!isRpcError(message.error)) {
+          pending.reject(
+            new CodexProtocolError("Codex app-server response has an invalid error"),
+          );
+          return;
+        }
         pending.reject(
           new CodexRpcError(message.error.message, message.error.code, message.error.data),
         );
@@ -306,6 +339,13 @@ export class CodexAppServerClient {
     }
 
     if ("method" in message && "id" in message) {
+      if (typeof message.method !== "string" || !isRpcId(message.id)) {
+        this.#events.emit(
+          "protocolError",
+          new CodexProtocolError("Codex app-server request has an invalid method or id"),
+        );
+        return;
+      }
       const request = message as RpcRequest;
       this.#events.emit("serverRequest", {
         id: request.id,
@@ -316,6 +356,13 @@ export class CodexAppServerClient {
     }
 
     if ("method" in message) {
+      if (typeof message.method !== "string") {
+        this.#events.emit(
+          "protocolError",
+          new CodexProtocolError("Codex app-server notification has an invalid method"),
+        );
+        return;
+      }
       this.#events.emit("notification", message.method, message.params);
       return;
     }
@@ -373,6 +420,19 @@ export class CodexAppServerClient {
     this.#closePromise ??= this.#transport.close();
     return this.#closePromise;
   }
+}
+
+function isRpcMessageRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRpcId(value: unknown): value is RpcId {
+  return typeof value === "string" || typeof value === "number";
+}
+
+function isRpcError(value: unknown): value is RpcError {
+  if (!isRpcMessageRecord(value)) return false;
+  return typeof value.code === "number" && typeof value.message === "string";
 }
 
 class ChildProcessTransport implements AppServerTransport {

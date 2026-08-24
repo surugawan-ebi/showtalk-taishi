@@ -390,6 +390,16 @@ test("accepts only the fixed, non-secret approval choices", () => {
     autoResolutionMs: null,
   };
   assert.equal(validateWorkspaceGitPlanQuestion(request).questionId, "approval");
+  assert.equal(
+    validateWorkspaceGitPlanQuestion({ ...request, autoResolutionMs: 60_000 })
+      .autoResolutionMs,
+    60_000,
+  );
+  for (const autoResolutionMs of [59_999, 240_001, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(() =>
+      validateWorkspaceGitPlanQuestion({ ...request, autoResolutionMs }),
+    );
+  }
   assert.throws(() =>
     validateWorkspaceGitPlanQuestion({
       ...request,

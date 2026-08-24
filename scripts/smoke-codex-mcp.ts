@@ -62,6 +62,7 @@ const runtime = await createRuntime(config, {
     presentPermissionApproval: async () => {
       throw new Error("The Codex MCP smoke must not request human approval");
     },
+    settlePermissionApproval: async () => undefined,
   }),
 });
 let sawAgentList = false;

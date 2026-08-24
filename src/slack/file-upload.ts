@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
-
-import type { RuntimeSlackAttachment } from "../mcp/workspace-attachments.js";
+import {
+  MAX_SLACK_ATTACHMENT_FILE_BYTES,
+  MAX_SLACK_ATTACHMENT_TOTAL_BYTES,
+  type RuntimeSlackAttachment,
+} from "../mcp/workspace-attachments.js";
 
 interface SlackFileUploadClient {
   readonly files: {
@@ -15,7 +17,6 @@ interface SlackFileUploadClient {
 
 export interface SlackFileUploadDependencies {
   readonly fetch?: (url: URL, init: RequestInit) => Promise<Response>;
-  readonly readFile?: (path: string) => Promise<Buffer>;
 }
 
 /**
@@ -32,54 +33,73 @@ export async function uploadSlackAttachments(
 ): Promise<void> {
   if (attachments.length === 0) return;
   const fetchFile = dependencies.fetch ?? fetch;
-  const loadFile = dependencies.readFile ?? readFile;
   const files: Array<{ id: string; title?: string }> = [];
-
+  let totalBytes = 0;
   for (const attachment of attachments) {
-    const ticket = asRecord(
-      await client.files.getUploadURLExternal({
-        filename: attachment.name,
-        length: attachment.size,
-        ...(attachment.altText === undefined
-          ? {}
-          : { alt_text: attachment.altText }),
-      }),
-    );
     if (
-      ticket?.ok !== true ||
-      typeof ticket.upload_url !== "string" ||
-      typeof ticket.file_id !== "string"
+      attachment.payload.size <= 0 ||
+      attachment.payload.size > MAX_SLACK_ATTACHMENT_FILE_BYTES
     ) {
-      throw new Error("Slack did not provide a usable external file upload ticket");
+      throw new Error("Slack attachment payload has an invalid size");
     }
-    const uploadUrl = requireSlackUploadUrl(ticket.upload_url);
-    const bytes = await loadFile(attachment.path);
-    if (bytes.byteLength !== attachment.size) {
-      throw new Error("Slack attachment changed after it was validated");
+    totalBytes += attachment.payload.size;
+    if (totalBytes > MAX_SLACK_ATTACHMENT_TOTAL_BYTES) {
+      throw new Error("Slack attachment payloads exceed the total size limit");
     }
-    const uploaded = await fetchFile(uploadUrl, {
-      method: "POST",
-      body: new Uint8Array(bytes),
-      redirect: "error",
-    });
-    if (!uploaded.ok) {
-      throw new Error("Slack external file upload failed");
-    }
-    files.push({
-      id: ticket.file_id,
-      ...(attachment.title === undefined ? {} : { title: attachment.title }),
-    });
   }
 
-  const completed = asRecord(
-    await client.apiCall("files.completeUploadExternal", {
-      channel_id: channelId,
-      thread_ts: rootThreadTs,
-      files,
-    }),
-  );
-  if (completed?.ok !== true) {
-    throw new Error("Slack did not complete the external file upload");
+  try {
+    for (const attachment of attachments) {
+      const ticket = asRecord(
+        await client.files.getUploadURLExternal({
+          filename: attachment.name,
+          length: attachment.payload.size,
+          ...(attachment.altText === undefined
+            ? {}
+            : { alt_text: attachment.altText }),
+        }),
+      );
+      if (
+        ticket?.ok !== true ||
+        typeof ticket.upload_url !== "string" ||
+        typeof ticket.file_id !== "string"
+      ) {
+        throw new Error("Slack did not provide a usable external file upload ticket");
+      }
+      const uploadUrl = requireSlackUploadUrl(ticket.upload_url);
+      files.push({
+        id: ticket.file_id,
+        ...(attachment.title === undefined ? {} : { title: attachment.title }),
+      });
+      const uploaded = await fetchFile(uploadUrl, {
+        method: "POST",
+        body: attachment.payload,
+        redirect: "error",
+      });
+      await uploaded.body?.cancel().catch(() => undefined);
+      if (!uploaded.ok) {
+        throw new Error("Slack external file upload failed");
+      }
+    }
+
+    const completed = asRecord(
+      await client.apiCall("files.completeUploadExternal", {
+        channel_id: channelId,
+        thread_ts: rootThreadTs,
+        files,
+      }),
+    );
+    if (completed?.ok !== true) {
+      throw new Error("Slack did not complete the external file upload");
+    }
+  } catch (error) {
+    // Uploaded-but-uncompleted tickets are not visible as the requested
+    // message, but deleting every acquired file ID avoids abandoned uploads
+    // and also compensates uncertain partial completion.
+    await Promise.allSettled(
+      files.map(({ id }) => client.apiCall("files.delete", { file: id })),
+    );
+    throw error;
   }
 }
 

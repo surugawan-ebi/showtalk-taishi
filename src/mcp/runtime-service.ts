@@ -13,7 +13,7 @@ import type { PermissionApprovalCoordinator } from "../permissions/approval-coor
 import type { PermissionEngine } from "../permissions/engine.js";
 import { MAX_LISTED_AGENTS, MAX_RESULT_MESSAGE_LENGTH } from "./schemas.js";
 import {
-  resolveWorkspaceAttachments,
+  withResolvedWorkspaceAttachments,
   type RuntimeSlackAttachment,
 } from "./workspace-attachments.js";
 import {
@@ -66,7 +66,6 @@ interface SourceSlackTurn {
 }
 
 interface IdempotencyEntry {
-  readonly fingerprint: string;
   readonly promise: Promise<unknown>;
   settledAt?: number;
 }
@@ -222,6 +221,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       );
     }
     const caller = this.#requireCaller(context);
+    const sourceTurn = this.#captureSourceSlackTurn(caller.id, caller.channelId);
     const result = await this.#approvals.authorize(
       "approval",
       {
@@ -231,6 +231,16 @@ export class RuntimeMcpService implements SwitchboardMcpService {
         summary: "Gateway Worker restart",
         grantKey: JSON.stringify(["gateway.restart", caller.id]),
         allowSessionGrant: false,
+        ...(sourceTurn === undefined
+          ? {}
+          : {
+              slackContext: {
+                rootThreadTs: sourceTurn.rootThreadTs,
+                ...(sourceTurn.slackUserId === undefined
+                  ? {}
+                  : { slackUserId: sourceTurn.slackUserId }),
+              },
+            }),
       },
       context.signal,
     );
@@ -366,14 +376,35 @@ export class RuntimeMcpService implements SwitchboardMcpService {
             this.#onProjectionError(error);
             if (
               activity.type === "delegation.agent_event" &&
-              activity.event.type === "user_input.requested"
+              activity.event.type === "approval.requested"
+            ) {
+              try {
+                await this.#requireGateway().resolveSessionApproval(
+                  activity.targetSessionId,
+                  {
+                    requestId: activity.event.requestId,
+                    decision: "cancel",
+                  },
+                );
+              } catch (resolutionError) {
+                this.#onProjectionError(resolutionError);
+                // An invisible native approval must never remain live. By
+                // failing routing here, adapter cleanup interrupts the target.
+                throw resolutionError;
+              }
+            } else if (
+              activity.type === "delegation.agent_event" &&
+              (activity.event.type === "user_input.requested" ||
+                activity.event.type === "choice.requested")
             ) {
               try {
                 await this.#requireGateway().resolveSessionUserInput(
                   activity.targetSessionId,
                   {
                     requestId: activity.event.requestId,
-                    optionId: "reject",
+                    ...(activity.event.type === "user_input.requested"
+                      ? { optionId: "reject" as const }
+                      : { cancelled: true as const }),
                   },
                 );
               } catch (resolutionError) {
@@ -490,17 +521,21 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       channelId,
       slackWriteSummary(message, attachments),
     );
-    const files = attachments.length === 0
-      ? []
-      : await resolveWorkspaceAttachments(
-          requireWorkspacePath(caller),
-          attachments,
-        );
-    this.#throwIfCancelled(context);
-    const ts = await (files.length === 0
-      ? this.#requireSlack().postMessage(channelId, message)
-      : this.#requireSlack().postMessage(channelId, message, files));
-    return { channel: channelId, ts };
+    if (attachments.length === 0) {
+      this.#throwIfCancelled(context);
+      const ts = await this.#requireSlack().postMessage(channelId, message);
+      return { channel: channelId, ts };
+    }
+    return withResolvedWorkspaceAttachments(
+      requireWorkspacePath(caller),
+      attachments,
+      async (files) => {
+        this.#throwIfCancelled(context);
+        const ts = await this.#requireSlack().postMessage(channelId, message, files);
+        return { channel: channelId, ts };
+      },
+      { signal: context.signal },
+    );
   }
 
   async slackReply(
@@ -535,17 +570,26 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       channelId,
       slackWriteSummary(message, attachments),
     );
-    const files = attachments.length === 0
-      ? []
-      : await resolveWorkspaceAttachments(
-          requireWorkspacePath(caller),
-          attachments,
+    if (attachments.length === 0) {
+      this.#throwIfCancelled(context);
+      const ts = await this.#requireSlack().reply(channelId, threadTs, message);
+      return { channel: channelId, ts, thread_ts: threadTs };
+    }
+    return withResolvedWorkspaceAttachments(
+      requireWorkspacePath(caller),
+      attachments,
+      async (files) => {
+        this.#throwIfCancelled(context);
+        const ts = await this.#requireSlack().reply(
+          channelId,
+          threadTs,
+          message,
+          files,
         );
-    this.#throwIfCancelled(context);
-    const ts = await (files.length === 0
-      ? this.#requireSlack().reply(channelId, threadTs, message)
-      : this.#requireSlack().reply(channelId, threadTs, message, files));
-    return { channel: channelId, ts, thread_ts: threadTs };
+        return { channel: channelId, ts, thread_ts: threadTs };
+      },
+      { signal: context.signal },
+    );
   }
 
   async #authorizeSlackWrite(
@@ -555,6 +599,11 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     message: string,
   ): Promise<void> {
     const sourceAgentId = context.agentId;
+    const sourceAgent = this.#registry.requireAgent(sourceAgentId);
+    const sourceTurn = this.#captureSourceSlackTurn(
+      sourceAgentId,
+      sourceAgent.channelId,
+    );
     const policy = this.#permissions.slackAccess(
       sourceAgentId,
       "write",
@@ -566,6 +615,16 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       operation: "slack.write",
       summary: `Post to ${targetChannelId}: ${truncateSummary(message)}`,
       grantKey: JSON.stringify(["slack.write", sourceAgentId, targetChannelId]),
+      ...(sourceTurn === undefined
+        ? {}
+        : {
+            slackContext: {
+              rootThreadTs: sourceTurn.rootThreadTs,
+              ...(sourceTurn.slackUserId === undefined
+                ? {}
+                : { slackUserId: sourceTurn.slackUserId }),
+            },
+          }),
     }, context.signal);
     this.#throwIfCancelled(context);
     if (result !== "allow") {
@@ -622,32 +681,66 @@ export class RuntimeMcpService implements SwitchboardMcpService {
   ): Promise<T> {
     this.#throwIfCancelled(context);
     this.#pruneIdempotencyEntries();
-    const key = digest([context.agentId, operation, context.requestId]);
     const fingerprint = digest(fingerprintInput);
+    const turnScope = this.#activeTurnIdempotencyScope(context.agentId);
+    // JSON-RPC request IDs are scoped to one MCP Client and commonly restart at
+    // zero after a reconnect or backend-thread switch. They are therefore not
+    // globally unique for a Koe. Canonical arguments prevent unrelated calls
+    // from colliding, while the live Gateway turn keeps exact retries bounded
+    // to the conversation that issued them.
+    const key = digest([
+      context.agentId,
+      operation,
+      turnScope ?? "unscoped",
+      context.requestId,
+      fingerprint,
+    ]);
     const existing = this.#idempotency.get(key);
     if (existing !== undefined) {
-      if (existing.fingerprint !== fingerprint) {
-        throw new McpServiceError(
-          "IDEMPOTENCY_CONFLICT",
-          "The MCP request identity was reused with different arguments",
-        );
-      }
       return awaitWithSignal(existing.promise as Promise<T>, context.signal);
     }
 
     this.#reserveIdempotencyCapacity();
     const promise = this.#trackExecution(execute);
-    const entry: IdempotencyEntry = { fingerprint, promise };
+    const entry: IdempotencyEntry = {
+      promise,
+    };
     this.#idempotency.set(key, entry);
     void promise.then(
       () => {
-        entry.settledAt = Date.now();
+        this.#settleIdempotencyEntry(key, entry);
       },
       () => {
-        entry.settledAt = Date.now();
+        this.#settleIdempotencyEntry(key, entry);
       },
     );
     return awaitWithSignal(promise, context.signal);
+  }
+
+  #activeTurnIdempotencyScope(agentId: string): string | undefined {
+    if (!this.#registry.hasActiveAgentTurn(agentId)) return undefined;
+    const session = this.#registry.getActiveSession(agentId);
+    const turn = session?.activeTurn;
+    if (session === undefined || turn === undefined) return undefined;
+    return digest([
+      session.id,
+      session.adapterSession.id,
+      turn.type,
+      turn.startedAt,
+      turn.type === "slack"
+        ? [
+            turn.channelId,
+            turn.rootThreadTs,
+            turn.messageTs,
+            turn.continuationDelegationId ?? null,
+          ]
+        : [turn.sourceAgentId, turn.delegationId],
+    ]);
+  }
+
+  #settleIdempotencyEntry(key: string, entry: IdempotencyEntry): void {
+    if (this.#idempotency.get(key) !== entry) return;
+    entry.settledAt = Date.now();
   }
 
   #pruneIdempotencyEntries(): void {
@@ -785,7 +878,9 @@ function latestSession(registry: InMemoryAgentRegistry, agentId: string) {
   if (primary !== undefined) return primary;
   const active = sessions
     .filter((session) =>
-      ["starting", "running", "waiting_for_approval"].includes(session.status),
+      ["starting", "running", "waiting_for_approval", "waiting_for_input"].includes(
+        session.status,
+      ),
     )
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
   if (active !== undefined) return active;

@@ -143,6 +143,64 @@ test("rejects environment files that expose Slack secrets to other users", async
   );
 });
 
+test("restores the previous plist and reports a failed rollback bootstrap", async () => {
+  const homeDirectory = await mkdtemp(join(tmpdir(), "taishi-launch-rollback-"));
+  const repository = join(homeDirectory, "repo");
+  await mkdir(repository);
+  const configPath = join(repository, "config.yaml");
+  const envFilePath = join(repository, ".env");
+  const cliEntrypoint = join(repository, "cli.js");
+  await Promise.all([
+    writePrivate(configPath, "version: 1\n"),
+    writePrivate(envFilePath, "SLACK_BOT_TOKEN=fixture\n"),
+    writeFile(cliEntrypoint, "// fixture\n", "utf8"),
+  ]);
+  let loaded = false;
+  let failBootstrap = false;
+  const context: MacOSLaunchAgentContext = {
+    platform: "darwin",
+    homeDirectory,
+    userId: process.getuid?.() ?? 501,
+    nodePath: "/usr/bin/node",
+    nodeArguments: [],
+    cliEntrypoint,
+    pathEnvironment: "/usr/bin:/bin",
+    runLaunchctl: async (arguments_) => {
+      if (arguments_[0] === "print") {
+        return loaded
+          ? { code: 0, stdout: "\tstate = running\n", stderr: "" }
+          : { code: 113, stdout: "", stderr: "not loaded" };
+      }
+      if (arguments_[0] === "bootout") {
+        loaded = false;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (arguments_[0] === "bootstrap") {
+        if (failBootstrap) {
+          return { code: 5, stdout: "", stderr: "bootstrap failed" };
+        }
+        loaded = true;
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    wait: async () => undefined,
+  };
+
+  await installMacOSLaunchAgent({ configPath, envFilePath }, context);
+  const plistPath = macOSLaunchAgentPaths(homeDirectory).plistPath;
+  const previous = await readFile(plistPath, "utf8");
+  failBootstrap = true;
+
+  await assert.rejects(
+    installMacOSLaunchAgent({ configPath, envFilePath }, context),
+    (error) =>
+      error instanceof AggregateError &&
+      /rollback was incomplete/u.test(error.message) &&
+      error.errors.length === 2,
+  );
+  assert.equal(await readFile(plistPath, "utf8"), previous);
+});
+
 async function writePrivate(path: string, contents: string): Promise<void> {
   await writeFile(path, contents, { encoding: "utf8", mode: 0o600 });
   await chmod(path, 0o600);
