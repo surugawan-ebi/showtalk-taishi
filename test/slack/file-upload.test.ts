@@ -7,6 +7,7 @@ test("completes multiple Slack files with only supported upload arguments", asyn
   const tickets: Array<Record<string, unknown>> = [];
   const completions: Array<Record<string, unknown>> = [];
   const uploadedUrls: string[] = [];
+  const uploadedBodies: Buffer[] = [];
   let nextFile = 1;
   const client = {
     files: {
@@ -33,24 +34,22 @@ test("completes multiple Slack files with only supported upload arguments", asyn
     "100.1",
     [
       {
-        path: "/workspace/one.png",
+        payload: new Blob(["abc"]),
         name: "one.png",
-        size: 3,
         kind: "image",
         altText: "First image",
         title: "One",
       },
       {
-        path: "/workspace/two.wav",
+        payload: new Blob(["abc"]),
         name: "two.wav",
-        size: 3,
         kind: "audio",
       },
     ],
     {
-      readFile: async () => Buffer.from("abc"),
-      fetch: async (url) => {
+      fetch: async (url, init) => {
         uploadedUrls.push(url.toString());
+        uploadedBodies.push(Buffer.from(await new Response(init.body).arrayBuffer()));
         return new Response("ok", { status: 200 });
       },
     },
@@ -64,6 +63,7 @@ test("completes multiple Slack files with only supported upload arguments", asyn
     "https://files.slack.com/upload/v1/1",
     "https://files.slack.com/upload/v1/2",
   ]);
+  assert.deepEqual(uploadedBodies, [Buffer.from("abc"), Buffer.from("abc")]);
   assert.deepEqual(completions, [
     {
       channel_id: "C1",
@@ -85,14 +85,12 @@ test("rejects unsafe upload tickets and files changed after validation", async (
     apiCall: async () => ({ ok: true }),
   };
   const attachment = {
-    path: "/workspace/one.png",
+    payload: new Blob(["abc"]),
     name: "one.png",
-    size: 3,
     kind: "image" as const,
   };
   await assert.rejects(
     uploadSlackAttachments(completionClient, "C1", "100.1", [attachment], {
-      readFile: async () => Buffer.from("abc"),
       fetch: async () => new Response("ok"),
     }),
     /unsafe external file upload URL/u,
@@ -104,10 +102,56 @@ test("rejects unsafe upload tickets and files changed after validation", async (
     file_id: "F1",
   });
   await assert.rejects(
-    uploadSlackAttachments(completionClient, "C1", "100.1", [attachment], {
-      readFile: async () => Buffer.from("changed"),
+    uploadSlackAttachments(completionClient, "C1", "100.1", [{
+      ...attachment,
+      payload: new Blob([]),
+    }], {
       fetch: async () => new Response("ok"),
     }),
-    /changed after it was validated/u,
+    /invalid size/u,
   );
+});
+
+test("deletes every acquired file ticket when a later upload fails", async () => {
+  let nextFile = 1;
+  const deleted: string[] = [];
+  const client = {
+    files: {
+      getUploadURLExternal: async () => {
+        const file = nextFile++;
+        return {
+          ok: true,
+          upload_url: `https://files.slack.com/upload/v1/${file}`,
+          file_id: `F${file}`,
+        };
+      },
+    },
+    apiCall: async (method: string, input: Record<string, unknown>) => {
+      if (method === "files.delete") {
+        deleted.push(String(input.file));
+        return { ok: true };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+
+  await assert.rejects(
+    uploadSlackAttachments(
+      client,
+      "C1",
+      "100.1",
+      [
+        { payload: new Blob(["one"]), name: "one.png", kind: "image" },
+        { payload: new Blob(["two"]), name: "two.png", kind: "image" },
+      ],
+      {
+        fetch: async (url) =>
+          url.pathname.endsWith("/1")
+            ? new Response("ok", { status: 200 })
+            : new Response("failed", { status: 500 }),
+      },
+    ),
+    /external file upload failed/u,
+  );
+  assert.deepEqual(deleted.sort(), ["F1", "F2"]);
 });

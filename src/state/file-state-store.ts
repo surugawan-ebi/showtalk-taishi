@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   mkdir,
+  link,
   open,
   readFile,
   rename,
@@ -28,6 +29,7 @@ export function emptyRuntimeState(): RuntimeState {
       primarySessions: [],
       handledDelegationResults: [],
       usedContinuationDelegations: [],
+      handledSlackEvents: [],
     },
   };
 }
@@ -47,25 +49,45 @@ export class FileStateStore {
     const lockPath = this.#lockPath();
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const nonce = randomUUID();
+      const temporaryLockPath = `${lockPath}.${process.pid}.${nonce}.tmp`;
       let handle: FileHandle | undefined;
       try {
-        handle = await open(lockPath, "wx", 0o600);
+        handle = await open(temporaryLockPath, "wx", 0o600);
         await handle.writeFile(
           `${JSON.stringify({ version: 1, pid: process.pid, nonce })}\n`,
           "utf8",
         );
         await handle.sync();
-        this.#lockHandle = handle;
-        this.#lockNonce = nonce;
-        return;
       } catch (error) {
         await handle?.close().catch(() => undefined);
+        await unlink(temporaryLockPath).catch(() => undefined);
+        throw error;
+      }
+      try {
+        // A hard-link install is an atomic no-clobber operation. Other
+        // processes can therefore observe only a complete lock record—never
+        // the open-before-write window of the old implementation.
+        await link(temporaryLockPath, lockPath);
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await unlink(temporaryLockPath).catch(() => undefined);
         if (!isNodeError(error) || error.code !== "EEXIST") throw error;
         if (!(await this.#removeStaleLock())) {
           throw new Error(
             `Another ShowTalk Taishi process is using state file: ${this.path}`,
           );
         }
+        continue;
+      }
+      await unlink(temporaryLockPath).catch(() => undefined);
+      try {
+        this.#lockHandle = handle;
+        this.#lockNonce = nonce;
+        return;
+      } catch (error) {
+        await handle?.close().catch(() => undefined);
+        await unlink(lockPath).catch(() => undefined);
+        throw error;
       }
     }
     throw new Error(`Could not acquire ShowTalk Taishi state lock: ${this.path}`);
@@ -109,8 +131,10 @@ export class FileStateStore {
 
   save(state: RuntimeState): Promise<void> {
     const snapshot = structuredClone(validateRuntimeState(state));
-    const nextWrite = this.#writeQueue.then(() => this.#writeAtomically(snapshot));
-    this.#writeQueue = nextWrite.catch(() => undefined);
+    const nextWrite = this.#writeQueue
+      .catch(() => undefined)
+      .then(() => this.#writeAtomically(snapshot));
+    this.#writeQueue = nextWrite;
     return nextWrite;
   }
 
@@ -229,6 +253,12 @@ function validateRuntimeState(value: unknown): RuntimeState {
     (core.usedContinuationDelegations !== undefined &&
       (!Array.isArray(core.usedContinuationDelegations) ||
         !core.usedContinuationDelegations.every(
+          (item) => typeof item === "string" && item.trim().length > 0,
+        ))) ||
+    (core.handledSlackEvents !== undefined &&
+      (!Array.isArray(core.handledSlackEvents) ||
+        core.handledSlackEvents.length > 10_000 ||
+        !core.handledSlackEvents.every(
           (item) => typeof item === "string" && item.trim().length > 0,
         )))
   ) {

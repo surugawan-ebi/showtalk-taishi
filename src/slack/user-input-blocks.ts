@@ -1,11 +1,15 @@
 import type { KnownBlock } from "@slack/types";
 
 import type {
-  AgentUserInputResponse,
+  AgentGitApprovalInputResponse,
   WorkspaceGitApprovalPlan,
 } from "../core/index.js";
 
 export const USER_INPUT_ACTION_PREFIX = "taishi.git_plan.";
+export const USER_INPUT_PATH_ACTION_PREFIX = `${USER_INPUT_ACTION_PREFIX}paths.`;
+export const USER_INPUT_BODY_ACTION_PREFIX = `${USER_INPUT_ACTION_PREFIX}body.`;
+
+const MAX_STORED_GIT_APPROVAL_DETAILS = 128;
 
 export interface UserInputActionValue {
   readonly version: 1;
@@ -15,11 +19,82 @@ export interface UserInputActionValue {
   readonly messageTs: string;
 }
 
+export type UserInputPathVisibility = "show" | "hide";
+export type UserInputBodyVisibility = "show" | "hide";
+
+export interface WorkspaceGitApprovalBlockOptions {
+  readonly pathsExpanded?: boolean;
+  readonly allowPathToggle?: boolean;
+  readonly bodyExpanded?: boolean;
+  readonly allowBodyToggle?: boolean;
+}
+
+export interface WorkspaceGitApprovalDisplayState {
+  readonly pathsExpanded: boolean;
+  readonly bodyExpanded: boolean;
+}
+
+export interface WorkspaceGitApprovalDetails {
+  readonly prompt: string;
+  readonly plan: WorkspaceGitApprovalPlan;
+  readonly routing: UserInputActionValue;
+  readonly fallbackText: string;
+  readonly sourceUserMention?: string;
+  readonly display: WorkspaceGitApprovalDisplayState;
+}
+
+/** Process-local display state for one exact, message-bound Git approval card. */
+export class WorkspaceGitApprovalDetailsStore {
+  readonly #entries = new Map<string, WorkspaceGitApprovalDetails>();
+
+  remember(details: WorkspaceGitApprovalDetails): void {
+    const key = approvalDetailsKey(details.routing);
+    this.#entries.delete(key);
+    this.#entries.set(key, Object.freeze({
+      ...details,
+      plan: details.plan,
+      routing: Object.freeze({ ...details.routing }),
+      display: Object.freeze({ ...details.display }),
+    }));
+    while (this.#entries.size > MAX_STORED_GIT_APPROVAL_DETAILS) {
+      const oldest = this.#entries.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#entries.delete(oldest);
+    }
+  }
+
+  get(routing: UserInputActionValue): WorkspaceGitApprovalDetails | undefined {
+    return this.#entries.get(approvalDetailsKey(routing));
+  }
+
+  updateDisplay(
+    routing: UserInputActionValue,
+    display: WorkspaceGitApprovalDisplayState,
+  ): void {
+    const key = approvalDetailsKey(routing);
+    const current = this.#entries.get(key);
+    if (current === undefined) return;
+    this.#entries.set(key, Object.freeze({
+      ...current,
+      display: Object.freeze({ ...display }),
+    }));
+  }
+
+  forget(routing: UserInputActionValue): void {
+    this.#entries.delete(approvalDetailsKey(routing));
+  }
+}
+
 export function buildWorkspaceGitApprovalBlocks(
   prompt: string,
   plan: WorkspaceGitApprovalPlan,
   value: UserInputActionValue,
+  options: WorkspaceGitApprovalBlockOptions = {},
 ): KnownBlock[] {
+  const pathsExpanded = options.pathsExpanded ?? true;
+  const allowPathToggle = options.allowPathToggle ?? false;
+  const bodyExpanded = options.bodyExpanded ?? true;
+  const allowBodyToggle = options.allowBodyToggle ?? false;
   const blocks: KnownBlock[] = [
     {
       type: "section",
@@ -43,16 +118,36 @@ export function buildWorkspaceGitApprovalBlocks(
       },
     },
   ];
-  const pathChunks = exactPathChunks(plan.paths);
-  blocks.push(...pathChunks.map((text): KnownBlock => ({
-    type: "section",
-    text: { type: "plain_text", text, emoji: false },
-  })));
+  blocks.push(pathSummaryBlock(plan.paths.length, value, {
+    pathsExpanded,
+    allowPathToggle,
+  }));
+  if (pathsExpanded) {
+    const pathChunks = exactPathChunks(plan.paths);
+    blocks.push(...pathChunks.map((text): KnownBlock => ({
+      type: "section",
+      text: { type: "plain_text", text, emoji: false },
+    })));
+  }
   for (const [label, value] of exactPlanTexts(plan)) {
     blocks.push(...exactTextChunks(label, value).map((text): KnownBlock => ({
       type: "section",
       text: { type: "plain_text", text, emoji: false },
     })));
+  }
+  if (plan.pullRequestBody !== undefined) {
+    blocks.push(bodySummaryBlock(plan.pullRequestBody, value, {
+      bodyExpanded,
+      allowBodyToggle,
+    }));
+    if (bodyExpanded) {
+      blocks.push(...exactTextChunks("Draft PR body", plan.pullRequestBody).map(
+        (text): KnownBlock => ({
+          type: "section",
+          text: { type: "plain_text", text, emoji: false },
+        }),
+      ));
+    }
   }
   if (blocks.length > 48) {
     throw new Error("The exact Git plan is too large for Slack Block Kit");
@@ -91,11 +186,31 @@ export function buildWorkspaceGitApprovalBlocks(
 
 export function parseUserInputDecision(
   actionId: string,
-): AgentUserInputResponse["optionId"] | undefined {
+): AgentGitApprovalInputResponse["optionId"] | undefined {
   if (!actionId.startsWith(USER_INPUT_ACTION_PREFIX)) return undefined;
   const decision = actionId.slice(USER_INPUT_ACTION_PREFIX.length);
   return decision === "approve" || decision === "reject"
     ? decision
+    : undefined;
+}
+
+export function parseUserInputPathVisibility(
+  actionId: string,
+): UserInputPathVisibility | undefined {
+  if (!actionId.startsWith(USER_INPUT_PATH_ACTION_PREFIX)) return undefined;
+  const visibility = actionId.slice(USER_INPUT_PATH_ACTION_PREFIX.length);
+  return visibility === "show" || visibility === "hide"
+    ? visibility
+    : undefined;
+}
+
+export function parseUserInputBodyVisibility(
+  actionId: string,
+): UserInputBodyVisibility | undefined {
+  if (!actionId.startsWith(USER_INPUT_BODY_ACTION_PREFIX)) return undefined;
+  const visibility = actionId.slice(USER_INPUT_BODY_ACTION_PREFIX.length);
+  return visibility === "show" || visibility === "hide"
+    ? visibility
     : undefined;
 }
 
@@ -175,6 +290,76 @@ function planFields(
   return fields;
 }
 
+function pathSummaryBlock(
+  pathCount: number,
+  routing: UserInputActionValue,
+  options: {
+    readonly pathsExpanded: boolean;
+    readonly allowPathToggle: boolean;
+  },
+): KnownBlock {
+  const summary = pathCount === 0
+    ? "*変更ファイル*\nなし"
+    : `*変更ファイル*\n${pathCount}件`;
+  if (!options.allowPathToggle || pathCount === 0) {
+    return {
+      type: "section",
+      text: { type: "mrkdwn", text: summary },
+    };
+  }
+  const visibility: UserInputPathVisibility = options.pathsExpanded
+    ? "hide"
+    : "show";
+  return {
+    type: "section",
+    text: { type: "mrkdwn", text: summary },
+    accessory: {
+      type: "button",
+      text: {
+        type: "plain_text",
+        text: options.pathsExpanded ? "一覧を閉じる" : "変更ファイルを表示",
+        emoji: true,
+      },
+      action_id: `${USER_INPUT_PATH_ACTION_PREFIX}${visibility}`,
+      value: JSON.stringify(routing),
+    },
+  };
+}
+
+function bodySummaryBlock(
+  body: string,
+  routing: UserInputActionValue,
+  options: {
+    readonly bodyExpanded: boolean;
+    readonly allowBodyToggle: boolean;
+  },
+): KnownBlock {
+  const summary = `*Draft PR body*\n${[...body].length}文字`;
+  if (!options.allowBodyToggle) {
+    return {
+      type: "section",
+      text: { type: "mrkdwn", text: summary },
+    };
+  }
+  const visibility: UserInputBodyVisibility = options.bodyExpanded
+    ? "hide"
+    : "show";
+  return {
+    type: "section",
+    text: { type: "mrkdwn", text: summary },
+    accessory: {
+      type: "button",
+      text: {
+        type: "plain_text",
+        text: options.bodyExpanded ? "PR本文を閉じる" : "PR本文を表示",
+        emoji: true,
+      },
+      action_id: `${USER_INPUT_BODY_ACTION_PREFIX}${visibility}`,
+      value: JSON.stringify(routing),
+    },
+  };
+}
+
 function field(label: string, value: string): { type: "mrkdwn"; text: string } {
   return { type: "mrkdwn", text: `*${label}*\n${escapeSlack(value)}` };
 }
@@ -208,9 +393,6 @@ function exactPlanTexts(
     ...(plan.pullRequestTitle === undefined
       ? []
       : [["Draft PR title", plan.pullRequestTitle] as const]),
-    ...(plan.pullRequestBody === undefined
-      ? []
-      : [["Draft PR body", plan.pullRequestBody] as const]),
     ...(plan.pullRequestBaseBranch === undefined
       ? []
       : [["Draft PR base", plan.pullRequestBaseBranch] as const]),
@@ -273,4 +455,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function countLiteralKey(value: string, key: string): number {
   return [...value.matchAll(new RegExp(`"${key}"\\s*:`, "g"))].length;
+}
+
+function approvalDetailsKey(value: UserInputActionValue): string {
+  return [
+    value.requestId,
+    value.channelId,
+    value.rootThreadTs,
+    value.messageTs,
+  ].join("\u0000");
 }

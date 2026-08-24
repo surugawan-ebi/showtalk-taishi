@@ -164,6 +164,65 @@ test("deduplicates file IDs without changing their first-occurrence order", asyn
   assert.deepEqual(result.attachments.map(({ name }) => name), ["FONE.png", "FTWO.mp3"]);
 });
 
+test("does not let one Koe's slow download block another Koe", async (t) => {
+  const root = await temporaryRoot(t);
+  const fixtures = [png("FONE"), png("FTWO")];
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let markSecondStarted!: () => void;
+  const secondStarted = new Promise<void>((resolve) => {
+    markSecondStarted = resolve;
+  });
+  const transport = new SlackFileTransport({
+    botToken: BOT_TOKEN,
+    rootDirectory: root,
+    fetchFn: async (input) => {
+      const value = String(input);
+      const fixture = fixtures.find((candidate) => value.endsWith(candidate.id));
+      assert.ok(fixture);
+      if (fixture.id === "FONE") await firstGate;
+      if (fixture.id === "FTWO") markSecondStarted();
+      return new Response(Uint8Array.from(fixture.bytes), {
+        status: 200,
+        headers: { "Content-Length": String(fixture.bytes.byteLength) },
+      });
+    },
+  });
+
+  const first = transport.download({
+    agentId: "one",
+    channelId: "C1",
+    messageTs: "1.001",
+    fileIds: ["FONE"],
+    client: clientFor(fixtures),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = transport.download({
+    agentId: "two",
+    channelId: "C2",
+    messageTs: "2.001",
+    fileIds: ["FTWO"],
+    client: clientFor(fixtures),
+  });
+  try {
+    await Promise.race([
+      secondStarted,
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("the second Koe stayed blocked")),
+          1_000,
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    releaseFirst();
+  }
+  await Promise.all([first, second]);
+});
+
 test("ignores unsupported MIME types without downloading them", async (t) => {
   const root = await temporaryRoot(t);
   const fixture: FileFixture = {

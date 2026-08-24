@@ -16,6 +16,7 @@ These instructions describe public project expectations for contributors and cod
 - Use synthetic channel IDs, thread IDs, paths, usernames, and tokens in tests and documentation.
 - Keep Slack OAuth scopes minimal and preserve the Gateway permission boundary even when Slack itself allows an operation.
 - Do not weaken command, file-change, structured-input, or Git publication approval binding.
+- In the ShowTalk App Server flow, a blocking structured-input answer from the bound Slack approval message separates the pre-approval and post-approval phases of one Codex turn. `承認して実行` is the new human decision; after exact revalidation, the post-approval phase may execute only that bound plan without waiting for another Slack message.
 
 ## Runtime diagnosis
 

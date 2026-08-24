@@ -9,6 +9,22 @@ export type PermissionApprovalDecision =
   | "deny"
   | "cancel";
 
+export type PermissionApprovalSettlementReason =
+  | PermissionApprovalDecision
+  | "expired"
+  | "caller_cancelled"
+  | "coordinator_closed";
+
+export interface PermissionApprovalSettlement {
+  readonly requestId: string;
+  readonly reason: PermissionApprovalSettlementReason;
+  readonly resolvedBySlackUserId?: string;
+}
+
+export interface PermissionApprovalResolutionContext {
+  readonly resolvedBySlackUserId?: string;
+}
+
 export interface PermissionApprovalPresentation {
   readonly requestId: string;
   readonly sourceAgentId: string;
@@ -35,6 +51,8 @@ export interface PermissionApprovalRequest {
   readonly grantKey: string;
   /** Set false for high-impact operations that must be approved every time. */
   readonly allowSessionGrant?: boolean;
+  /** Exact process-owned Slack turn that initiated this operation. */
+  readonly slackContext?: PermissionApprovalSlackContext;
 }
 
 export interface PermissionApprovalCoordinatorOptions {
@@ -63,13 +81,13 @@ export class PermissionApprovalCoordinator {
   readonly #idFactory: () => string;
   readonly #pending = new Map<string, PendingApproval>();
   readonly #sessionGrants = new Set<string>();
-  readonly #latestSlackContextByChannel = new Map<
-    string,
-    PermissionApprovalSlackContext
-  >();
   #presenter:
     | ((request: PermissionApprovalPresentation) => Promise<void>)
     | undefined;
+  #settlementPresenter:
+    | ((settlement: PermissionApprovalSettlement) => Promise<void>)
+    | undefined;
+  readonly #settlementTasks = new Set<Promise<void>>();
   #closed = false;
 
   constructor(options: PermissionApprovalCoordinatorOptions = {}) {
@@ -88,29 +106,11 @@ export class PermissionApprovalCoordinator {
     this.#presenter = presenter;
   }
 
-  /**
-   * Remembers the latest human reply destination for one Agent channel. MCP
-   * calls do not accept routing metadata from the model, so only the trusted
-   * Slack event boundary may update this host-owned context.
-   */
-  rememberSlackContext(
-    sourceChannelId: string,
-    context: PermissionApprovalSlackContext,
+  setSettlementPresenter(
+    presenter: (settlement: PermissionApprovalSettlement) => Promise<void>,
   ): void {
-    if (this.#closed) return;
-    if (sourceChannelId.trim().length === 0 || sourceChannelId.length > 128) {
-      throw new TypeError("Slack channel ID has an invalid format");
-    }
-    if (!/^\d{1,20}\.\d{1,20}$/u.test(context.rootThreadTs)) {
-      throw new TypeError("Slack root thread timestamp has an invalid format");
-    }
-    if (
-      context.slackUserId !== undefined &&
-      !/^[UW][A-Z0-9]{1,127}$/u.test(context.slackUserId)
-    ) {
-      throw new TypeError("Slack user ID has an invalid format");
-    }
-    this.#latestSlackContextByChannel.set(sourceChannelId, Object.freeze({ ...context }));
+    if (this.#closed) throw new Error("Permission approval coordinator is closed");
+    this.#settlementPresenter = presenter;
   }
 
   async authorize(
@@ -127,6 +127,7 @@ export class PermissionApprovalCoordinator {
     ) {
       return "allow";
     }
+    const slackContext = validateSlackContext(request.slackContext);
     const presenter = this.#presenter;
     if (presenter === undefined) {
       throw new CoreError(
@@ -141,9 +142,14 @@ export class PermissionApprovalCoordinator {
     const result = new Promise<"allow" | "deny">((resolve) => {
       resolveDecision = resolve;
     });
-    const timer = setTimeout(() => this.#settle(requestId, "deny"), this.#timeoutMs);
+    const timer = setTimeout(
+      () => this.#settle(requestId, "deny", "expired"),
+      this.#timeoutMs,
+    );
     const abortListener =
-      signal === undefined ? undefined : () => this.#settle(requestId, "deny");
+      signal === undefined
+        ? undefined
+        : () => this.#settle(requestId, "deny", "caller_cancelled");
     this.#pending.set(requestId, {
       request,
       expiresAtMs,
@@ -156,13 +162,10 @@ export class PermissionApprovalCoordinator {
       once: true,
     });
     if (isAborted(signal)) {
-      this.#settle(requestId, "deny");
+      this.#settle(requestId, "deny", "caller_cancelled");
       return result;
     }
 
-    const slackContext = this.#latestSlackContextByChannel.get(
-      request.sourceChannelId,
-    );
     try {
       await presenter({
         requestId,
@@ -182,14 +185,18 @@ export class PermissionApprovalCoordinator {
         allowSessionGrant: request.allowSessionGrant !== false,
       });
     } catch (error) {
-      this.#settle(requestId, "deny");
+      this.#settle(requestId, "deny", "caller_cancelled", undefined, false);
       if (isAborted(signal)) return result;
       throw error;
     }
     return result;
   }
 
-  resolve(requestId: string, decision: PermissionApprovalDecision): void {
+  resolve(
+    requestId: string,
+    decision: PermissionApprovalDecision,
+    context: PermissionApprovalResolutionContext = {},
+  ): void {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) {
       throw new CoreError(
@@ -198,7 +205,7 @@ export class PermissionApprovalCoordinator {
       );
     }
     if (this.#now().getTime() >= pending.expiresAtMs) {
-      this.#settle(requestId, "deny");
+      this.#settle(requestId, "deny", "expired");
       throw new CoreError(
         "UNKNOWN_APPROVAL_REQUEST",
         `Permission approval has expired: ${requestId}`,
@@ -216,20 +223,29 @@ export class PermissionApprovalCoordinator {
     this.#settle(
       requestId,
       decision === "allow_once" || decision === "allow_session" ? "allow" : "deny",
+      decision,
+      context.resolvedBySlackUserId,
     );
   }
 
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    for (const requestId of [...this.#pending.keys()]) {
-      this.#settle(requestId, "deny");
+  async close(): Promise<void> {
+    if (!this.#closed) {
+      this.#closed = true;
+      for (const requestId of [...this.#pending.keys()]) {
+        this.#settle(requestId, "deny", "coordinator_closed");
+      }
+      this.#sessionGrants.clear();
     }
-    this.#sessionGrants.clear();
-    this.#latestSlackContextByChannel.clear();
+    await Promise.allSettled([...this.#settlementTasks]);
   }
 
-  #settle(requestId: string, result: "allow" | "deny"): void {
+  #settle(
+    requestId: string,
+    result: "allow" | "deny",
+    reason: PermissionApprovalSettlementReason,
+    resolvedBySlackUserId?: string,
+    notify = true,
+  ): void {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) return;
     clearTimeout(pending.timer);
@@ -238,7 +254,39 @@ export class PermissionApprovalCoordinator {
     }
     this.#pending.delete(requestId);
     pending.resolve(result);
+    if (notify) {
+      this.#notifySettlement({
+        requestId,
+        reason,
+        ...(resolvedBySlackUserId === undefined ? {} : { resolvedBySlackUserId }),
+      });
+    }
   }
+
+  #notifySettlement(settlement: PermissionApprovalSettlement): void {
+    const presenter = this.#settlementPresenter;
+    if (presenter === undefined) return;
+    const task = presenter(settlement)
+      .catch(() => undefined)
+      .finally(() => this.#settlementTasks.delete(task));
+    this.#settlementTasks.add(task);
+  }
+}
+
+function validateSlackContext(
+  context: PermissionApprovalSlackContext | undefined,
+): PermissionApprovalSlackContext | undefined {
+  if (context === undefined) return undefined;
+  if (!/^\d{1,20}\.\d{1,20}$/u.test(context.rootThreadTs)) {
+    throw new TypeError("Slack root thread timestamp has an invalid format");
+  }
+  if (
+    context.slackUserId !== undefined &&
+    !/^[UW][A-Z0-9]{1,127}$/u.test(context.slackUserId)
+  ) {
+    throw new TypeError("Slack user ID has an invalid format");
+  }
+  return Object.freeze({ ...context });
 }
 
 function isAborted(signal: AbortSignal | undefined): boolean {

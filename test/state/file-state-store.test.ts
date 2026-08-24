@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -53,4 +53,26 @@ test("holds an exclusive state lock until the runtime releases it", async () => 
   await first.releaseLock();
   await second.acquireLock();
   await second.releaseLock();
+});
+
+test("flush reports the latest state write failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-state-failure-"));
+  const store = new FileStateStore(directory);
+
+  await assert.rejects(store.save(emptyRuntimeState()));
+  await assert.rejects(store.flush());
+});
+
+test("never removes an incomplete lock based only on its age", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-state-invalid-lock-"));
+  const path = join(directory, "state.json");
+  const lockPath = `${path}.lock`;
+  const store = new FileStateStore(path);
+  await writeFile(lockPath, "", { mode: 0o600 });
+
+  await assert.rejects(store.acquireLock(), /lock is invalid/u);
+  const old = new Date(Date.now() - 60_000);
+  await utimes(lockPath, old, old);
+  await assert.rejects(store.acquireLock(), /lock is invalid/u);
+  assert.equal((await stat(lockPath)).size, 0);
 });

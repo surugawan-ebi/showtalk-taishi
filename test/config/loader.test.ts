@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -58,6 +58,122 @@ test("loads config and expands environment references", async () => {
   assert.equal(config.agents.implementer?.adapter_session_id, undefined);
   assert.equal(config.agents.implementer?.consultations, undefined);
   assert.deepEqual(config.gateway.admin_ui, { enabled: false, port: 4_781 });
+});
+
+test("rejects malformed and allowlist-bypassing admin overrides", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  const overridesPath = join(directory, "admin-config-overrides.v1.json");
+  await writeFile(path, source);
+  const environment = {
+    STATE_FILE: join(directory, "state.json"),
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  };
+
+  await writeFile(overridesPath, "not-json\n", { mode: 0o600 });
+  await assert.rejects(
+    loadConfig(path, environment, { adminOverridesPath: overridesPath }),
+    /not valid JSON/u,
+  );
+
+  await writeFile(
+    overridesPath,
+    `${JSON.stringify({
+      version: 1,
+      overrides: [
+        {
+          json_pointer: "/slack/bot_token",
+          expected_base_hash: "0".repeat(64),
+          value: "xoxb-replacement",
+        },
+      ],
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    loadConfig(path, environment, { adminOverridesPath: overridesPath }),
+    /not editable/u,
+  );
+});
+
+test("refuses a symlinked admin override file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  const targetPath = join(directory, "target.json");
+  const overridesPath = join(directory, "admin-config-overrides.v1.json");
+  await writeFile(path, source);
+  await writeFile(targetPath, '{"version":1,"overrides":[]}\n', { mode: 0o600 });
+  await symlink(targetPath, overridesPath);
+
+  await assert.rejects(
+    loadConfig(
+      path,
+      {
+        STATE_FILE: join(directory, "state.json"),
+        APP_TOKEN: "xapp-test",
+        BOT_TOKEN: "xoxb-test",
+        WORKSPACE: "/tmp/project",
+      },
+      { adminOverridesPath: overridesPath },
+    ),
+    /Unable to read the admin override file/u,
+  );
+});
+
+test("rejects unknown permission override Koe IDs", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "  agents: {}",
+      "  agents:\n    implemener:\n      agents:\n        send: deny",
+    ),
+  );
+  await assert.rejects(
+    loadConfig(path, {
+      STATE_FILE: "/tmp/state.json",
+      APP_TOKEN: "xapp-test",
+      BOT_TOKEN: "xoxb-test",
+      WORKSPACE: "/tmp/project",
+    }),
+    /Permission override references unknown Koe/u,
+  );
+});
+
+test("rejects malformed or duplicate Slack approver IDs", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(path, source.replace("    - U123", "    - ' '\n    - ' '"));
+  await assert.rejects(
+    loadConfig(path, {
+      STATE_FILE: "/tmp/state.json",
+      APP_TOKEN: "xapp-test",
+      BOT_TOKEN: "xoxb-test",
+      WORKSPACE: "/tmp/project",
+    }),
+    /Invalid Slack user ID|must be unique/u,
+  );
+});
+
+test("rejects Koe addresses that shadow literal Slack channel IDs", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace("  implementer:", "  C123:"),
+  );
+  await assert.rejects(
+    loadConfig(path, {
+      STATE_FILE: "/tmp/state.json",
+      APP_TOKEN: "xapp-test",
+      BOT_TOKEN: "xoxb-test",
+      WORKSPACE: "/tmp/project",
+    }),
+    /Koe address conflicts with Slack channel/u,
+  );
 });
 
 test("loads an explicit localhost admin UI configuration", async () => {
@@ -331,6 +447,53 @@ test("rejects normalized duplicate and MCP-incompatible Koe IDs", async () => {
       /Koe ID|Invalid key in record/u,
     );
   }
+});
+
+test("rejects Koe IDs and call names that can shadow literal Slack channels", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const environment = {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  };
+  const idPath = join(directory, "channel-shaped-id.yaml");
+  await writeFile(
+    idPath,
+    source.replace("  implementer:", "  C999:"),
+  );
+  await assert.rejects(
+    loadConfig(idPath, environment),
+    /must not look like literal Slack channel IDs/u,
+  );
+
+  const callNamePath = join(directory, "channel-shaped-call-name.yaml");
+  await writeFile(
+    callNamePath,
+    source.replace(
+      "      channel_id: C123",
+      "      channel_id: C123\n      call_name: G999",
+    ),
+  );
+  await assert.rejects(
+    loadConfig(callNamePath, environment),
+    /must not look like literal Slack channel IDs/u,
+  );
+});
+
+test("rejects prototype-inherited adapter names", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "prototype-adapter.yaml");
+  await writeFile(path, source.replace("adapter: codex", "adapter: toString"));
+  await assert.rejects(
+    loadConfig(path, {
+      STATE_FILE: "/tmp/state.json",
+      APP_TOKEN: "xapp-test",
+      BOT_TOKEN: "xoxb-test",
+      WORKSPACE: "/tmp/project",
+    }),
+    /Unknown adapter: toString/u,
+  );
 });
 
 test("rejects blank Slack-only personas", async () => {

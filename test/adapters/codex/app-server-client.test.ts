@@ -206,6 +206,34 @@ test("rejects a request with the app-server RPC error", async () => {
   await client.close();
 });
 
+test("reports malformed JSON values without crashing the client", async () => {
+  const { client, transport } = await connectClient();
+  const diagnostics: Error[] = [];
+  client.onProtocolError((error) => diagnostics.push(error));
+
+  for (const value of ["null", "true", "[]", '"text"', '{"method":7}', '{"id":{},"result":{}}']) {
+    transport.input.write(`${value}\n`);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(diagnostics.length, 6);
+  assert.ok(diagnostics.every((error) => error instanceof Error));
+  await client.close();
+});
+
+test("rejects a pending request when its RPC error shape is malformed", async () => {
+  const { client, transport } = await connectClient();
+  transport.readOutput();
+  const pending = client.startThread({ cwd: "/workspace" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+
+  transport.input.write(`${JSON.stringify({ id: request.id, error: "invalid" })}\n`);
+
+  await assert.rejects(pending, /invalid error/u);
+  await client.close();
+});
+
 test("releases a thread subscription through thread/unsubscribe", async () => {
   const { client, transport } = await connectClient();
   transport.readOutput();
@@ -224,6 +252,44 @@ test("releases a thread subscription through thread/unsubscribe", async () => {
     `${JSON.stringify({ id: request.id, result: { status: "unsubscribed" } })}\n`,
   );
   await pending;
+  await client.close();
+});
+
+test("pages exact turn status without hydrating paginated thread history", async () => {
+  const { client, transport } = await connectClient();
+  transport.readOutput();
+
+  const pending = client.listThreadTurns("thr_1", {
+    limit: 50,
+    sortDirection: "desc",
+    itemsView: "notLoaded",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const [rawRequest] = transport.readOutput();
+  const request = JSON.parse(rawRequest ?? "null") as {
+    id: number;
+    method: string;
+    params: unknown;
+  };
+  assert.equal(request.method, "thread/turns/list");
+  assert.deepEqual(request.params, {
+    threadId: "thr_1",
+    limit: 50,
+    sortDirection: "desc",
+    itemsView: "notLoaded",
+  });
+
+  transport.input.write(`${JSON.stringify({
+    id: request.id,
+    result: {
+      data: [{ id: "turn_1", status: "completed" }],
+      nextCursor: null,
+      backwardsCursor: "newer_1",
+    },
+  })}\n`);
+  const result = await pending;
+  assert.equal(result.data[0]?.id, "turn_1");
+  assert.equal(result.backwardsCursor, "newer_1");
   await client.close();
 });
 

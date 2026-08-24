@@ -183,6 +183,7 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
 
   assert.deepEqual(rejected, [
     {
+      kind: "git_approval",
       sessionId: "source-session",
       channelId: "C1",
       rootThreadTs: "100.1",
@@ -191,6 +192,46 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
   ]);
   assert.ok(posts.length >= 2);
   assert.ok(updates.length >= 1);
+});
+
+test("cancels a delayed native approval when its Slack buttons cannot be projected", async () => {
+  const client = {
+    chat: {
+      postMessage: async () => ({ ok: true, ts: "101.1" }),
+      update: async () => {
+        throw new Error("Slack approval update failed");
+      },
+    },
+  } as unknown as WebClient;
+  const rejected: unknown[] = [];
+
+  await assert.rejects(
+    projectDelegationContinuation(
+      client,
+      request,
+      events([
+        gatewayEvent({
+          type: "approval.requested",
+          requestId: "approval-1",
+          summary: "Run a command",
+        }),
+      ]),
+      {},
+      undefined,
+      async (failure) => {
+        rejected.push(failure);
+      },
+    ),
+    /Slack approval update failed/u,
+  );
+
+  assert.deepEqual(rejected, [{
+    kind: "approval",
+    sessionId: "source-session",
+    channelId: "C1",
+    rootThreadTs: "100.1",
+    requestId: "approval-1",
+  }]);
 });
 
 function fakeClient(

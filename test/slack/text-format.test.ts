@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   formatAgentTextForSlack,
   splitSlackText,
+  utf8ByteLength,
 } from "../../src/slack/text-format.js";
 
 test("renders simple Markdown tables as Slack-readable bullets", () => {
@@ -269,4 +270,33 @@ test("splits without cutting escaped entities or non-BMP Unicode", () => {
   assert.ok(chunks.every((chunk) => chunk.length <= 64));
   assert.ok(chunks.every((chunk) => !/[\uD800-\uDBFF]$/u.test(chunk)));
   assert.ok(chunks.every((chunk) => !/&(?:a|am|l|g)?$/u.test(chunk)));
+});
+
+test("bounds multibyte Slack text by UTF-8 size", () => {
+  const formatted = formatAgentTextForSlack(
+    "日本語😀".repeat(2_000),
+    3_800,
+    3_800,
+  );
+
+  assert.ok(formatted.length <= 3_800);
+  assert.ok(utf8ByteLength(formatted) <= 3_800);
+  assert.ok(!/[\uD800-\uDBFF]$/u.test(formatted));
+  assert.match(formatted, /…$/u);
+});
+
+test("splits multibyte Slack text within both wire bounds", () => {
+  const formatted = formatAgentTextForSlack(
+    "確認結果です。😀\n".repeat(2_000),
+    12_000,
+    12_000,
+  );
+  const chunks = splitSlackText(formatted, 3_000, 3_000);
+
+  assert.ok(chunks.length > 1);
+  assert.ok(
+    chunks.every(
+      (chunk) => chunk.length <= 3_000 && utf8ByteLength(chunk) <= 3_000,
+    ),
+  );
 });

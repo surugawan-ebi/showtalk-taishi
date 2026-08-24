@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   PermissionApprovalCoordinator,
   type PermissionApprovalPresentation,
+  type PermissionApprovalSettlement,
 } from "../../src/permissions/approval-coordinator.js";
 
 const request = {
@@ -22,30 +23,45 @@ test("allows and denies configured non-interactive policy immediately", async ()
 
 test("binds a single-use approval to a host-generated request id", async () => {
   const shown: PermissionApprovalPresentation[] = [];
+  const settled: PermissionApprovalSettlement[] = [];
   const coordinator = new PermissionApprovalCoordinator({ idFactory: () => "one" });
   coordinator.setPresenter(async (approval) => {
     shown.push(approval);
   });
+  coordinator.setSettlementPresenter(async (settlement) => {
+    settled.push(settlement);
+  });
   const result = coordinator.authorize("approval", request);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(shown[0]?.requestId, "permission:one");
-  coordinator.resolve("permission:one", "allow_once");
+  coordinator.resolve("permission:one", "allow_once", {
+    resolvedBySlackUserId: "U0123456789",
+  });
   assert.equal(await result, "allow");
+  assert.deepEqual(settled, [
+    {
+      requestId: "permission:one",
+      reason: "allow_once",
+      resolvedBySlackUserId: "U0123456789",
+    },
+  ]);
   assert.throws(() => coordinator.resolve("permission:one", "allow_once"));
 });
 
-test("routes approval UI to the latest trusted Slack thread and user", async () => {
+test("routes approval UI to the exact trusted Slack turn on the request", async () => {
   let shown: PermissionApprovalPresentation | undefined;
   const coordinator = new PermissionApprovalCoordinator({ idFactory: () => "thread" });
-  coordinator.rememberSlackContext("C1", {
-    rootThreadTs: "1786554845.402859",
-    slackUserId: "U0123456789",
-  });
   coordinator.setPresenter(async (approval) => {
     shown = approval;
   });
 
-  const result = coordinator.authorize("approval", request);
+  const result = coordinator.authorize("approval", {
+    ...request,
+    slackContext: {
+      rootThreadTs: "1786554845.402859",
+      slackUserId: "U0123456789",
+    },
+  });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(shown?.sourceRootThreadTs, "1786554845.402859");
   assert.equal(shown?.sourceSlackUserId, "U0123456789");
@@ -53,18 +69,24 @@ test("routes approval UI to the latest trusted Slack thread and user", async () 
   assert.equal(await result, "deny");
 });
 
-test("rejects malformed host-owned Slack routing context", () => {
+test("rejects malformed host-owned Slack routing context", async () => {
   const coordinator = new PermissionApprovalCoordinator();
-  assert.throws(
-    () => coordinator.rememberSlackContext("C1", { rootThreadTs: "not-a-ts" }),
+  coordinator.setPresenter(async () => undefined);
+  await assert.rejects(
+    coordinator.authorize("approval", {
+      ...request,
+      slackContext: { rootThreadTs: "not-a-ts" },
+    }),
     /timestamp/u,
   );
-  assert.throws(
-    () =>
-      coordinator.rememberSlackContext("C1", {
+  await assert.rejects(
+    coordinator.authorize("approval", {
+      ...request,
+      slackContext: {
         rootThreadTs: "1786554845.402859",
         slackUserId: "<!channel>",
-      }),
+      },
+    }),
     /user ID/u,
   );
 });
@@ -113,23 +135,34 @@ test("rejects session grants for operations that require fresh approval", async 
 });
 
 test("fails closed on expiry and shutdown", async () => {
+  const settlements: PermissionApprovalSettlement[] = [];
   const coordinator = new PermissionApprovalCoordinator({ timeoutMs: 5 });
   coordinator.setPresenter(async () => undefined);
+  coordinator.setSettlementPresenter(async (settlement) => {
+    settlements.push(settlement);
+  });
   assert.equal(await coordinator.authorize("approval", request), "deny");
+  assert.equal(settlements[0]?.reason, "expired");
 
   const pending = coordinator.authorize("approval", request);
   await new Promise((resolve) => setImmediate(resolve));
-  coordinator.close();
+  await coordinator.close();
   assert.equal(await pending, "deny");
+  assert.equal(settlements[1]?.reason, "coordinator_closed");
 });
 
 test("removes a pending approval when its caller cancels", async () => {
+  let settlement: PermissionApprovalSettlement | undefined;
   const coordinator = new PermissionApprovalCoordinator({ idFactory: () => "cancel" });
   const controller = new AbortController();
   coordinator.setPresenter(async () => undefined);
+  coordinator.setSettlementPresenter(async (value) => {
+    settlement = value;
+  });
   const pending = coordinator.authorize("approval", request, controller.signal);
   await new Promise((resolve) => setImmediate(resolve));
   controller.abort();
   assert.equal(await pending, "deny");
+  assert.equal(settlement?.reason, "caller_cancelled");
   assert.throws(() => coordinator.resolve("permission:cancel", "allow_once"));
 });

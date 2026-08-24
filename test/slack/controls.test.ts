@@ -11,6 +11,7 @@ import {
 const routing = {
   channelId: "C012ABCDEF",
   rootThreadTs: "1723456789.123456",
+  messageTs: "1723456789.123457",
 };
 
 test("builds status, interrupt, and restart controls for the channel-wide Koe session", () => {
@@ -103,7 +104,11 @@ test("accepts exact routing keys in either order", () => {
   );
   assert.deepEqual(
     parseConversationControlActionValue(
-      JSON.stringify({ rootThreadTs: routing.rootThreadTs, channelId: routing.channelId }),
+      JSON.stringify({
+        messageTs: routing.messageTs,
+        rootThreadTs: routing.rootThreadTs,
+        channelId: routing.channelId,
+      }),
     ),
     routing,
   );
@@ -157,6 +162,7 @@ test("rejects invalid routing coordinates before rendering blocks", () => {
       buildConversationControlBlocks({
         channelId: "C123<script>",
         rootThreadTs: routing.rootThreadTs,
+        messageTs: routing.messageTs,
       }),
     /Invalid conversation control action payload/,
   );

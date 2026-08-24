@@ -10,6 +10,7 @@ import {
   InMemoryAgentRegistry,
   type AdapterSession,
   type AgentAdapter,
+  type AgentApproval,
   type AgentCapabilities,
   type AgentEvent,
   type AgentUserInputResponse,
@@ -142,6 +143,37 @@ class StructuredInputFakeAdapter extends FakeAdapter {
   ): Promise<void> {
     this.responses.push(response);
     this.#resolveInput();
+  }
+}
+
+class NativeApprovalFakeAdapter extends FakeAdapter {
+  override readonly capabilities: AgentCapabilities = {
+    streaming: true,
+    approval: true,
+    interrupt: true,
+    resume: true,
+    toolEvents: false,
+  };
+  readonly approvals: AgentApproval[] = [];
+  #resolveApproval!: () => void;
+  readonly #approvalResolved = new Promise<void>((resolve) => {
+    this.#resolveApproval = resolve;
+  });
+
+  override async *sendMessage(): AsyncIterable<AgentEvent> {
+    this.sendCalls += 1;
+    yield {
+      type: "approval.requested",
+      requestId: "codex:11111111-1111-4111-8111-111111111111",
+      summary: "Run a command",
+    };
+    await this.#approvalResolved;
+    yield { type: "message.completed", text: "Cancelled safely" };
+  }
+
+  async approve(_session: AdapterSession, approval: AgentApproval): Promise<void> {
+    this.approvals.push(approval);
+    this.#resolveApproval();
   }
 }
 
@@ -518,8 +550,12 @@ test("continues a delayed agent.send result on the original Slack-bound Koe", as
   );
   assert.equal(result.message, "Slow review completed");
   assert.equal(continuations.length, 1);
+  const firstContinuation = continuations[0] as {
+    readonly delegationId: string;
+  };
+  assert.notEqual(result.delegation_id, firstContinuation.delegationId);
   assert.deepEqual(continuations[0], {
-    delegationId: result.delegation_id,
+    delegationId: firstContinuation.delegationId,
     sourceAgentId: "implementer",
     sourceChannelId: "C1",
     sourceRootThreadTs: "1710000000.000001",
@@ -547,11 +583,12 @@ test("continues a delayed agent.send result on the original Slack-bound Koe", as
     result,
   );
   assert.equal(continuations.length, 1);
-  assert.equal(adapter.sendCalls, 2);
+  assert.equal(adapter.sendCalls, 3);
   assert.equal(adapter.interruptCalls, 0);
-  assert.match(
-    adapter.sentTexts[1] ?? "",
-    /元依頼で明示された次のKoe工程.*一工程だけ/su,
+  assert.ok(
+    adapter.sentTexts.some((text) =>
+      /元依頼で明示された次のKoe工程.*一工程だけ/su.test(text),
+    ),
   );
   await idle;
   assert.equal(service.isIdle(), true);
@@ -628,6 +665,25 @@ test("rejects an invisible delegated Git approval instead of stranding the targe
   assert.equal(projectionErrors.length, 1);
 });
 
+test("cancels an invisible delegated native approval instead of stranding the target turn", async () => {
+  const adapter = new NativeApprovalFakeAdapter();
+  const { service, projectionErrors } = setup({
+    adapter,
+    projectionFailsOnceOn: "delegation.agent_event",
+  });
+
+  const result = await service.agentSend(context(), "reviewer", "Run safely");
+
+  assert.equal(result.message, "Cancelled safely");
+  assert.deepEqual(adapter.approvals, [
+    {
+      requestId: "codex:11111111-1111-4111-8111-111111111111",
+      decision: "cancel",
+    },
+  ]);
+  assert.equal(projectionErrors.length, 1);
+});
+
 test("enforces Slack write policy and resolves Koe IDs or call names to channels", async () => {
   const { service, posts } = setup();
   const posted = await service.slackPost(context(), "レビュー係", "Hello");
@@ -663,8 +719,8 @@ test("uploads only resolved image and audio files from the caller workspace", as
   assert.equal(posts[0]?.[0], "C2");
   assert.equal(posts[0]?.[1], undefined);
   assert.deepEqual(
-    (posts[0]?.[2] as Array<{ name: string; kind: string; size: number }>).map(
-      ({ name, kind, size }) => ({ name, kind, size }),
+    (posts[0]?.[2] as Array<{ name: string; kind: string; payload: Blob }>).map(
+      ({ name, kind, payload }) => ({ name, kind, size: payload.size }),
     ),
     [
       { name: "result.png", kind: "image", size: 8 },
@@ -917,15 +973,62 @@ test("deduplicates slack.reply retries from a call name to its channel ID", asyn
   assert.deepEqual(posts, [["C2", "1710000000.000010", "Reply once"]]);
 });
 
-test("rejects request identity reuse with different arguments", async () => {
-  const { service } = setup();
+test("does not confuse reused client request IDs with different agent.send calls", async () => {
+  const { service, adapter } = setup();
   const reused = context("implementer", "agent.send:number:99");
   await service.agentSend(reused, "reviewer", "First input");
-  await assert.rejects(
-    () => service.agentSend(reused, "reviewer", "Changed input"),
-    (error) =>
-      error instanceof McpServiceError && error.code === "IDEMPOTENCY_CONFLICT",
+  await service.agentSend(reused, "reviewer", "Changed input");
+  assert.equal(adapter.sendCalls, 2);
+  assert.deepEqual(
+    adapter.sentTexts,
+    ["First input", "Changed input"],
   );
+});
+
+test("namespaces transport retries to the active Slack turn", async (t) => {
+  const { service, registry, adapter } = setup();
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "idle",
+    createdAt: "2026-08-21T00:00:00.000Z",
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+
+  const request = context("implementer", "agent.send:number:7");
+  const firstRelease = registry.reserveAgentTurn("implementer");
+  registry.beginSessionTurn("source-session", {
+    type: "slack",
+    channelId: "C1",
+    rootThreadTs: "1710000000.000001",
+    messageTs: "1710000000.000002",
+    startedAt: "2026-08-21T00:00:01.000Z",
+  }, "2026-08-21T00:00:01.000Z");
+  await service.agentSend(request, "reviewer", "Review this");
+  await service.agentSend(request, "レビュー係", "Review this");
+  firstRelease();
+
+  registry.updateSessionStatus(
+    "source-session",
+    "idle",
+    "2026-08-21T00:01:00.000Z",
+  );
+  const secondRelease = registry.reserveAgentTurn("implementer");
+  t.after(secondRelease);
+  registry.beginSessionTurn("source-session", {
+    type: "slack",
+    channelId: "C1",
+    rootThreadTs: "1710000000.000001",
+    messageTs: "1710000000.000003",
+    startedAt: "2026-08-21T00:01:01.000Z",
+  }, "2026-08-21T00:01:01.000Z");
+  await service.agentSend(request, "reviewer", "Review this");
+
+  assert.equal(adapter.sendCalls, 2);
+  assert.deepEqual(adapter.sentTexts, ["Review this", "Review this"]);
 });
 
 test("lists and reports configured Agent state while rejecting unknown callers", () => {
