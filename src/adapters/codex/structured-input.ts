@@ -32,9 +32,9 @@ export interface ValidatedChoiceRequest {
 }
 
 /**
- * Conservatively identifies the fixed workspace-git approval prompt. A
- * malformed Git-looking prompt must remain on the fail-closed Git path rather
- * than being downgraded to an ordinary choice.
+ * Identifies the fixed workspace-git approval prompt from protocol-level
+ * signals. Ordinary question prose may discuss Git approvals without itself
+ * granting or requesting publication authority.
  */
 export function looksLikeWorkspaceGitApproval(value: unknown): boolean {
   const params = asRecord(value);
@@ -43,16 +43,6 @@ export function looksLikeWorkspaceGitApproval(value: unknown): boolean {
   const question = asRecord(questions[0]);
   if (question === undefined) return false;
   if (question.id === "git_approval") return true;
-  const gitContext = [question.header, question.question]
-    .filter((part): part is string => typeof part === "string")
-    .join(" ");
-  if (
-    /workspace[\s_-]*git/iu.test(gitContext) ||
-    /git[\s_-]*(?:plan|approval|publication|計画|承認|公開)/iu.test(gitContext) ||
-    /(?:plan|計画)[\s_-]*(?:approval|承認)/iu.test(gitContext)
-  ) {
-    return true;
-  }
   const options = question.options;
   if (!Array.isArray(options)) return false;
   return options.some((option) => {

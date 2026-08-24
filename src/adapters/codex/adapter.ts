@@ -378,6 +378,7 @@ export class CodexAdapter implements AgentAdapter {
     let terminal = false;
     let failed = false;
     let ownedTurnId: string | undefined;
+    let completingTurnId: string | undefined;
     let clientUserMessageId = randomUUID();
     const deferredNotifications: Array<{
       readonly method: string;
@@ -472,6 +473,119 @@ export class CodexAdapter implements AgentAdapter {
       this.#activeTurns.set(session.id, turnId);
       this.#flushDeferredServerRequests(session.id, turnId);
     };
+    const completeTurn = async (
+      params: unknown,
+      turn: Record<string, unknown> | undefined,
+      event: AgentEvent | undefined,
+    ): Promise<void> => {
+      this.#rejectPendingUserInputBindings(
+        session.id,
+        queue,
+        "The Codex turn completed before its workspace-git plan could be bound",
+      );
+      clearTerminalWatchdog();
+      this.#activeTurns.delete(session.id);
+      const status = turnStatus(params);
+      const approvedGit = this.#approvedGitExecutionBySession.get(session.id);
+      let finalTurn = turn;
+      const completedTurnId = notificationTurnId(params);
+      if (
+        approvedGit !== undefined &&
+        !hasFullTurnItems(finalTurn) &&
+        completedTurnId !== undefined
+      ) {
+        finalTurn =
+          (await this.#hydrateCompletedTurn(session.id, completedTurnId)) ??
+          finalTurn;
+        if (terminal || failed) return;
+      }
+      if (approvedGit !== undefined) {
+        this.#observeApprovedGitTurnSnapshot(approvedGit, finalTurn, queue);
+      }
+      const executeCompleted =
+        approvedGit !== undefined &&
+        approvedGit.executeCompletedItemIds.size > 0;
+      const executeFailedOrIncomplete =
+        approvedGit !== undefined &&
+        (approvedGit.executeFailedItemIds.size > 0 ||
+          [...approvedGit.executeStartedItemIds].some(
+            (itemId) =>
+              !approvedGit.executeCompletedItemIds.has(itemId) &&
+              !approvedGit.executeFailedItemIds.has(itemId),
+          ));
+      const operationTerminal =
+        approvedGit !== undefined &&
+        [...approvedGit.operationStatuses].some(isTerminalGitOperationStatus);
+      const finalItemsComplete = hasFullTurnItems(finalTurn);
+      if (
+        status === "idle" &&
+        approvedGit !== undefined &&
+        !executeCompleted &&
+        !executeFailedOrIncomplete &&
+        !operationTerminal &&
+        finalItemsComplete &&
+        !approvedGit.continuationStarted
+      ) {
+        approvedGit.continuationStarted = true;
+        completingTurnId = undefined;
+        ownedTurnId = undefined;
+        this.#statuses.set(session.id, "starting");
+        this.#removePendingApprovals(session.id);
+        this.#removePendingUserInputs(session.id);
+        this.#removeWorkspaceGitPlans(session.id);
+        this.#removeGitApprovalRecoveryTurns(session.id);
+        this.#removeStartedItems(session.id);
+        queue.push({ type: "status.changed", status: "starting" });
+        startApprovedGitContinuation(approvedGit);
+        return;
+      }
+      if (approvedGit !== undefined && executeFailedOrIncomplete) {
+        queue.push({
+          type: "error",
+          code: "GIT_APPROVAL_EXECUTION_INCOMPLETE",
+          message:
+            "承認済みGit実行が失敗したか、完了状態を確認できませんでした。" +
+            "同じoperationは自動再実行していません。",
+        });
+      } else if (
+        approvedGit !== undefined &&
+        !executeCompleted &&
+        !operationTerminal &&
+        !finalItemsComplete
+      ) {
+        queue.push({
+          type: "error",
+          code: "GIT_APPROVAL_FINAL_STATE_INCOMPLETE",
+          message:
+            "承認後ターンの完全な最終item一覧を確認できないため、" +
+            "二重実行を避けて自動継続を停止しました。",
+        });
+      } else if (
+        approvedGit !== undefined &&
+        !executeCompleted &&
+        !operationTerminal
+      ) {
+        queue.push({
+          type: "error",
+          code: "GIT_APPROVAL_EXECUTION_NOT_OBSERVED",
+          message:
+            "承認後のGit実行が確認できませんでした。" +
+            "自動継続は1回で停止し、同じoperationを再実行していません。",
+        });
+      }
+      terminal = true;
+      completingTurnId = undefined;
+      this.#runningSessions.delete(session.id);
+      this.#statuses.set(session.id, status);
+      if (event !== undefined) queue.push(event);
+      this.#approvedGitExecutionBySession.delete(session.id);
+      this.#removePendingApprovals(session.id);
+      this.#removePendingUserInputs(session.id);
+      this.#removeWorkspaceGitPlans(session.id);
+      this.#removeGitApprovalRecoveryTurns(session.id);
+      this.#removeStartedItems(session.id);
+      queue.close();
+    };
     const processNotification = (method: string, params: unknown) => {
       if (!belongsToThread(params, session.id)) return;
       if (isTurnScopedNotification(method)) {
@@ -538,99 +652,21 @@ export class CodexAdapter implements AgentAdapter {
       const event = normalizeNotification(method, params);
       if (method !== "turn/completed" && event !== undefined) queue.push(event);
       if (method === "turn/completed") {
-        this.#rejectPendingUserInputBindings(
-          session.id,
-          queue,
-          "The Codex turn completed before its workspace-git plan could be bound",
-        );
-        clearTerminalWatchdog();
-        this.#activeTurns.delete(session.id);
-        const status = turnStatus(params);
-        const approvedGit = this.#approvedGitExecutionBySession.get(session.id);
-        if (approvedGit !== undefined) {
-          this.#observeApprovedGitTurnSnapshot(approvedGit, turn, queue);
-        }
-        const executeCompleted =
-          approvedGit !== undefined &&
-          approvedGit.executeCompletedItemIds.size > 0;
-        const executeFailedOrIncomplete =
-          approvedGit !== undefined &&
-          (approvedGit.executeFailedItemIds.size > 0 ||
-            [...approvedGit.executeStartedItemIds].some(
-              (itemId) =>
-                !approvedGit.executeCompletedItemIds.has(itemId) &&
-                !approvedGit.executeFailedItemIds.has(itemId),
-            ));
-        const operationTerminal =
-          approvedGit !== undefined &&
-          [...approvedGit.operationStatuses].some(isTerminalGitOperationStatus);
-        const finalItemsComplete = hasFullTurnItems(turn);
+        const completedTurnId = notificationTurnId(params);
         if (
-          status === "idle" &&
-          approvedGit !== undefined &&
-          !executeCompleted &&
-          !executeFailedOrIncomplete &&
-          !operationTerminal &&
-          finalItemsComplete &&
-          !approvedGit.continuationStarted
+          completedTurnId === undefined ||
+          completingTurnId === completedTurnId
         ) {
-          approvedGit.continuationStarted = true;
-          ownedTurnId = undefined;
-          this.#statuses.set(session.id, "starting");
-          this.#removePendingApprovals(session.id);
-          this.#removePendingUserInputs(session.id);
-          this.#removeWorkspaceGitPlans(session.id);
-          this.#removeGitApprovalRecoveryTurns(session.id);
-          this.#removeStartedItems(session.id);
-          queue.push({ type: "status.changed", status: "starting" });
-          startApprovedGitContinuation(approvedGit);
           return;
         }
-        if (approvedGit !== undefined && executeFailedOrIncomplete) {
-          queue.push({
-            type: "error",
-            code: "GIT_APPROVAL_EXECUTION_INCOMPLETE",
-            message:
-              "承認済みGit実行が失敗したか、完了状態を確認できませんでした。" +
-              "同じoperationは自動再実行していません。",
-          });
-        } else if (
-          approvedGit !== undefined &&
-          !executeCompleted &&
-          !operationTerminal &&
-          !finalItemsComplete
-        ) {
-          queue.push({
-            type: "error",
-            code: "GIT_APPROVAL_FINAL_STATE_INCOMPLETE",
-            message:
-              "承認後ターンの完全な最終item一覧を確認できないため、" +
-              "二重実行を避けて自動継続を停止しました。",
-          });
-        } else if (
-          approvedGit !== undefined &&
-          !executeCompleted &&
-          !operationTerminal
-        ) {
-          queue.push({
-            type: "error",
-            code: "GIT_APPROVAL_EXECUTION_NOT_OBSERVED",
-            message:
-              "承認後のGit実行が確認できませんでした。" +
-              "自動継続は1回で停止し、同じoperationを再実行していません。",
-          });
-        }
-        terminal = true;
-        this.#runningSessions.delete(session.id);
-        this.#statuses.set(session.id, status);
-        if (event !== undefined) queue.push(event);
-        this.#approvedGitExecutionBySession.delete(session.id);
-        this.#removePendingApprovals(session.id);
-        this.#removePendingUserInputs(session.id);
-        this.#removeWorkspaceGitPlans(session.id);
-        this.#removeGitApprovalRecoveryTurns(session.id);
-        this.#removeStartedItems(session.id);
-        queue.close();
+        completingTurnId = completedTurnId;
+        void completeTurn(params, turn, event).catch((error: unknown) => {
+          queue.fail(
+            error instanceof Error
+              ? error
+              : new Error("Could not reconcile the completed Codex turn"),
+          );
+        });
       }
     };
     const startApprovedGitContinuation = (
@@ -1592,6 +1628,43 @@ export class CodexAdapter implements AgentAdapter {
     this.#observeApprovedGitItem(watch, item, queue);
   }
 
+  async #hydrateCompletedTurn(
+    sessionId: string,
+    turnId: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (
+      !this.#legacyPaginatedCompatibilitySessions.has(sessionId) &&
+      this.#turnPaginationSupported !== false
+    ) {
+      try {
+        const page = await this.#client.listThreadTurns(sessionId, {
+          limit: 50,
+          sortDirection: "desc",
+          itemsView: "full",
+        });
+        this.#turnPaginationSupported = true;
+        const paginatedTurn = asRecord(
+          page.data.find((candidate) => candidate.id === turnId),
+        );
+        if (hasFullTurnItems(paginatedTurn)) return paginatedTurn;
+      } catch (error) {
+        if (isPaginatedThreadsUnsupported(error)) {
+          this.#turnPaginationSupported = false;
+        }
+      }
+    }
+
+    try {
+      const thread = await this.#client.readThread(sessionId, true);
+      const legacyTurn = asRecord(
+        thread.turns?.find((candidate) => candidate.id === turnId),
+      );
+      return hasFullTurnItems(legacyTurn) ? legacyTurn : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   #observeApprovedGitTurnSnapshot(
     watch: ApprovedGitExecutionWatch,
     turn: Record<string, unknown> | undefined,
@@ -2217,6 +2290,7 @@ function normalizeNotification(method: string, params: unknown): AgentEvent | un
     case "turn/completed":
       return { type: "status.changed", status: turnStatus(params) };
     case "error": {
+      if (record?.willRetry === true) return undefined;
       const error = asRecord(record?.error);
       return {
         type: "error",

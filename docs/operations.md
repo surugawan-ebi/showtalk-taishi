@@ -8,7 +8,7 @@ root stay together and another root uses a different backend thread.
 
 Rapid human messages are queued FIFO per Koe. Each turn replies under the Slack
 message that triggered it. One activity message is updated in place with a
-progress marker and elapsed time every five seconds. At completion it collapses
+progress marker and elapsed time at most every thirty seconds. At completion it collapses
 to the thinking duration, and the final answer is posted separately with a
 fresh mention of the source user.
 

@@ -36,6 +36,9 @@ class FakeAppServer implements CodexAppServer {
     response: ToolRequestUserInputResponse;
   }> = [];
   readonly unsubscribeCalls: string[] = [];
+  readonly readThreadIncludeTurns: boolean[] = [];
+  readonly listTurnsParams: ThreadTurnsListParams[] = [];
+  readonly hydratedTurns = new Map<string, CodexTurn>();
   readCalls = 0;
   listTurnsCalls = 0;
   threadStatusType = "idle";
@@ -93,6 +96,7 @@ class FakeAppServer implements CodexAppServer {
 
   async readThread(threadId: string, includeTurns = false): Promise<CodexThread> {
     this.readCalls += 1;
+    this.readThreadIncludeTurns.push(includeTurns);
     if (this.readFailures > 0) {
       this.readFailures -= 1;
       throw new Error("transient read failure");
@@ -107,6 +111,8 @@ class FakeAppServer implements CodexAppServer {
         ? {
             turns: this.turnStarts.map((_, index) => {
               const id = `turn_${index + 1}`;
+              const hydrated = this.hydratedTurns.get(id);
+              if (hydrated !== undefined) return hydrated;
               const inferred = this.threadStatusType === "active"
                 ? "inProgress"
                 : this.threadStatusType === "systemError"
@@ -124,9 +130,10 @@ class FakeAppServer implements CodexAppServer {
 
   async listThreadTurns(
     _threadId: string,
-    _params: ThreadTurnsListParams = {},
+    params: ThreadTurnsListParams = {},
   ): Promise<ThreadTurnsListResponse> {
     this.listTurnsCalls += 1;
+    this.listTurnsParams.push(params);
     if (this.rejectTurnPaginationAsUnsupported) {
       throw new CodexRpcError(
         "paginated_threads is not supported yet",
@@ -140,6 +147,10 @@ class FakeAppServer implements CodexAppServer {
     return {
       data: this.turnStarts.map((_, index) => {
         const id = `turn_${index + 1}`;
+        const hydrated = this.hydratedTurns.get(id);
+        if (params.itemsView === "full" && hydrated !== undefined) {
+          return hydrated;
+        }
         const inferred = this.threadStatusType === "active"
           ? "inProgress"
           : this.threadStatusType === "systemError"
@@ -1315,6 +1326,76 @@ test("normalizes stream events and resolves an approval", async () => {
   );
 });
 
+test("suppresses retrying App Server errors and emits only the final error", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const consuming = collectEvents(
+    adapter.sendMessage(session, {
+      text: "Keep working through transient retries",
+      source: { type: "human" },
+    }),
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("error", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    error: { message: "Reconnecting... 1/2" },
+    willRetry: true,
+  });
+  server.notify("error", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    error: { message: "Reconnecting... 2/2" },
+    willRetry: true,
+  });
+  server.notify("error", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    error: { message: "Connection failed" },
+    willRetry: false,
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "failed" },
+  });
+
+  const events = await consuming;
+  assert.deepEqual(
+    events.filter((event) => event.type === "error"),
+    [{ type: "error", message: "Connection failed" }],
+  );
+});
+
+test("preserves legacy App Server errors without willRetry", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const consuming = collectEvents(
+    adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Report a legacy failure", source: { type: "human" } },
+    ),
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("error", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    error: { message: "Legacy connection failure" },
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "failed" },
+  });
+
+  const events = await consuming;
+  assert.deepEqual(
+    events.filter((event) => event.type === "error"),
+    [{ type: "error", message: "Legacy connection failure" }],
+  );
+});
+
 test("presents and accepts only command decisions offered by Codex", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
@@ -1790,6 +1871,65 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
   );
 });
 
+test("keeps ordinary questions about Git approval on the choice path", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "公開範囲を確認する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "choice.requested") continue;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId: "option_1" },
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 901,
+    method: "item/tool/requestUserInput",
+    params: ordinaryChoiceQuestion([
+      {
+        id: "publication_scope",
+        header: "AGENTS公開",
+        question: "Git承認フローの安全規則も公開対象に含めますか？",
+        isOther: false,
+        isSecret: false,
+        options: [
+          { label: "公開に含める", description: "安全規則を含める" },
+          { label: "公開から除外", description: "今回は含めない" },
+        ],
+      },
+    ]),
+  });
+
+  await consuming;
+
+  assert.ok(events.some((event) => event.type === "choice.requested"));
+  assert.equal(
+    events.some((event) => event.type === "git_approval.reprepare_required"),
+    false,
+  );
+  assert.deepEqual(server.userInputResponses, [
+    {
+      id: 901,
+      response: {
+        answers: { publication_scope: { answers: ["公開に含める"] } },
+      },
+    },
+  ]);
+});
+
 test("rejects secret ordinary input without showing Git recovery", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
@@ -2070,6 +2210,138 @@ test("continues one bounded turn when an approved Git plan was not executed", as
       (event) => event.type === "error" &&
         event.code === "GIT_APPROVAL_EXECUTION_NOT_OBSERVED",
     ),
+    false,
+  );
+});
+
+test("hydrates a summarized approved turn before starting its bounded continuation", async () => {
+  const server = new FakeAppServer();
+  server.hydratedTurns.set("turn_1", {
+    id: "turn_1",
+    status: "completed",
+    itemsView: "full",
+    items: [],
+  });
+  const adapter = new CodexAdapter(server);
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 108);
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "summary",
+      items: [],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(server.listTurnsParams[0]?.itemsView, "full");
+  assert.equal(server.turnStarts.length, 2);
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turnId: "turn_2",
+    turn: {
+      id: "turn_2",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem()],
+    },
+  });
+  const events = await eventsPromise;
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "error" &&
+        event.code === "GIT_APPROVAL_FINAL_STATE_INCOMPLETE",
+    ),
+    false,
+  );
+});
+
+test("hydrates a summarized approved turn through legacy thread/read compatibility", async () => {
+  const server = new FakeAppServer();
+  server.rejectExcludeTurnsAsUnsupported = true;
+  server.hydratedTurns.set("turn_1", {
+    id: "turn_1",
+    status: "completed",
+    itemsView: "full",
+    items: [],
+  });
+  const adapter = new CodexAdapter(server);
+  await adapter.resumeSession({
+    adapterSessionId: "thr_1",
+    agent: {
+      id: "implementer",
+      adapter: "codex",
+      channelId: "C123",
+    },
+  });
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 109);
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "summary",
+      items: [],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(server.listTurnsCalls, 0);
+  assert.ok(server.readThreadIncludeTurns.includes(true));
+  assert.equal(server.turnStarts.length, 2);
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turnId: "turn_2",
+    turn: {
+      id: "turn_2",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem()],
+    },
+  });
+  const events = await eventsPromise;
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "error" &&
+        event.code === "GIT_APPROVAL_FINAL_STATE_INCOMPLETE",
+    ),
+    false,
+  );
+});
+
+test("uses a hydrated execution result instead of starting a duplicate continuation", async () => {
+  const server = new FakeAppServer();
+  server.hydratedTurns.set("turn_1", {
+    id: "turn_1",
+    status: "completed",
+    itemsView: "full",
+    items: [publicationExecutionItem()],
+  });
+  const adapter = new CodexAdapter(server);
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 110);
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "summary",
+      items: [],
+    },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(server.turnStarts.length, 1);
+  assert.equal(
+    events.some((event) => event.type === "error"),
     false,
   );
 });

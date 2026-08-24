@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { validateOrdinaryChoiceRequest } from "../../../src/adapters/codex/structured-input.js";
+import {
+  looksLikeWorkspaceGitApproval,
+  validateOrdinaryChoiceRequest,
+} from "../../../src/adapters/codex/structured-input.js";
 
 function request(autoResolutionMs: number | null) {
   return {
@@ -41,4 +44,37 @@ test("accepts only the documented structured-input auto-resolution window", () =
       /auto-resolution/u,
     );
   }
+});
+
+test("does not classify ordinary question prose as workspace-git approval", () => {
+  for (const text of [
+    "Git承認の説明を公開してよいですか？",
+    "Git公開の運用についてコメントしてください。",
+    "Git publicationの方針を選んでください。",
+    "workspace-git approvalの仕様を確認しますか？",
+  ]) {
+    const value = request(null);
+    const question = value.questions[0];
+    assert.ok(question);
+    question.header = text;
+    question.question = text;
+    assert.equal(looksLikeWorkspaceGitApproval(value), false, text);
+  }
+});
+
+test("keeps strong workspace-git approval identifiers fail-closed", () => {
+  const identified = request(null);
+  const identifiedQuestion = identified.questions[0];
+  assert.ok(identifiedQuestion);
+  identifiedQuestion.id = "git_approval";
+  assert.equal(looksLikeWorkspaceGitApproval(identified), true);
+
+  const fixedChoices = request(null);
+  const fixedChoiceQuestion = fixedChoices.questions[0];
+  assert.ok(fixedChoiceQuestion);
+  fixedChoiceQuestion.options = [
+    { label: "承認して実行", description: "固定された計画を実行する" },
+    { label: "拒否・保留", description: "固定された計画を実行しない" },
+  ];
+  assert.equal(looksLikeWorkspaceGitApproval(fixedChoices), true);
 });

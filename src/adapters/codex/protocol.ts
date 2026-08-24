@@ -58,6 +58,7 @@ export interface CodexThread {
 export interface CodexTurn {
   id: string;
   status: "inProgress" | "completed" | "interrupted" | "failed" | string;
+  itemsView?: "notLoaded" | "summary" | "full";
   items?: unknown[];
   error?: unknown;
 }
