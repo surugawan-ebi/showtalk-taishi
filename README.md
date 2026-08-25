@@ -1,5 +1,13 @@
 # ShowTalk Taishi
 
+<p align="center">
+  <img
+    src="docs/assets/brand/showtalk-taishi-concept-v3.png"
+    alt="ShowTalk Taishi — AI kamon icon, AI-highlighted wordmark, and an ukiyo-e inspired Taishi listening to six Koe"
+    width="100%"
+  >
+</p>
+
 > **Every Koe gets a channel. Every channel can talk.**
 
 ShowTalk Taishi is a local-first, self-hosted Slack front end and switchboard
