@@ -13,7 +13,65 @@ import {
   parseTrustedPermissionAction,
   permissionApprovalPostArguments,
   permissionApprovalSettlementUpdateArguments,
+  recordGitDecisionBeforeAppServerResume,
 } from "../../src/slack/frontend.js";
+import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
+
+const exactGitPlan = {
+  operationId: "11111111-1111-4111-8111-111111111111",
+  planHash: "a".repeat(64),
+  approvalTarget: "primary",
+  operation: "git_publication",
+  repoId: "showtalk-taishi",
+  mode: "commit_only",
+  branch: "codex/private-approval",
+  paths: ["src/slack/frontend.ts"],
+  expectedHead: "b".repeat(40),
+  expectedSnapshotId: "c".repeat(64),
+  worktreeId: "primary",
+  commitMessage: "Record private approval",
+  expiresAt: "2099-08-24T02:30:00+09:00",
+} satisfies WorkspaceGitApprovalPlan;
+
+test("records the exact private Git decision before resuming App Server", async () => {
+  const order: string[] = [];
+  await recordGitDecisionBeforeAppServerResume(
+    {
+      recordDecision: async (input) => {
+        order.push("broker");
+        assert.equal(input.plan, exactGitPlan);
+        assert.equal(input.actor, "slack-user:U0123456789");
+        assert.equal(input.decision, "approve");
+      },
+    },
+    exactGitPlan,
+    "approve",
+    "U0123456789",
+    async () => {
+      order.push("app-server");
+    },
+  );
+  assert.deepEqual(order, ["broker", "app-server"]);
+});
+
+test("does not resume App Server when the private Git decision fails", async () => {
+  let resumed = false;
+  await assert.rejects(
+    recordGitDecisionBeforeAppServerResume(
+      {
+        recordDecision: async () => Promise.reject(new Error("private mismatch")),
+      },
+      exactGitPlan,
+      "approve",
+      "U0123456789",
+      async () => {
+        resumed = true;
+      },
+    ),
+    /private mismatch/u,
+  );
+  assert.equal(resumed, false);
+});
 
 test("accepts permission and control actions only from their exact Slack message", () => {
   const route = {

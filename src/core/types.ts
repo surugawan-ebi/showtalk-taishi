@@ -112,6 +112,8 @@ export type WorkspaceGitPublicationMode =
 interface WorkspaceGitApprovalPlanBase {
   readonly operationId: string;
   readonly planHash: string;
+  /** Exact private approval target emitted by workspace-git prepare_*. */
+  readonly approvalTarget: string;
   readonly repoId: string;
   readonly branch: string;
   readonly paths: readonly string[];
@@ -241,6 +243,16 @@ export interface AgentChoiceQuestion {
   readonly allowsOther: boolean;
 }
 
+/** Immutable binary output produced by an Agent during the current turn. */
+export interface AgentOutputAttachment {
+  readonly kind: "image" | "audio";
+  readonly payload: Blob;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly title?: string;
+  readonly altText?: string;
+}
+
 export type AgentEvent =
   | {
       readonly type: "message.delta";
@@ -249,6 +261,12 @@ export type AgentEvent =
   | {
       readonly type: "message.completed";
       readonly text?: string;
+    }
+  | {
+      readonly type: "attachment.generated";
+      /** Adapter-scoped opaque ID used only to suppress duplicate projection. */
+      readonly attachmentId: string;
+      readonly attachment: AgentOutputAttachment;
     }
   | {
       readonly type: "status.changed";
@@ -276,12 +294,19 @@ export type AgentEvent =
   | {
       readonly type: "user_input.requested";
       readonly requestId: string;
+      /** Effective deadline after adapter and plan timeouts are intersected. */
+      readonly expiresAt: string;
       readonly prompt: string;
       readonly options: readonly [
         { readonly id: "approve"; readonly label: "承認して実行" },
         { readonly id: "reject"; readonly label: "拒否・保留" },
       ];
       readonly plan: WorkspaceGitApprovalPlan;
+    }
+  | {
+      /** The exact Git approval request expired and is no longer actionable. */
+      readonly type: "git_approval.expired";
+      readonly requestId: string;
     }
   | {
       /** Ordinary, non-secret model question. This is not an approval request. */

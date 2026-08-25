@@ -210,17 +210,33 @@ title/body/base, PR metadata, merge method, and authoritative expiry. Control
 characters and bidirectional overrides are escaped visibly. Draft PR plans
 without an explicit base branch are not offered in Slack because Taishi cannot
 inspect workspace-git's private default.
+
+Raw workspace-git prepare payloads are normalized at one adapter boundary.
+Only the resulting immutable plan enters the process-local approval lifecycle.
+That lifecycle owns exact turn binding, ambiguous-plan rejection, one bounded
+post-approval continuation, and execute/status observation. It distinguishes a
+confirmed execute result from rejected, expired, partial, failed, or
+outcome-uncertain terminal state instead of treating every terminal observation
+as successful execution.
 Absolute/traversal paths, malformed fields, multiple plans, unsupported
 choices, and plans too large to display exactly are rejected. The immutable
 binding lives only while the originating App Server RPC is live, including its
 bounded same-turn binding grace period.
 
-The Slack choice is returned to that same `item/tool/requestUserInput` RPC.
+The Slack choice is first recorded through a model-inaccessible local
+workspace-git decision broker. The broker re-reads private status and requires
+the exact operation ID, full plan hash, approval target, repository, and expiry
+captured from the bound prepare result. For publication responses from older
+workspace-git versions that omit a top-level `approval_target`, Taishi derives
+that target only from the already validated `worktree_id` or
+`temporary_workspace_id`; an explicit target must match that same scope. Only
+after workspace-git reports the exact operation as `approved` or `rejected` is
+the choice returned to that same `item/tool/requestUserInput` RPC.
 Taishi does not expose a second text parser and does not treat messages such as
 `承認` as authorization. The existing workspace-git private approval state
 remains authoritative: after the structured answer, Codex must re-read status,
-record the exact approval, verify the approved state, and call the matching
-`execute_approved_*` tool once. workspace-git performs its own hash, expiry,
+verify the approved state, and call the matching `execute_approved_*` tool
+once without attempting to approve it again. workspace-git performs its own hash, expiry,
 snapshot/worktree or PR HEAD/state revalidation before any external write.
 The authenticated structured answer is a human interaction boundary inside
 the resumed App Server turn. It is not assistant self-approval, and an accepted
@@ -238,12 +254,13 @@ reported as errors and are not retried. Already rejected, executing, applied,
 partial, failed, outcome-uncertain, or expired operations are terminal and are
 not replayed.
 
-This means v0.1 still trusts the resumed Codex turn to coordinate the private
-approval-record step. Taishi does not possess a model-isolated workspace-git
-decision broker. Operators whose threat model includes a malicious model
-should approve through Codex App until a dedicated authenticated broker can
-atomically bind the Slack decision to workspace-git's operation ID and plan
-hash without model mediation.
+The private broker is opt-in and fail-closed. It is enabled only when the
+Gateway process has an absolute `SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI` path and
+the same absolute `WORKSPACE_GIT_STATE_ROOT` used by workspace-git. The broker
+launches the owner-controlled CLI without a shell and passes only that state
+root plus `PATH`; Slack, MCP, admin, and other parent-process credentials are
+not inherited. If it is unavailable or any exact field differs, the App Server
+request is not resumed and no Git write is authorized.
 
 Ordinary structured questions are classified only after the bounded
 same-turn Git-plan race window. They use a separate Slack action namespace and

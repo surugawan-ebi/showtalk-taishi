@@ -27,6 +27,7 @@ export interface WorkspaceGitApprovalBlockOptions {
   readonly allowPathToggle?: boolean;
   readonly bodyExpanded?: boolean;
   readonly allowBodyToggle?: boolean;
+  readonly expiresAt?: string;
 }
 
 export interface WorkspaceGitApprovalDisplayState {
@@ -38,6 +39,7 @@ export interface WorkspaceGitApprovalDetails {
   readonly prompt: string;
   readonly plan: WorkspaceGitApprovalPlan;
   readonly routing: UserInputActionValue;
+  readonly expiresAt: number;
   readonly fallbackText: string;
   readonly sourceUserMention?: string;
   readonly display: WorkspaceGitApprovalDisplayState;
@@ -46,6 +48,7 @@ export interface WorkspaceGitApprovalDetails {
 /** Process-local display state for one exact, message-bound Git approval card. */
 export class WorkspaceGitApprovalDetailsStore {
   readonly #entries = new Map<string, WorkspaceGitApprovalDetails>();
+  readonly #actionTails = new Map<string, Promise<void>>();
 
   remember(details: WorkspaceGitApprovalDetails): void {
     const key = approvalDetailsKey(details.routing);
@@ -67,6 +70,26 @@ export class WorkspaceGitApprovalDetailsStore {
     return this.#entries.get(approvalDetailsKey(routing));
   }
 
+  getForRequest(
+    requestId: string,
+    channelId: string,
+    rootThreadTs: string,
+  ): WorkspaceGitApprovalDetails | undefined {
+    let match: WorkspaceGitApprovalDetails | undefined;
+    for (const details of this.#entries.values()) {
+      if (
+        details.routing.requestId !== requestId ||
+        details.routing.channelId !== channelId ||
+        details.routing.rootThreadTs !== rootThreadTs
+      ) {
+        continue;
+      }
+      if (match !== undefined) return undefined;
+      match = details;
+    }
+    return match;
+  }
+
   updateDisplay(
     routing: UserInputActionValue,
     display: WorkspaceGitApprovalDisplayState,
@@ -83,6 +106,27 @@ export class WorkspaceGitApprovalDetailsStore {
   forget(routing: UserInputActionValue): void {
     this.#entries.delete(approvalDetailsKey(routing));
   }
+
+  async serialize<T>(
+    routing: UserInputActionValue,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const key = approvalDetailsKey(routing);
+    const previous = this.#actionTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolveCurrent) => {
+      release = resolveCurrent;
+    });
+    const tail = previous.catch(() => undefined).then(() => current);
+    this.#actionTails.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await action();
+    } finally {
+      release();
+      if (this.#actionTails.get(key) === tail) this.#actionTails.delete(key);
+    }
+  }
 }
 
 export function buildWorkspaceGitApprovalBlocks(
@@ -95,6 +139,7 @@ export function buildWorkspaceGitApprovalBlocks(
   const allowPathToggle = options.allowPathToggle ?? false;
   const bodyExpanded = options.bodyExpanded ?? true;
   const allowBodyToggle = options.allowBodyToggle ?? false;
+  const expiresAt = options.expiresAt ?? plan.expiresAt;
   const blocks: KnownBlock[] = [
     {
       type: "section",
@@ -114,7 +159,7 @@ export function buildWorkspaceGitApprovalBlocks(
         text:
           `*Operation ID*\n\`${plan.operationId}\`\n` +
           `*Plan hash*\n\`${plan.planHash}\`\n` +
-          `*期限*\n${escapeSlack(plan.expiresAt)}`,
+          `*期限*\n${escapeSlack(expiresAt)}`,
       },
     },
   ];
@@ -182,6 +227,56 @@ export function buildWorkspaceGitApprovalBlocks(
     ],
   });
   return blocks;
+}
+
+export function buildExpiredWorkspaceGitApprovalBlocks(
+  plan: WorkspaceGitApprovalPlan,
+  expiresAt: string,
+): KnownBlock[] {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          "*:warning: Git操作の承認期限が切れました*\n" +
+          "この計画は実行できません。必要な場合は、同じ依頼をもう一度送って承認画面を再作成してください。",
+      },
+    },
+    {
+      type: "section",
+      fields: [
+        field("操作", operationLabel(plan.operation)),
+        field("Repository", plan.repoId),
+        field("Branch", plan.branch),
+        field("Mode", plan.mode),
+      ],
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `期限: ${escapeSlack(expiresAt)} ・ 状態: 期限切れ（実行不可）`,
+        },
+      ],
+    },
+  ];
+}
+
+export function buildUnavailableWorkspaceGitApprovalBlocks(): KnownBlock[] {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          "*:warning: このGit承認は利用できません*\n" +
+          "期限切れ、処理済み、またはGateway再起動前の承認画面です。" +
+          "このボタンからは実行できません。必要な場合は承認画面を再作成してください。",
+      },
+    },
+  ];
 }
 
 export function parseUserInputDecision(

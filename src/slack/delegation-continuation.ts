@@ -11,6 +11,7 @@ import {
 } from "./presentation.js";
 import { SlackThreadProjector } from "./projector.js";
 import { formatAgentTextForSlack } from "./text-format.js";
+import type { WorkspaceGitApprovalDetailsStore } from "./user-input-blocks.js";
 
 const MAX_FALLBACK_RESULT_TEXT = 3_000;
 
@@ -35,6 +36,7 @@ export async function projectDelegationContinuation(
   onUserInputProjectionFailure?: (
     failure: UserInputProjectionFailure,
   ) => Promise<void>,
+  gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore,
 ): Promise<void> {
   const sourceUserId =
     request.sourceSlackUserId ?? defaultNotificationUserId;
@@ -51,6 +53,9 @@ export async function projectDelegationContinuation(
         presentations,
         request.sourceChannelId,
       ),
+      ...(gitApprovalDetailsStore === undefined
+        ? {}
+        : { gitApprovalDetailsStore }),
     },
   );
   let turnError: unknown;

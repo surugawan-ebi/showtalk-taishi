@@ -407,7 +407,13 @@ function notifyPublicationExecution(
     item: {
       ...item,
       status: overrides.status ?? "completed",
-      result: { structuredContent: { status: "executed" } },
+      result: {
+        structuredContent: {
+          operation_id:
+            overrides.operationId ?? "11111111-1111-4111-8111-111111111111",
+          status: "executed",
+        },
+      },
     },
   });
 }
@@ -431,7 +437,10 @@ function publicationExecutionItem(
     arguments: { operation_id: operationId },
     status: overrides.status ?? "completed",
     result: {
-      structuredContent: { status: overrides.outcomeStatus ?? "applied" },
+      structuredContent: {
+        operation_id: operationId,
+        status: overrides.outcomeStatus ?? "applied",
+      },
     },
     error: null,
   };
@@ -579,7 +588,7 @@ test("creates a Codex thread with workspace and role instructions", async () => 
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
-    /After `承認して実行`.*continue the resumed turn.*execute_approved_\* tool exactly once/su,
+    /Before the App Server receives `承認して実行`.*Continue the resumed turn.*execute_approved_\* tool exactly once/su,
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -587,7 +596,7 @@ test("creates a Codex thread with workspace and role instructions", async () => 
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
-    /Re-read the exact workspace-git operation status.*record and verify approval.*operation ID.*full plan hash.*worktree.*HEAD\/snapshot or PR state.*scope.*expiry/su,
+    /model-inaccessible private broker.*Re-read the exact workspace-git operation status.*operation ID.*full plan hash.*approval target.*worktree.*HEAD\/snapshot or PR state.*scope.*expiry/su,
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -891,7 +900,7 @@ test("attaches the required MCP config on both thread creation and resume", asyn
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
-    /After `承認して実行`.*instead of ending with prose or deferring execution/su,
+    /Before the App Server receives `承認して実行`.*instead of ending with prose or deferring execution/su,
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
@@ -899,7 +908,7 @@ test("attaches the required MCP config on both thread creation and resume", asyn
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
-    /operation ID.*full plan hash.*worktree.*HEAD\/snapshot or PR state.*scope.*expiry/su,
+    /operation ID.*full plan hash.*approval target.*worktree.*HEAD\/snapshot or PR state.*scope.*expiry/su,
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
@@ -1324,6 +1333,55 @@ test("normalizes stream events and resolves an approval", async () => {
     }),
     /Unknown approval request/,
   );
+});
+
+test("normalizes completed generated images once for Slack projection", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Generate a logo", source: { type: "human" } },
+    )) {
+      events.push(event);
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  const item = {
+    type: "imageGeneration",
+    id: "generated-image-1",
+    status: "completed",
+    revisedPrompt: "A logo",
+    result:
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=",
+    savedPath: "/private/tmp/generated-logo.png",
+    failure: null,
+  };
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item,
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item,
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  const generated = events.filter(
+    (event): event is Extract<AgentEvent, { type: "attachment.generated" }> =>
+      event.type === "attachment.generated",
+  );
+  assert.equal(generated.length, 1);
+  assert.equal(generated[0]?.attachmentId, "generated-image-1");
+  assert.equal(generated[0]?.attachment.mimeType, "image/png");
+  assert.doesNotMatch(generated[0]?.attachment.name ?? "", /private|tmp/u);
 });
 
 test("suppresses retrying App Server errors and emits only the final error", async () => {
@@ -2130,6 +2188,70 @@ test("bridges one exact workspace-git publication choice to the same App Server 
   assert.equal(server.turnStarts.length, 1);
 });
 
+test("rejects a second same-turn Git approval without losing the active execution", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
+  let releaseFirstRequest!: () => void;
+  const firstRequestReady = new Promise<void>((resolve) => {
+    releaseFirstRequest = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Publish one exact plan",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "user_input.requested") continue;
+      requests.push(event);
+      if (requests.length === 1) releaseFirstRequest();
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 811,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await firstRequestReady;
+  await adapter.respondToUserInput(session, {
+    requestId: requests[0]?.requestId ?? "",
+    optionId: "approve",
+  });
+
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-2",
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  server.request({
+    id: 812,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(requests.length, 1);
+  assert.match(
+    server.errorResponses.find((response) => response.id === 812)?.message ?? "",
+    /CONCURRENT_GIT_APPROVAL_NOT_SUPPORTED/u,
+  );
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem({ outcomeStatus: "succeeded" })],
+    },
+  });
+  await consuming;
+  assert.equal(server.turnStarts.length, 1);
+});
+
 test("continues one bounded turn when an approved Git plan was not executed", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
@@ -2913,12 +3035,14 @@ test("rejects an expired structured choice and resumes the App Server once", asy
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { approvalTimeoutMs: 10 });
   const session = { id: "thr_1" };
+  let expiredRequestId: string | undefined;
   const consuming = (async () => {
     for await (const event of adapter.sendMessage(session, {
       text: "Wait for approval",
       source: { type: "human" },
     })) {
-      if (event.type === "error" && event.code === "STRUCTURED_INPUT_EXPIRED") {
+      if (event.type === "git_approval.expired") {
+        expiredRequestId = event.requestId;
         server.notify("turn/completed", {
           threadId: "thr_1",
           turn: { id: "turn_1", status: "completed" },
@@ -2931,6 +3055,7 @@ test("rejects an expired structured choice and resumes the App Server once", asy
   server.request({ id: 83, method: "item/tool/requestUserInput", params: workspaceGitQuestion() });
   await consuming;
 
+  assert.match(expiredRequestId ?? "", /^codex-input:/u);
   assert.deepEqual(server.userInputResponses, [
     {
       id: 83,
@@ -2939,6 +3064,42 @@ test("rejects an expired structured choice and resumes the App Server once", asy
       },
     },
   ]);
+});
+
+test("projects an expired Git approval before a rejection transport failure", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { approvalTimeoutMs: 10 });
+  server.userInputResponseError = new Error("expiry rejection transport failed");
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    try {
+      for await (const event of adapter.sendMessage(
+        { id: "thr_1" },
+        { text: "Wait for approval", source: { type: "human" } },
+      )) {
+        events.push(event);
+      }
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 84,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+
+  const error = await consuming;
+
+  assert.match(String(error), /expiry rejection transport failed/u);
+  assert.equal(
+    events.some((event) => event.type === "git_approval.expired"),
+    true,
+  );
+  assert.deepEqual(server.userInputResponses, []);
 });
 
 test("cancels an expired approval instead of stranding the Codex turn", async () => {

@@ -21,7 +21,9 @@ export interface ChoiceActionValue extends ChoiceActionRouting {
   readonly optionId?: string;
 }
 
-export type ChoiceActionKind = "select" | "other";
+export type ParsedChoiceAction =
+  | { readonly kind: "select"; readonly optionId: string }
+  | { readonly kind: "other" };
 
 export function buildChoiceBlocks(
   question: AgentChoiceQuestion,
@@ -41,15 +43,15 @@ export function buildChoiceBlocks(
     optionDetails,
   ].filter((value) => value.length > 0).join("\n\n");
   const elements: ActionsBlock["elements"] = question.options.map((option) => ({
-      type: "button",
-      text: {
-        type: "plain_text",
-        text: truncate(option.label, 75),
-        emoji: true,
-      },
-      action_id: `${CHOICE_ACTION_PREFIX}select`,
-      value: encodeChoiceActionValue({ ...routing, optionId: option.id }),
-    }));
+    type: "button",
+    text: {
+      type: "plain_text",
+      text: truncate(option.label, 75),
+      emoji: true,
+    },
+    action_id: `${CHOICE_ACTION_PREFIX}select.${option.id}`,
+    value: encodeChoiceActionValue({ ...routing, optionId: option.id }),
+  }));
   if (question.allowsOther) {
     elements.push({
       type: "button",
@@ -101,10 +103,14 @@ export function buildChoiceOtherModal(
   };
 }
 
-export function parseChoiceActionKind(actionId: string): ChoiceActionKind | undefined {
+export function parseChoiceActionId(actionId: string): ParsedChoiceAction | undefined {
   if (!actionId.startsWith(CHOICE_ACTION_PREFIX)) return undefined;
   const value = actionId.slice(CHOICE_ACTION_PREFIX.length);
-  return value === "select" || value === "other" ? value : undefined;
+  if (value === "other") return { kind: "other" };
+  const selected = /^select\.(option_[1-3])$/u.exec(value);
+  return selected === null
+    ? undefined
+    : { kind: "select", optionId: selected[1]! };
 }
 
 export function parseChoiceActionValue(value: string): ChoiceActionValue {

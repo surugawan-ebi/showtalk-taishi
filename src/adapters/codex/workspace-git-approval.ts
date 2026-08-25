@@ -2,10 +2,6 @@ import type {
   WorkspaceGitApprovalPlan,
   WorkspaceGitPublicationMode,
 } from "../../core/index.js";
-import type {
-  ToolRequestUserInputParams,
-  ToolRequestUserInputQuestion,
-} from "./protocol.js";
 
 const WORKSPACE_GIT_SERVERS = new Set(["workspace-git", "workspace_git"]);
 const PUBLICATION_MODES = new Set<WorkspaceGitPublicationMode>([
@@ -22,32 +18,20 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const SHA256 = /^[0-9a-f]{64}$/u;
 const GIT_SHA = /^[0-9a-f]{40}$/u;
 const SNAPSHOT = /^[0-9a-f]{64}$/u;
-const APPROVE_LABEL = "承認して実行";
-const REJECT_LABEL = "拒否・保留";
 const MAX_PATHS = 100;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_TOTAL_PATH_LENGTH = 30_000;
-const MIN_AUTO_RESOLUTION_MS = 60_000;
-const MAX_AUTO_RESOLUTION_MS = 240_000;
 
 export interface WorkspaceGitPlanCapture {
   readonly turnId: string;
   readonly plan: WorkspaceGitApprovalPlan;
 }
 
-export interface ValidatedPlanQuestion {
-  readonly questionId: string;
-  readonly prompt: string;
-  readonly approveLabel: typeof APPROVE_LABEL;
-  readonly rejectLabel: typeof REJECT_LABEL;
-  readonly autoResolutionMs?: number;
-}
-
 /**
  * Reads only the bounded, public prepare result plus its original MCP inputs.
  * Absolute repository paths and private workspace-git state are never copied.
  */
-export function captureWorkspaceGitPlan(
+export function normalizeWorkspaceGitPrepareCompletion(
   notification: unknown,
   startedItem?: Readonly<Record<string, unknown>>,
 ): WorkspaceGitPlanCapture | undefined {
@@ -106,6 +90,40 @@ export function captureWorkspaceGitPlan(
     const mode = modeValue;
     const branch = boundedString(scope.branch, 256, "branch");
     const worktreeId = boundedString(scope.worktree_id, 256, "worktree ID");
+    const temporaryWorkspaceId = optionalBoundedString(
+      argumentsRecord.temporary_workspace_id,
+      256,
+    );
+    const inputWorktreeId = optionalBoundedString(
+      argumentsRecord.worktree_id,
+      256,
+    );
+    if (temporaryWorkspaceId !== undefined && inputWorktreeId !== undefined) {
+      throw new Error("workspace-git publication target inputs are ambiguous");
+    }
+    if (
+      temporaryWorkspaceId === undefined &&
+      worktreeId !== (inputWorktreeId ?? "primary")
+    ) {
+      throw new Error("workspace-git pending plan worktree does not match its input");
+    }
+    const expectedApprovalTarget = temporaryWorkspaceId ?? worktreeId;
+    const explicitApprovalTarget = output.approval_target === undefined
+      ? undefined
+      : boundedString(output.approval_target, 256, "approval target");
+    if (
+      explicitApprovalTarget !== undefined &&
+      explicitApprovalTarget !== expectedApprovalTarget
+    ) {
+      throw new Error(
+        "workspace-git approval target does not match its publication scope",
+      );
+    }
+    // workspace-git publication plans historically exposed the exact target
+    // through the validated worktree/temporary-workspace inputs and private
+    // status CLI, but not as a top-level prepare field. Preserve compatibility
+    // without parsing the human-readable approval command.
+    const approvalTarget = explicitApprovalTarget ?? expectedApprovalTarget;
     const expectedHead = argumentsRecord.expected_head === null
       ? null
       : boundedString(argumentsRecord.expected_head, 40, "expected HEAD");
@@ -132,12 +150,6 @@ export function captureWorkspaceGitPlan(
         argumentsRecord.temporary_workspace_id !== undefined)
     ) {
       throw new Error("workspace-git returned an invalid initial publication scope");
-    }
-    if (
-      typeof argumentsRecord.worktree_id === "string" &&
-      argumentsRecord.worktree_id !== worktreeId
-    ) {
-      throw new Error("workspace-git pending plan worktree does not match its input");
     }
     const paths = validatedPaths(scope.paths);
     const inputPaths = argumentsRecord.paths === undefined
@@ -202,6 +214,7 @@ export function captureWorkspaceGitPlan(
     const commonPlan = {
       operationId,
       planHash,
+      approvalTarget,
       operation: "git_publication" as const,
       repoId,
       expectedSnapshotId,
@@ -270,6 +283,14 @@ export function captureWorkspaceGitPlan(
     scope.pull_request_number,
     "Pull Request number",
   );
+  const approvalTarget = boundedString(
+    output.approval_target,
+    256,
+    "approval target",
+  );
+  if (approvalTarget !== `pr_${pullRequestNumber}`) {
+    throw new Error("workspace-git approval target does not match its Pull Request");
+  }
   const expectedHead = boundedString(scope.expected_head_sha, 40, "expected HEAD");
   const branch = boundedString(scope.head_ref_name, 256, "head branch");
   const baseBranch = boundedString(scope.base_ref_name, 256, "base branch");
@@ -298,6 +319,7 @@ export function captureWorkspaceGitPlan(
     plan: freezePlan({
       operationId,
       planHash,
+      approvalTarget,
       operation:
         action === "merge" ? "pull_request_merge" : "pull_request_ready",
       repoId,
@@ -316,62 +338,14 @@ export function captureWorkspaceGitPlan(
   };
 }
 
-export function validateWorkspaceGitPlanQuestion(
-  value: unknown,
-): ValidatedPlanQuestion {
-  const params = requiredRecord(value, "user input request");
-  const questions = params.questions;
-  if (!Array.isArray(questions) || questions.length !== 1) {
-    throw new Error("Git plan approval requires exactly one structured question");
-  }
-  const question = requiredRecord(questions[0], "question") as unknown as
-    ToolRequestUserInputQuestion;
-  if (
-    typeof question.id !== "string" ||
-    question.id.length < 1 ||
-    question.id.length > 128 ||
-    typeof question.question !== "string" ||
-    question.question.length < 1 ||
-    question.question.length > 2_000 ||
-    typeof question.isOther !== "boolean" ||
-    question.isSecret !== false ||
-    !Array.isArray(question.options) ||
-    question.options.length !== 2 ||
-    question.options[0]?.label !== APPROVE_LABEL ||
-    question.options[1]?.label !== REJECT_LABEL
-  ) {
-    throw new Error("Git plan approval question has unsupported choices");
-  }
-  const autoResolutionMs = params.autoResolutionMs;
-  if (
-    autoResolutionMs !== null &&
-    (typeof autoResolutionMs !== "number" ||
-      !Number.isSafeInteger(autoResolutionMs) ||
-      autoResolutionMs < MIN_AUTO_RESOLUTION_MS ||
-      autoResolutionMs > MAX_AUTO_RESOLUTION_MS)
-  ) {
-    throw new Error("Git plan approval auto-resolution is invalid");
-  }
-  return {
-    questionId: question.id,
-    prompt: question.question,
-    approveLabel: APPROVE_LABEL,
-    rejectLabel: REJECT_LABEL,
-    ...(typeof autoResolutionMs === "number" ? { autoResolutionMs } : {}),
-  };
-}
+/** Backwards-compatible name for tests and downstream imports. */
+export const captureWorkspaceGitPlan = normalizeWorkspaceGitPrepareCompletion;
 
-export function toolRequestUserInputParams(value: unknown): ToolRequestUserInputParams {
-  const params = requiredRecord(value, "user input request");
-  if (
-    typeof params.threadId !== "string" ||
-    typeof params.turnId !== "string" ||
-    typeof params.itemId !== "string"
-  ) {
-    throw new Error("Structured input request is missing its turn identity");
-  }
-  return params as unknown as ToolRequestUserInputParams;
-}
+export {
+  toolRequestUserInputParams,
+  validateWorkspaceGitPlanQuestion,
+} from "./workspace-git-approval-question.js";
+export type { ValidatedPlanQuestion } from "./workspace-git-approval-question.js";
 
 function validatedPaths(value: unknown): readonly string[] {
   if (!Array.isArray(value) || value.length > MAX_PATHS) {
@@ -434,7 +408,12 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function boundedString(value: unknown, max: number, label: string): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > max) {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > max ||
+    value.trim().length < 1
+  ) {
     throw new Error(`workspace-git ${label} is invalid`);
   }
   return value;

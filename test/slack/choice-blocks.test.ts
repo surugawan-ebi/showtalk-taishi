@@ -58,7 +58,11 @@ test("renders ordinary choices with opaque message-bound action payloads", () =>
   const actions = (blocks[1] as { elements: Array<{ action_id: string; value: string }> })
     .elements;
   const first = actions[0]!;
-  assert.equal(first.action_id, "taishi.choice.select");
+  assert.equal(first.action_id, "taishi.choice.select.option_1");
+  assert.equal(
+    new Set(actions.map((action) => action.action_id)).size,
+    actions.length,
+  );
   assert.deepEqual(parseChoiceActionValue(first.value), {
     ...routing,
     optionId: "option_1",
@@ -68,7 +72,7 @@ test("renders ordinary choices with opaque message-bound action payloads", () =>
 
 test("accepts a choice only from its bound Slack user and message", () => {
   const action = {
-    action_id: "taishi.choice.select",
+    action_id: "taishi.choice.select.option_2",
     value: JSON.stringify({ ...routing, optionId: "option_2" }),
   };
   assert.equal(
@@ -90,10 +94,23 @@ test("accepts a choice only from its bound Slack user and message", () => {
   );
 });
 
+test("rejects a fixed choice whose action ID and payload disagree", () => {
+  assert.throws(() =>
+    parseTrustedChoiceAction(
+      actionBody(),
+      {
+        action_id: "taishi.choice.select.option_1",
+        value: JSON.stringify({ ...routing, optionId: "option_2" }),
+      },
+      new Set(),
+    ),
+  );
+});
+
 test("allows a source-less Koe question only for a configured operator", () => {
   const { responderUserId: _responderUserId, ...delegatedRouting } = routing;
   const action = {
-    action_id: "taishi.choice.select",
+    action_id: "taishi.choice.select.option_1",
     value: JSON.stringify({ ...delegatedRouting, optionId: "option_1" }),
   };
   assert.equal(

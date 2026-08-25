@@ -150,6 +150,7 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
         gatewayEvent({
           type: "user_input.requested",
           requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+          expiresAt: "2099-08-14T11:00:00.000Z",
           prompt: "Approve?",
           options: [
             { id: "approve", label: "承認して実行" },
@@ -158,6 +159,7 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
           plan: {
             operationId: "22222222-2222-4222-8222-222222222222",
             planHash: "a".repeat(64),
+            approvalTarget: "primary",
             operation: "git_publication",
             repoId: "mini-all",
             mode: "commit_and_push",

@@ -51,6 +51,7 @@ test("captures every public exact-plan field from a publication prepare result",
     plan: {
       operationId: "11111111-1111-4111-8111-111111111111",
       planHash: "a".repeat(64),
+      approvalTarget: "primary",
       operation: "git_publication",
       repoId: "showtalk-taishi",
       mode: "commit_and_push",
@@ -64,6 +65,79 @@ test("captures every public exact-plan field from a publication prepare result",
       expiresAt: "2026-08-14T20:00:00+09:00",
     },
   });
+});
+
+test("derives a missing publication approval target from exact prepare inputs", () => {
+  const defaultPrimary = publicationNotification();
+  Reflect.deleteProperty(defaultPrimary.item.arguments, "worktree_id");
+  assert.equal(
+    captureWorkspaceGitPlan(defaultPrimary)?.plan.approvalTarget,
+    "primary",
+  );
+
+  const linked = publicationNotification();
+  linked.item.arguments.worktree_id = `wt_${"d".repeat(64)}`;
+  linked.item.result.structuredContent.scope.worktree_id = `wt_${"d".repeat(64)}`;
+  assert.equal(
+    captureWorkspaceGitPlan(linked)?.plan.approvalTarget,
+    `wt_${"d".repeat(64)}`,
+  );
+
+  const temporary = publicationNotification();
+  Reflect.deleteProperty(temporary.item.arguments, "worktree_id");
+  Reflect.set(
+    temporary.item.arguments,
+    "temporary_workspace_id",
+    `tmp_${"e".repeat(64)}`,
+  );
+  assert.equal(
+    captureWorkspaceGitPlan(temporary)?.plan.approvalTarget,
+    `tmp_${"e".repeat(64)}`,
+  );
+});
+
+test("rejects an explicit publication approval target that conflicts with scope", () => {
+  const publication = publicationNotification();
+  Reflect.set(
+    publication.item.result.structuredContent,
+    "approval_target",
+    "wt_substituted",
+  );
+  assert.throws(
+    () => captureWorkspaceGitPlan(publication),
+    /approval target does not match its publication scope/u,
+  );
+
+  const substitutedDefault = publicationNotification();
+  Reflect.deleteProperty(substitutedDefault.item.arguments, "worktree_id");
+  substitutedDefault.item.result.structuredContent.scope.worktree_id =
+    `wt_${"f".repeat(64)}`;
+  assert.throws(
+    () => captureWorkspaceGitPlan(substitutedDefault),
+    /worktree does not match its input/u,
+  );
+
+  const ambiguous = publicationNotification();
+  Reflect.set(
+    ambiguous.item.arguments,
+    "temporary_workspace_id",
+    `tmp_${"1".repeat(64)}`,
+  );
+  assert.throws(
+    () => captureWorkspaceGitPlan(ambiguous),
+    /publication target inputs are ambiguous/u,
+  );
+
+  const whitespaceTarget = publicationNotification();
+  Reflect.set(
+    whitespaceTarget.item.result.structuredContent,
+    "approval_target",
+    "   ",
+  );
+  assert.throws(
+    () => captureWorkspaceGitPlan(whitespaceTarget),
+    /approval target is invalid/u,
+  );
 });
 
 test("captures both narrowly scoped initial publication modes", () => {
@@ -115,6 +189,7 @@ test("rejects initial publication plans outside the primary main checkout", () =
   const temporary = publicationNotification();
   temporary.item.arguments.mode = "initial_push_existing";
   Reflect.deleteProperty(temporary.item.arguments, "commit_message");
+  Reflect.deleteProperty(temporary.item.arguments, "worktree_id");
   Reflect.set(temporary.item.arguments, "temporary_workspace_id", "tmp_workspace");
   temporary.item.result.structuredContent.scope.mode = "initial_push_existing";
   temporary.item.result.structuredContent.scope.branch = "main";
@@ -232,6 +307,7 @@ test("captures Ready and merge plans with the exact PR HEAD", () => {
           structuredContent: {
             status: "awaiting_human_approval",
             operation_id: "22222222-2222-4222-8222-222222222222",
+            approval_target: "pr_42",
             approval_expires_at: "2026-08-14T20:00:00+09:00",
             scope: {
               repo_id: "showtalk-taishi",
@@ -346,6 +422,7 @@ test("rejects an unsupported merge method", () => {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "22222222-2222-4222-8222-222222222222",
+          approval_target: "pr_42",
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
             repo_id: "showtalk-taishi",
@@ -366,6 +443,49 @@ test("rejects an unsupported merge method", () => {
     },
   };
   assert.throws(() => captureWorkspaceGitPlan(notification), /merge method/u);
+});
+
+test("rejects a Pull Request approval target that does not match its number", () => {
+  const notification = {
+    threadId: "thr_1",
+    turnId: "turn_pr",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp_ready",
+      server: "workspace-git",
+      tool: "prepare_pull_request_operation",
+      status: "completed",
+      arguments: {
+        repo_id: "showtalk-taishi",
+        pull_request_number: 42,
+        action: "mark_ready_for_review",
+      },
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "22222222-2222-4222-8222-222222222222",
+          approval_target: "pr_99",
+          approval_expires_at: "2026-08-14T20:00:00+09:00",
+          scope: {
+            repo_id: "showtalk-taishi",
+            action: "mark_ready_for_review",
+            pull_request_number: 42,
+            pull_request_url: "https://github.com/example-org/example-repo/pull/42",
+            base_ref_name: "main",
+            head_ref_name: "agent/approval-ui",
+            expected_head_sha: "d".repeat(40),
+          },
+          plan_hash: "e".repeat(64),
+          execute_tool: "execute_approved_pull_request_operation",
+          external_write: false,
+        },
+      },
+    },
+  };
+  assert.throws(
+    () => captureWorkspaceGitPlan(notification),
+    /approval target does not match its Pull Request/u,
+  );
 });
 
 test("accepts only the fixed, non-secret approval choices", () => {
