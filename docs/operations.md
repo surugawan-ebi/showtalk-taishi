@@ -39,13 +39,22 @@ expired, reused, restarted, wrong-thread, or otherwise unbound action fails
 closed. The owning Koe must inspect current status and prepare a fresh exact
 plan before requesting approval again.
 
-Selecting `承認して実行` resumes the original Codex request. The resumed turn
-must still use workspace-git's status, approval, and execute boundaries;
+Selecting `承認して実行` first records the exact decision through the
+model-inaccessible workspace-git private broker, then resumes the original
+Codex request. Configure the LaunchAgent `.env` with the absolute built CLI
+path and the same private state root used by workspace-git:
+
+```dotenv
+SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI=/absolute/path/to/local-mcp/servers/workspace-git/dist/src/cli/approval-cli.js
+WORKSPACE_GIT_STATE_ROOT=/absolute/private/state/workspace-git
+```
+
+The resumed turn must still use workspace-git's status and execute boundaries;
 ShowTalk does not directly perform the Git write from a Slack callback.
 The bound Slack button response is the fresh human approval boundary, so the
 resumed Codex turn must not stop with an acknowledgement or defer the exact
-approved operation to another user message. It revalidates, records and
-confirms approval, and calls the matching `execute_approved_*` tool once when
+approved operation to another user message. It revalidates and confirms the
+broker-recorded approval, and calls the matching `execute_approved_*` tool once when
 the immutable plan still matches. Rejection, expiry, mismatch, an already
 rejected or executed operation, or an inconclusive state remains fail-closed.
 If the approved turn nevertheless ends before the exact execute tool is

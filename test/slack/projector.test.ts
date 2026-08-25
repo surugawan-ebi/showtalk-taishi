@@ -244,6 +244,79 @@ test("keeps source-less final responses in the activity message", async () => {
   assert.equal(updates.length, 0);
 });
 
+test("uploads generated images to the originating Slack thread once", async () => {
+  const { client } = recordingClient();
+  const uploads: Array<{
+    readonly channelId: string;
+    readonly rootThreadTs: string;
+    readonly names: readonly string[];
+  }> = [];
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    attachmentUploader: async (_client, channelId, rootThreadTs, attachments) => {
+      uploads.push({
+        channelId,
+        rootThreadTs,
+        names: attachments.map((attachment) => attachment.name),
+      });
+    },
+  });
+  const event = {
+    type: "attachment.generated",
+    attachmentId: "image-1",
+    attachment: {
+      kind: "image",
+      payload: new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" }),
+      name: "codex-generated-image-1.png",
+      mimeType: "image/png",
+      title: "Codex生成画像",
+      altText: "Codexで生成された画像",
+    },
+  } as const;
+
+  await projector.project(event);
+  await projector.project(event);
+  await projector.complete();
+
+  assert.deepEqual(uploads, [{
+    channelId: "C1",
+    rootThreadTs: "100.0",
+    names: ["codex-generated-image-1.png"],
+  }]);
+});
+
+test("reports a generated image upload failure without aborting the final reply", async () => {
+  const { client, posts } = recordingClient();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    attachmentUploader: async () => {
+      throw new Error("sensitive Slack upload failure");
+    },
+  });
+
+  await projector.project({
+    type: "attachment.generated",
+    attachmentId: "image-1",
+    attachment: {
+      kind: "image",
+      payload: new Blob([new Uint8Array([1])], { type: "image/png" }),
+      name: "image.png",
+      mimeType: "image/png",
+    },
+  });
+  await projector.project({ type: "message.completed", text: "画像生成は完了しました。" });
+  await projector.complete();
+
+  assert.ok(posts.some((post) =>
+    String(post.text).includes("生成画像をSlackへ添付できませんでした")
+  ));
+  assert.ok(posts.some((post) =>
+    String(post.text).includes("画像生成は完了しました")
+  ));
+  assert.ok(posts.every((post) =>
+    !String(post.text).includes("sensitive Slack upload failure")
+  ));
+});
+
 test("retries an unconfirmed source-less final chunk without duplicating confirmed chunks", async () => {
   const attempts: Array<Record<string, unknown>> = [];
   const confirmed: Array<Record<string, unknown>> = [];
@@ -592,6 +665,7 @@ test("projects an exact workspace-git plan as Slack buttons in the originating t
   await projector.project({
     type: "user_input.requested",
     requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+    expiresAt: "2099-08-14T11:00:00.000Z",
     prompt: "このexact planを承認しますか？",
     options: [
       { id: "approve", label: "承認して実行" },
@@ -600,6 +674,7 @@ test("projects an exact workspace-git plan as Slack buttons in the originating t
     plan: {
       operationId: "22222222-2222-4222-8222-222222222222",
       planHash: "a".repeat(64),
+      approvalTarget: "pr_42",
       operation: "pull_request_merge",
       repoId: "showtalk-taishi",
       mode: "merge",
@@ -638,6 +713,7 @@ test("projects Git approvals with the file list collapsed when toggle state is a
   await projector.project({
     type: "user_input.requested",
     requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+    expiresAt: "2099-08-14T11:00:00.000Z",
     prompt: "このexact planを承認しますか？",
     options: [
       { id: "approve", label: "承認して実行" },
@@ -646,6 +722,7 @@ test("projects Git approvals with the file list collapsed when toggle state is a
     plan: {
       operationId: "22222222-2222-4222-8222-222222222222",
       planHash: "a".repeat(64),
+      approvalTarget: "primary",
       operation: "git_publication",
       repoId: "showtalk-taishi",
       mode: "commit_push_and_open_draft_pr",
@@ -670,6 +747,8 @@ test("projects Git approvals with the file list collapsed when toggle state is a
   assert.match(rendered, /変更ファイルを表示/u);
   assert.match(rendered, /PR本文を表示/u);
   assert.match(rendered, /2件/u);
+  assert.match(rendered, /2099-08-14T11:00:00\.000Z/u);
+  assert.doesNotMatch(rendered, /2026-08-21T20:00:00\+09:00/u);
   assert.doesNotMatch(rendered, /src\/one\.ts|src\/two\.ts/u);
   assert.doesNotMatch(rendered, /Keep exact paths available behind a bound toggle\./u);
   const routing = {
@@ -687,6 +766,90 @@ test("projects Git approvals with the file list collapsed when toggle state is a
     pathsExpanded: false,
     bodyExpanded: false,
   });
+
+  await projector.project({
+    type: "git_approval.expired",
+    requestId: routing.requestId,
+  });
+
+  const expiredUpdate = updates.at(-1);
+  assert.equal(expiredUpdate?.channel, routing.channelId);
+  assert.equal(expiredUpdate?.ts, routing.messageTs);
+  assert.match(String(expiredUpdate?.text), /承認期限が切れました/u);
+  const expiredBlocks = JSON.stringify(expiredUpdate?.blocks);
+  assert.match(expiredBlocks, /期限切れ（実行不可）/u);
+  assert.doesNotMatch(
+    expiredBlocks,
+    /承認して実行|拒否・保留|taishi\.git_plan|"type":"button"/u,
+  );
+  assert.equal(detailsStore.get(routing), undefined);
+});
+
+test("keeps an expired Git card retryable when the terminal Slack update fails", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let postCount = 0;
+  let terminalFailures = 3;
+  const client = {
+    chat: {
+      postMessage: async () => ({ ok: true, ts: `${101 + postCount++}.1` }),
+      update: async (input: Record<string, unknown>) => {
+        updates.push(input);
+        if (
+          JSON.stringify(input.blocks).includes("承認期限が切れました") &&
+          terminalFailures-- > 0
+        ) {
+          throw new Error("temporary Slack failure");
+        }
+        return { ok: true };
+      },
+    },
+  } as unknown as WebClient;
+  const detailsStore = new WorkspaceGitApprovalDetailsStore();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    gitApprovalDetailsStore: detailsStore,
+  });
+  const requestId = "codex-input:11111111-1111-4111-8111-111111111111";
+
+  await projector.project({
+    type: "user_input.requested",
+    requestId,
+    expiresAt: "2099-08-14T11:00:00.000Z",
+    prompt: "Approve?",
+    options: [
+      { id: "approve", label: "承認して実行" },
+      { id: "reject", label: "拒否・保留" },
+    ],
+    plan: {
+      operationId: "22222222-2222-4222-8222-222222222222",
+      planHash: "a".repeat(64),
+      approvalTarget: "primary",
+      operation: "git_publication",
+      repoId: "showtalk-taishi",
+      mode: "commit_only",
+      branch: "agent/expired-card",
+      paths: ["src/slack/projector.ts"],
+      expectedHead: "b".repeat(40),
+      expectedSnapshotId: "c".repeat(64),
+      worktreeId: "primary",
+      expiresAt: "2099-08-14T11:00:00.000Z",
+    },
+  });
+  const routing = {
+    version: 1 as const,
+    requestId,
+    channelId: "C1",
+    rootThreadTs: "100.0",
+    messageTs: "102.1",
+  };
+
+  await projector.project({ type: "git_approval.expired", requestId });
+  assert.ok(detailsStore.get(routing));
+  await projector.project({ type: "git_approval.expired", requestId });
+  assert.equal(detailsStore.get(routing), undefined);
+  assert.doesNotMatch(
+    JSON.stringify(updates.at(-1)?.blocks),
+    /承認して実行|拒否・保留|"type":"button"/u,
+  );
 });
 
 test("projects one safe recovery choice when an exact Git plan is unavailable", async () => {

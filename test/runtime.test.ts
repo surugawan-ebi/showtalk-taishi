@@ -98,6 +98,8 @@ test("does not leak Slack credentials into isolated Codex Agent processes", () =
     RENAMED_BOT_CREDENTIAL: "xoxb-secret",
     SLACK_UNRELATED_TOKEN: "other-slack-secret",
     SHOWTALK_TAISHI_MCP_TOKEN: "old-agent-token",
+    SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI: "/private/approval-cli.js",
+    WORKSPACE_GIT_STATE_ROOT: "/private/workspace-git-state",
     GITHUB_TOKEN: "not-forwarded",
     DATABASE_URL: "not-forwarded",
   });

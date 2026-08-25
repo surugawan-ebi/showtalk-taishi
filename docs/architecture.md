@@ -162,8 +162,10 @@ overwrite the completion state. Final responses, approvals, and errors remain
 immediate.
 
 Structured Git approvals are a narrow bridge rather than a generic text
-approval parser. The Codex adapter captures one `workspace-git` prepare result
-from an `item/completed` notification, binds it to that thread and turn, and
+approval parser. A dedicated normalizer captures one bounded `workspace-git`
+prepare result from an `item/completed` notification without exposing the raw
+MCP payload to the rest of the adapter. A process-local approval lifecycle then
+binds the normalized plan to that thread and turn, and
 accepts only the fixed two-choice `item/tool/requestUserInput` request that
 follows it. Because App Server transport ordering may expose the request just
 before the matching completion notification, the adapter can hold that RPC for
@@ -171,9 +173,20 @@ a bounded two-second grace period and re-evaluate it only when the exact same
 thread and turn plan arrives. Slack receives the exact immutable plan for
 display, while button
 values carry only an opaque single-use request ID and trusted routing fields.
-The callback is returned to the same App Server JSON-RPC ID. workspace-git,
-not Slack or model prose, remains responsible for private approval state and
-execution-time revalidation.
+The callback is first committed to workspace-git's private approval store by a
+model-inaccessible local decision broker. Only an exact matching approved or
+rejected status is then returned to the same App Server JSON-RPC ID.
+workspace-git, not Slack or model prose, remains responsible for private
+approval state and execution-time revalidation.
+
+The same lifecycle is the single owner of plan-binding ambiguity, per-turn
+recovery projection deduplication, the one permitted post-approval
+continuation, and exact execute/status observations. It reports execution,
+terminal workspace-git state, incomplete execution, and missing final state as
+different outcomes. The adapter converts those outcomes to App Server and
+Agent events but does not maintain parallel plan or execution maps. Slack still
+owns message-bound callback replay protection; it is not part of this
+process-local turn lifecycle.
 
 Ordinary `item/tool/requestUserInput` questions use a separate, non-authorizing
 path. Taishi validates one to three non-secret questions, projects each current
@@ -185,11 +198,10 @@ approve or reconstruct a workspace-git plan. The short plan-binding grace is
 also applied before classification so a transport-ordering race cannot
 downgrade a malformed same-turn Git approval into an ordinary choice.
 
-The current bridge therefore uses the resumed Codex turn as an approval
-coordinator between the structured answer and workspace-git's private
-prepare/approve/execute state machine. Taishi does not yet have a
-model-isolated decision-broker API into workspace-git; adding one is a separate
-cross-project hardening step, not something reconstructed from Slack payloads.
+The Gateway therefore owns the approval-record phase while the resumed Codex
+turn owns only status revalidation and the exact execute call. The private
+broker invokes an operator-configured local workspace-git approval CLI without
+a shell and does not expose that command or its state root as an Agent tool.
 
 Each Koe may also define a Slack presentation (`display_name` plus either an
 HTTPS `icon_url` or an `icon_emoji`). Runtime builds a presentation map keyed

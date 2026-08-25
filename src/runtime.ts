@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
+import { createWorkspaceGitDecisionBrokerFromEnvironment } from "./approvals/workspace-git-decision-broker.js";
 import {
   CodexModelCatalog,
   type CodexModelCatalogSnapshot,
@@ -109,6 +110,8 @@ async function createLockedRuntime(
       join(dirname(resolve(config.gateway.state_file)), "attachments"),
   );
   const state = await stateStore.load();
+  const workspaceGitDecisionBroker =
+    await createWorkspaceGitDecisionBrokerFromEnvironment(process.env);
   const registry = createRegistry(config, state);
   const clients: CodexAppServerClient[] = [];
   const codexAdapters: CodexAdapter[] = [];
@@ -253,6 +256,9 @@ async function createLockedRuntime(
       ),
       attachmentRoot,
       permissionApprovals,
+      ...(workspaceGitDecisionBroker === undefined
+        ? {}
+        : { workspaceGitDecisionBroker }),
       durableEventLedger: {
         has: (eventId) => registry.hasHandledSlackEvent(eventId),
         record: async (eventId) => {

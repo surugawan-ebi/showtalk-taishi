@@ -4,6 +4,8 @@ import test from "node:test";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 import {
   WorkspaceGitApprovalDetailsStore,
+  buildExpiredWorkspaceGitApprovalBlocks,
+  buildUnavailableWorkspaceGitApprovalBlocks,
   buildWorkspaceGitApprovalBlocks,
   parseUserInputActionValue,
   parseUserInputBodyVisibility,
@@ -11,9 +13,10 @@ import {
   parseUserInputPathVisibility,
 } from "../../src/slack/user-input-blocks.js";
 
-const plan: WorkspaceGitApprovalPlan = {
+const plan = {
   operationId: "11111111-1111-4111-8111-111111111111",
   planHash: "a".repeat(64),
+  approvalTarget: "wt_opaque",
   operation: "git_publication",
   repoId: "showtalk-taishi",
   mode: "commit_push_and_open_draft_pr",
@@ -28,7 +31,7 @@ const plan: WorkspaceGitApprovalPlan = {
   pullRequestBody: "Show the exact plan before approval.",
   pullRequestBaseBranch: "main",
   expiresAt: "2026-08-14T20:00:00+09:00",
-};
+} satisfies WorkspaceGitApprovalPlan;
 
 const routing = {
   version: 1 as const,
@@ -134,12 +137,22 @@ test("stores exact approval display details only for their bound Slack message",
     prompt: "Review",
     plan,
     routing,
+    expiresAt: Date.parse("2099-08-14T11:00:00.000Z"),
     fallbackText: "Git approval pending",
     sourceUserMention: "<@U0123456789>",
     display: { pathsExpanded: false, bodyExpanded: false },
   });
 
   assert.equal(store.get(routing)?.plan, plan);
+  assert.equal(
+    store.getForRequest(routing.requestId, routing.channelId, routing.rootThreadTs)
+      ?.routing.messageTs,
+    routing.messageTs,
+  );
+  assert.equal(
+    store.getForRequest(routing.requestId, "C9999999999", routing.rootThreadTs),
+    undefined,
+  );
   store.updateDisplay(routing, { pathsExpanded: true, bodyExpanded: false });
   assert.deepEqual(store.get(routing)?.display, {
     pathsExpanded: true,
@@ -153,10 +166,62 @@ test("stores exact approval display details only for their bound Slack message",
   assert.equal(store.get(routing), undefined);
 });
 
+test("serializes display and terminal writes for one exact Git approval card", async () => {
+  const store = new WorkspaceGitApprovalDetailsStore();
+  const order: string[] = [];
+  let releaseFirst!: () => void;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const holdFirst = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const first = store.serialize(routing, async () => {
+    order.push("first:start");
+    markFirstStarted();
+    await holdFirst;
+    order.push("first:end");
+  });
+  await firstStarted;
+  const second = store.serialize(routing, async () => {
+    order.push("second");
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["first:start"]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ["first:start", "first:end", "second"]);
+});
+
+test("renders expired and unavailable Git approvals without interactive controls", () => {
+  const expired = buildExpiredWorkspaceGitApprovalBlocks(
+    plan,
+    "2026-08-14T11:00:00.000Z",
+  );
+  const expiredText = JSON.stringify(expired);
+  assert.match(expiredText, /承認期限が切れました/u);
+  assert.match(expiredText, /期限切れ（実行不可）/u);
+  assert.match(expiredText, /showtalk-taishi/u);
+  assert.doesNotMatch(
+    expiredText,
+    /承認して実行|拒否・保留|taishi\.git_plan|"type":"button"/u,
+  );
+
+  const unavailable = buildUnavailableWorkspaceGitApprovalBlocks();
+  const unavailableText = JSON.stringify(unavailable);
+  assert.match(unavailableText, /このGit承認は利用できません/u);
+  assert.doesNotMatch(
+    unavailableText,
+    /承認して実行|拒否・保留|taishi\.git_plan|"type":"button"/u,
+  );
+});
+
 test("renders an unborn initial publication without inventing a HEAD", () => {
   const initialPlan: WorkspaceGitApprovalPlan = {
     operationId: plan.operationId,
     planHash: plan.planHash,
+    approvalTarget: "primary",
     operation: "git_publication",
     repoId: plan.repoId,
     mode: "initial_commit_and_push",

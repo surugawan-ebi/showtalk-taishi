@@ -7,8 +7,10 @@ import { buildGitApprovalRecoveryBlocks } from "./git-approval-recovery-blocks.j
 import { buildChoiceBlocks } from "./choice-blocks.js";
 import {
   WorkspaceGitApprovalDetailsStore,
+  buildExpiredWorkspaceGitApprovalBlocks,
   buildWorkspaceGitApprovalBlocks,
 } from "./user-input-blocks.js";
+import { uploadSlackAttachments } from "./file-upload.js";
 import type { SlackMessagePresentation } from "./presentation.js";
 import {
   formatAgentTextForSlack,
@@ -32,12 +34,23 @@ const MAX_ACTIVE_TOOL_CALLS = 256;
 const MAX_SETTLED_TOOL_CALL_IDS = 512;
 const UPDATE_INTERVAL_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const TERMINAL_UPDATE_RETRY_DELAYS_MS = [100, 500] as const;
 const WORKING_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 
 type HeartbeatScheduler = (
   task: () => Promise<void>,
   delayMs: number,
 ) => () => void;
+
+type AttachmentUploader = (
+  client: WebClient,
+  channelId: string,
+  rootThreadTs: string,
+  attachments: readonly Extract<
+    AgentEvent,
+    { readonly type: "attachment.generated" }
+  >["attachment"][],
+) => Promise<void>;
 
 export interface SlackThreadProjectorOptions {
   readonly sourceUserId?: string;
@@ -46,6 +59,7 @@ export interface SlackThreadProjectorOptions {
   readonly heartbeatScheduler?: HeartbeatScheduler;
   readonly maxFinalChunks?: number;
   readonly gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
+  readonly attachmentUploader?: AttachmentUploader;
 }
 
 export class SlackThreadProjector {
@@ -59,6 +73,7 @@ export class SlackThreadProjector {
   readonly #heartbeatScheduler: HeartbeatScheduler;
   readonly #maxFinalChunks: number;
   readonly #gitApprovalDetailsStore: WorkspaceGitApprovalDetailsStore | undefined;
+  readonly #attachmentUploader: AttachmentUploader;
   readonly #startedAtMs: number;
   #messageTs: string | undefined;
   #text = "";
@@ -91,6 +106,7 @@ export class SlackThreadProjector {
   #activityWriteTail: Promise<void> = Promise.resolve();
   readonly #activeTools = new Set<string>();
   readonly #settledToolIds = new Set<string>();
+  readonly #settledGeneratedAttachmentIds = new Set<string>();
 
   constructor(
     client: WebClient,
@@ -111,6 +127,10 @@ export class SlackThreadProjector {
       options.heartbeatScheduler ?? scheduleHeartbeat;
     this.#maxFinalChunks = options.maxFinalChunks ?? MAX_FINAL_CHUNKS;
     this.#gitApprovalDetailsStore = options.gitApprovalDetailsStore;
+    this.#attachmentUploader =
+      options.attachmentUploader ??
+      ((client, channelId, rootThreadTs, attachments) =>
+        uploadSlackAttachments(client, channelId, rootThreadTs, attachments));
     if (
       !Number.isSafeInteger(this.#maxFinalChunks) ||
       this.#maxFinalChunks < 1 ||
@@ -153,6 +173,25 @@ export class SlackThreadProjector {
         }
         if (this.#activityUpdateDue()) await this.#upsertAgentMessage();
         break;
+      case "attachment.generated":
+        this.#turnActivityStarted = true;
+        if (this.#settledGeneratedAttachmentIds.has(event.attachmentId)) break;
+        this.#settledGeneratedAttachmentIds.add(event.attachmentId);
+        try {
+          await this.#attachmentUploader(
+            this.#client,
+            this.#channelId,
+            this.#rootThreadTs,
+            [event.attachment],
+          );
+        } catch {
+          await this.#post(
+            ":warning: 生成画像をSlackへ添付できませんでした。",
+            undefined,
+            true,
+          );
+        }
+        break;
       case "approval.requested":
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
@@ -162,6 +201,9 @@ export class SlackThreadProjector {
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
         await this.#postUserInput(event);
+        break;
+      case "git_approval.expired":
+        await this.#expireGitApproval(event.requestId);
         break;
       case "choice.requested":
         this.#turnActivityStarted = true;
@@ -758,6 +800,10 @@ export class SlackThreadProjector {
       messageTs: posted.ts,
     } as const;
     const canToggleDetails = this.#gitApprovalDetailsStore !== undefined;
+    const expiresAt = Date.parse(event.expiresAt);
+    if (!Number.isFinite(expiresAt)) {
+      throw new Error("Git approval UI received an invalid expiry");
+    }
     const blocks = buildWorkspaceGitApprovalBlocks(
       event.prompt,
       event.plan,
@@ -767,12 +813,14 @@ export class SlackThreadProjector {
         allowPathToggle: canToggleDetails,
         bodyExpanded: !canToggleDetails,
         allowBodyToggle: canToggleDetails,
+        expiresAt: event.expiresAt,
       },
     );
     this.#gitApprovalDetailsStore?.remember({
       prompt: event.prompt,
       plan: event.plan,
       routing,
+      expiresAt,
       fallbackText: fallback,
       display: {
         pathsExpanded: !canToggleDetails,
@@ -796,6 +844,42 @@ export class SlackThreadProjector {
       this.#gitApprovalDetailsStore?.forget(routing);
       throw error;
     }
+  }
+
+  async #expireGitApproval(requestId: string): Promise<void> {
+    const initial = this.#gitApprovalDetailsStore?.getForRequest(
+      requestId,
+      this.#channelId,
+      this.#rootThreadTs,
+    );
+    if (initial === undefined || this.#gitApprovalDetailsStore === undefined) return;
+    await this.#gitApprovalDetailsStore.serialize(initial.routing, async () => {
+      const details = this.#gitApprovalDetailsStore?.get(initial.routing);
+      if (details === undefined) return;
+      const fallback = this.#formatActionableMessage(
+        "Git操作の承認期限が切れました。この計画は実行できません。",
+        this.#sourceUserMention !== undefined,
+      );
+      const blocks = buildExpiredWorkspaceGitApprovalBlocks(
+        details.plan,
+        new Date(details.expiresAt).toISOString(),
+      );
+      const updated = await retryTerminalSlackUpdate(() =>
+        this.#client.chat.update({
+          channel: details.routing.channelId,
+          ts: details.routing.messageTs,
+          text: fallback,
+          blocks:
+            details.sourceUserMention === undefined
+              ? blocks
+              : [sourceMentionBlock(details.sourceUserMention), ...blocks],
+        }).then(() => undefined)
+      );
+      if (updated) this.#gitApprovalDetailsStore?.forget(details.routing);
+      // If every bounded update attempt fails, retain the exact route. A stale
+      // click can then retry the same cosmetic terminal update without ever
+      // resolving or reconstructing the expired App Server request.
+    });
   }
 
   async #postApproval(
@@ -997,4 +1081,19 @@ function isSlackMessageTooLong(error: unknown): boolean {
     (typeof record.message === "string" &&
       /\bmsg_too_long\b/u.test(record.message))
   );
+}
+
+async function retryTerminalSlackUpdate(
+  update: () => Promise<void>,
+): Promise<boolean> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await update();
+      return true;
+    } catch {
+      const delayMs = TERMINAL_UPDATE_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined) return false;
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }

@@ -114,6 +114,7 @@ class StructuredInputFakeAdapter extends FakeAdapter {
     yield {
       type: "user_input.requested",
       requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+      expiresAt: "2099-08-14T11:00:00.000Z",
       prompt: "Approve?",
       options: [
         { id: "approve", label: "承認して実行" },
@@ -122,6 +123,7 @@ class StructuredInputFakeAdapter extends FakeAdapter {
       plan: {
         operationId: "22222222-2222-4222-8222-222222222222",
         planHash: "a".repeat(64),
+        approvalTarget: "primary",
         operation: "git_publication",
         repoId: "reviewer",
         mode: "commit_only",
