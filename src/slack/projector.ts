@@ -6,8 +6,13 @@ import { buildApprovalBlocks } from "./blocks.js";
 import { buildGitApprovalRecoveryBlocks } from "./git-approval-recovery-blocks.js";
 import { buildChoiceBlocks } from "./choice-blocks.js";
 import {
+  StructuredChoiceContinuationStore,
+  buildChoiceContinuationBlocks,
+} from "./choice-continuation.js";
+import {
   WorkspaceGitApprovalDetailsStore,
   buildExpiredWorkspaceGitApprovalBlocks,
+  buildUnavailableWorkspaceGitApprovalBlocks,
   buildWorkspaceGitApprovalBlocks,
 } from "./user-input-blocks.js";
 import { uploadSlackAttachments } from "./file-upload.js";
@@ -59,6 +64,7 @@ export interface SlackThreadProjectorOptions {
   readonly heartbeatScheduler?: HeartbeatScheduler;
   readonly maxFinalChunks?: number;
   readonly gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
+  readonly choiceContinuationStore?: StructuredChoiceContinuationStore;
   readonly attachmentUploader?: AttachmentUploader;
 }
 
@@ -73,6 +79,7 @@ export class SlackThreadProjector {
   readonly #heartbeatScheduler: HeartbeatScheduler;
   readonly #maxFinalChunks: number;
   readonly #gitApprovalDetailsStore: WorkspaceGitApprovalDetailsStore | undefined;
+  readonly #choiceContinuationStore: StructuredChoiceContinuationStore | undefined;
   readonly #attachmentUploader: AttachmentUploader;
   readonly #startedAtMs: number;
   #messageTs: string | undefined;
@@ -127,6 +134,7 @@ export class SlackThreadProjector {
       options.heartbeatScheduler ?? scheduleHeartbeat;
     this.#maxFinalChunks = options.maxFinalChunks ?? MAX_FINAL_CHUNKS;
     this.#gitApprovalDetailsStore = options.gitApprovalDetailsStore;
+    this.#choiceContinuationStore = options.choiceContinuationStore;
     this.#attachmentUploader =
       options.attachmentUploader ??
       ((client, channelId, rootThreadTs, attachments) =>
@@ -205,10 +213,16 @@ export class SlackThreadProjector {
       case "git_approval.expired":
         await this.#expireGitApproval(event.requestId);
         break;
+      case "git_approval.resolved_externally":
+        await this.#resolveGitApprovalExternally(event.requestId);
+        break;
       case "choice.requested":
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
         await this.#postChoice(event);
+        break;
+      case "choice.resolved_externally":
+        await this.#resolveChoiceExternally(event.requestId);
         break;
       case "git_approval.reprepare_required":
         this.#turnActivityStarted = true;
@@ -841,9 +855,38 @@ export class SlackThreadProjector {
             : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
       });
     } catch (error) {
-      this.#gitApprovalDetailsStore?.forget(routing);
+      // Keep the exact message route so the frontend can compensate by
+      // terminalizing the placeholder after it records a private rejection.
       throw error;
     }
+  }
+
+  async #resolveGitApprovalExternally(requestId: string): Promise<void> {
+    const initial = this.#gitApprovalDetailsStore?.getForRequest(
+      requestId,
+      this.#channelId,
+      this.#rootThreadTs,
+    );
+    if (initial === undefined || this.#gitApprovalDetailsStore === undefined) return;
+    await this.#gitApprovalDetailsStore.serialize(initial.routing, async () => {
+      const details = this.#gitApprovalDetailsStore?.get(initial.routing);
+      if (details === undefined) return;
+      const fallback =
+        "このGit承認は別のCodexクライアントで解決されました。Slackからは実行できません。";
+      const blocks = buildUnavailableWorkspaceGitApprovalBlocks();
+      const updated = await retryTerminalSlackUpdate(() =>
+        this.#client.chat.update({
+          channel: details.routing.channelId,
+          ts: details.routing.messageTs,
+          text: fallback,
+          blocks:
+            details.sourceUserMention === undefined
+              ? blocks
+              : [sourceMentionBlock(details.sourceUserMention), ...blocks],
+        }).then(() => undefined)
+      );
+      if (updated) this.#gitApprovalDetailsStore?.forget(initial.routing);
+    });
   }
 
   async #expireGitApproval(requestId: string): Promise<void> {
@@ -917,6 +960,23 @@ export class SlackThreadProjector {
     });
   }
 
+  async #resolveChoiceExternally(requestId: string): Promise<void> {
+    const continuation = this.#choiceContinuationStore?.resolveExternally(requestId);
+    if (continuation === undefined) return;
+    const blocks = buildChoiceContinuationBlocks(continuation);
+    await this.#client.chat.update({
+      channel: continuation.channelId,
+      ts: continuation.messageTs,
+      text:
+        "Codex側の元の質問は先に終了しました。" +
+        "この選択を通常の新しいターンとして送信できます。",
+      blocks:
+        continuation.responderUserId === undefined
+          ? blocks
+          : [sourceMentionBlock(`<@${continuation.responderUserId}>`), ...blocks],
+    });
+  }
+
   async #postChoice(
     event: Extract<AgentEvent, { type: "choice.requested" }>,
   ): Promise<void> {
@@ -954,6 +1014,21 @@ export class SlackThreadProjector {
           ? blocks
           : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
     });
+    if (this.#sessionId !== undefined) {
+      this.#choiceContinuationStore?.rememberDisplayed({
+        requestId: event.requestId,
+        sessionId: this.#sessionId,
+        question: event.question,
+        completedAnswers: event.completedAnswers,
+        channelId: this.#channelId,
+        rootThreadTs: this.#rootThreadTs,
+        messageTs: posted.ts,
+        ...(this.#sourceUserId === undefined
+          ? {}
+          : { responderUserId: this.#sourceUserId }),
+        expiresAt: Date.parse(event.expiresAt),
+      });
+    }
   }
 
   async #postGitApprovalRecovery(

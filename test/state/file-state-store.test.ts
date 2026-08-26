@@ -26,6 +26,14 @@ test("persists state with owner-only file permissions", async () => {
       agents: [{ id: "implementer", adapter: "codex", channelId: "C123" }],
       handledDelegationResults: ["delegation-result-1"],
       usedContinuationDelegations: ["delegation-continuation-1"],
+      pendingWorkspaceGitSystemRejections: [{
+        operationId: "11111111-1111-4111-8111-111111111111",
+        planHash: "a".repeat(64),
+        approvalTarget: "primary",
+        repoId: "showtalk-taishi",
+        expiresAt: "2099-08-26T20:00:00.000Z",
+        actor: "showtalk:external-app-server-resolution" as const,
+      }],
     },
   };
   await store.save(state);

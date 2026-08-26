@@ -4,6 +4,7 @@ import test from "node:test";
 import type { WebClient } from "@slack/web-api";
 
 import { SlackThreadProjector } from "../../src/slack/projector.js";
+import { StructuredChoiceContinuationStore } from "../../src/slack/choice-continuation.js";
 import { WorkspaceGitApprovalDetailsStore } from "../../src/slack/user-input-blocks.js";
 
 function recordingClient(): {
@@ -633,6 +634,8 @@ test("projects an ordinary model question as non-Git Slack choices", async () =>
   await projector.project({
     type: "choice.requested",
     requestId: "codex-choice:11111111-1111-4111-8111-111111111111",
+    expiresAt: "2030-01-01T00:00:00.000Z",
+    completedAnswers: [],
     question: {
       id: "question_1",
       header: "地形",
@@ -654,6 +657,56 @@ test("projects an ordinary model question as non-Git Slack choices", async () =>
   assert.match(rendered, /乾燥岩盤平原/u);
   assert.match(rendered, /その他を入力/u);
   assert.doesNotMatch(rendered, /Git操作|承認して実行|拒否・保留/u);
+});
+
+test("replaces an externally resolved ordinary choice with a new-turn continuation", async () => {
+  const { client, updates } = recordingClient();
+  const store = new StructuredChoiceContinuationStore(
+    () => Date.parse("2026-08-27T00:00:00.000Z"),
+  );
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    choiceContinuationStore: store,
+  });
+  projector.setSessionId("session_1");
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111112";
+
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: "2026-08-27T00:10:00.000Z",
+    completedAnswers: [{
+      header: "対象",
+      prompt: "対象repoを選んでください",
+      answers: ["showtalk-taishi"],
+    }],
+    question: {
+      id: "question_1",
+      header: "公開設定",
+      prompt: "main保護を設定しますか？",
+      options: [
+        { id: "option_1", label: "承認して実行", description: "設定する" },
+        { id: "option_2", label: "拒否・保留", description: "設定しない" },
+      ],
+      allowsOther: false,
+    },
+  });
+  await projector.project({ type: "choice.resolved_externally", requestId });
+
+  const continuation = store.getForOriginalRequest(requestId);
+  assert.ok(continuation);
+  assert.equal(continuation.sessionId, "session_1");
+  assert.deepEqual(continuation.completedAnswers, [{
+    header: "対象",
+    prompt: "対象repoを選んでください",
+    answers: ["showtalk-taishi"],
+  }]);
+  const terminalUpdate = updates.at(-1);
+  assert.equal(terminalUpdate?.ts, "102.1");
+  const rendered = JSON.stringify(terminalUpdate?.blocks);
+  assert.match(rendered, /通常の新しいターン/u);
+  assert.match(rendered, /taishi\.choice_continue\.select\.option_1/u);
+  assert.doesNotMatch(rendered, /codex-choice:/u);
 });
 
 test("projects an exact workspace-git plan as Slack buttons in the originating thread", async () => {
@@ -700,6 +753,58 @@ test("projects an exact workspace-git plan as Slack buttons in the originating t
   assert.match(blocks, /拒否・保留/u);
   assert.match(blocks, /22222222-2222-4222-8222-222222222222/u);
   assert.match(blocks, /squash/u);
+});
+
+test("projects GitHub repository settings as an exact Slack approval card", async () => {
+  const { client, posts, updates } = recordingClient();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    gitApprovalDetailsStore: new WorkspaceGitApprovalDetailsStore(),
+  });
+
+  await projector.project({
+    type: "user_input.requested",
+    requestId: "codex-input:33333333-3333-4333-8333-333333333333",
+    expiresAt: "2099-08-26T11:00:00.000Z",
+    prompt: "Repository設定を承認しますか？",
+    options: [
+      { id: "approve", label: "承認して実行" },
+      { id: "reject", label: "拒否・保留" },
+    ],
+    plan: {
+      operationId: "33333333-3333-4333-8333-333333333333",
+      planHash: "f".repeat(64),
+      approvalTarget: "repo_settings_showtalk-taishi",
+      operation: "github_repository_settings",
+      repoId: "showtalk-taishi",
+      mode: "repository_settings",
+      paths: [],
+      repositorySettingsBefore: {
+        description: "Old description",
+        topics: ["slack"],
+        dependabotSecurityUpdates: "disabled",
+      },
+      repositorySettingsDesired: {
+        description: "New description",
+        dependabotSecurityUpdates: true,
+      },
+      repositorySettingsResultingState: {
+        description: "New description",
+        topics: ["slack"],
+        dependabotSecurityUpdates: "enabled",
+      },
+      expiresAt: "2026-08-26T20:00:00+09:00",
+    },
+  });
+
+  assert.equal(posts.length, 2);
+  const approvalUpdate = updates.find((update) => update.ts === "102.1");
+  const rendered = JSON.stringify(approvalUpdate?.blocks);
+  assert.match(rendered, /GitHub Repository設定を変更/u);
+  assert.match(rendered, /Old description/u);
+  assert.match(rendered, /New description/u);
+  assert.match(rendered, /承認して実行/u);
+  assert.doesNotMatch(rendered, /変更ファイル|Branch|Worktree/u);
 });
 
 test("projects Git approvals with the file list collapsed when toggle state is available", async () => {
@@ -850,6 +955,133 @@ test("keeps an expired Git card retryable when the terminal Slack update fails",
     JSON.stringify(updates.at(-1)?.blocks),
     /承認して実行|拒否・保留|"type":"button"/u,
   );
+});
+
+test("terminalizes a Git approval card resolved by another App Server client", async () => {
+  const { client, updates } = recordingClient();
+  const detailsStore = new WorkspaceGitApprovalDetailsStore();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    gitApprovalDetailsStore: detailsStore,
+  });
+  const requestId = "codex-input:44444444-4444-4444-8444-444444444444";
+  const plan = {
+    operationId: "55555555-5555-4555-8555-555555555555",
+    planHash: "a".repeat(64),
+    approvalTarget: "primary",
+    operation: "git_publication" as const,
+    repoId: "showtalk-taishi",
+    mode: "commit_only" as const,
+    branch: "agent/external-resolution",
+    paths: ["src/slack/projector.ts"],
+    expectedHead: "b".repeat(40),
+    expectedSnapshotId: "c".repeat(64),
+    worktreeId: "primary",
+    expiresAt: "2099-08-14T11:00:00.000Z",
+  };
+
+  await projector.project({
+    type: "user_input.requested",
+    requestId,
+    expiresAt: plan.expiresAt,
+    prompt: "Approve?",
+    options: [
+      { id: "approve", label: "承認して実行" },
+      { id: "reject", label: "拒否・保留" },
+    ],
+    plan,
+  });
+  const routing = {
+    version: 1 as const,
+    requestId,
+    channelId: "C1",
+    rootThreadTs: "100.0",
+    messageTs: "102.1",
+  };
+  assert.ok(detailsStore.get(routing));
+
+  await projector.project({
+    type: "git_approval.resolved_externally",
+    requestId,
+    plan,
+  });
+
+  const terminal = updates.at(-1);
+  assert.match(String(terminal?.text), /別のCodexクライアント/u);
+  assert.doesNotMatch(
+    JSON.stringify(terminal?.blocks),
+    /承認して実行|拒否・保留|"type":"button"/u,
+  );
+  assert.equal(detailsStore.get(routing), undefined);
+});
+
+test("keeps an externally resolved Git card retryable after terminal Slack update failure", async () => {
+  let postCount = 0;
+  let terminalFailures = 3;
+  const client = {
+    chat: {
+      postMessage: async () => ({ ok: true, ts: `${101 + postCount++}.1` }),
+      update: async (input: Record<string, unknown>) => {
+        if (
+          String(input.text).includes("別のCodexクライアント") &&
+          terminalFailures-- > 0
+        ) {
+          throw new Error("temporary Slack failure");
+        }
+        return { ok: true };
+      },
+    },
+  } as unknown as WebClient;
+  const detailsStore = new WorkspaceGitApprovalDetailsStore();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    gitApprovalDetailsStore: detailsStore,
+  });
+  const requestId = "codex-input:66666666-6666-4666-8666-666666666666";
+  const plan = {
+    operationId: "77777777-7777-4777-8777-777777777777",
+    planHash: "d".repeat(64),
+    approvalTarget: "primary",
+    operation: "git_publication" as const,
+    repoId: "showtalk-taishi",
+    mode: "commit_only" as const,
+    branch: "agent/external-retry",
+    paths: ["src/slack/projector.ts"],
+    expectedHead: "e".repeat(40),
+    expectedSnapshotId: "f".repeat(64),
+    worktreeId: "primary",
+    expiresAt: "2099-08-14T11:00:00.000Z",
+  };
+  const routing = {
+    version: 1 as const,
+    requestId,
+    channelId: "C1",
+    rootThreadTs: "100.0",
+    messageTs: "102.1",
+  };
+
+  await projector.project({
+    type: "user_input.requested",
+    requestId,
+    expiresAt: plan.expiresAt,
+    prompt: "Approve?",
+    options: [
+      { id: "approve", label: "承認して実行" },
+      { id: "reject", label: "拒否・保留" },
+    ],
+    plan,
+  });
+  await projector.project({
+    type: "git_approval.resolved_externally",
+    requestId,
+    plan,
+  });
+  assert.ok(detailsStore.get(routing));
+  await projector.project({
+    type: "git_approval.resolved_externally",
+    requestId,
+    plan,
+  });
+  assert.equal(detailsStore.get(routing), undefined);
 });
 
 test("projects one safe recovery choice when an exact Git plan is unavailable", async () => {

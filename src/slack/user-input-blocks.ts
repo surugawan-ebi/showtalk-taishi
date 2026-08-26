@@ -163,16 +163,18 @@ export function buildWorkspaceGitApprovalBlocks(
       },
     },
   ];
-  blocks.push(pathSummaryBlock(plan.paths.length, value, {
-    pathsExpanded,
-    allowPathToggle,
-  }));
-  if (pathsExpanded) {
-    const pathChunks = exactPathChunks(plan.paths);
-    blocks.push(...pathChunks.map((text): KnownBlock => ({
-      type: "section",
-      text: { type: "plain_text", text, emoji: false },
-    })));
+  if (plan.operation !== "github_repository_settings") {
+    blocks.push(pathSummaryBlock(plan.paths.length, value, {
+      pathsExpanded,
+      allowPathToggle,
+    }));
+    if (pathsExpanded) {
+      const pathChunks = exactPathChunks(plan.paths);
+      blocks.push(...pathChunks.map((text): KnownBlock => ({
+        type: "section",
+        text: { type: "plain_text", text, emoji: false },
+      })));
+    }
   }
   for (const [label, value] of exactPlanTexts(plan)) {
     blocks.push(...exactTextChunks(label, value).map((text): KnownBlock => ({
@@ -245,12 +247,7 @@ export function buildExpiredWorkspaceGitApprovalBlocks(
     },
     {
       type: "section",
-      fields: [
-        field("操作", operationLabel(plan.operation)),
-        field("Repository", plan.repoId),
-        field("Branch", plan.branch),
-        field("Mode", plan.mode),
-      ],
+      fields: planFields(plan).slice(0, 4),
     },
     {
       type: "context",
@@ -353,6 +350,14 @@ function planFields(
   plan: WorkspaceGitApprovalPlan,
 ): Array<{ type: "mrkdwn"; text: string }> {
   const operation = operationLabel(plan.operation);
+  if (plan.operation === "github_repository_settings") {
+    return [
+      field("操作", operation),
+      field("Repository", plan.repoId),
+      field("Mode", plan.mode),
+      field("変更項目", repositorySettingsChangedFields(plan).join(", ")),
+    ];
+  }
   const fields = [
     field("操作", operation),
     field("Repository", plan.repoId),
@@ -481,6 +486,24 @@ function exactPathChunks(paths: readonly string[]): string[] {
 function exactPlanTexts(
   plan: WorkspaceGitApprovalPlan,
 ): ReadonlyArray<readonly [string, string]> {
+  if (plan.operation === "github_repository_settings") {
+    return [
+      [
+        "変更前のRepository設定",
+        JSON.stringify(repositorySettingsStateForDisplay(plan.repositorySettingsBefore)),
+      ],
+      [
+        "承認する変更内容",
+        JSON.stringify(repositorySettingsDesiredForDisplay(plan.repositorySettingsDesired)),
+      ],
+      [
+        "承認後のRepository設定",
+        JSON.stringify(
+          repositorySettingsStateForDisplay(plan.repositorySettingsResultingState),
+        ),
+      ],
+    ];
+  }
   return [
     ...(plan.commitMessage === undefined
       ? []
@@ -535,7 +558,55 @@ function operationLabel(operation: WorkspaceGitApprovalPlan["operation"]): strin
       return "Pull RequestをReady化";
     case "pull_request_merge":
       return "Pull Requestをmerge";
+    case "github_repository_settings":
+      return "GitHub Repository設定を変更";
   }
+}
+
+function repositorySettingsChangedFields(
+  plan: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>,
+): string[] {
+  const fields: string[] = [];
+  if (Object.hasOwn(plan.repositorySettingsDesired, "description")) {
+    fields.push("description");
+  }
+  if (Object.hasOwn(plan.repositorySettingsDesired, "topics")) {
+    fields.push("topics");
+  }
+  if (Object.hasOwn(plan.repositorySettingsDesired, "dependabotSecurityUpdates")) {
+    fields.push("Dependabot Security Updates");
+  }
+  return fields;
+}
+
+function repositorySettingsStateForDisplay(
+  state: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsBefore"],
+): Record<string, unknown> {
+  return {
+    description: state.description,
+    topics: state.topics,
+    dependabot_security_updates: state.dependabotSecurityUpdates,
+  };
+}
+
+function repositorySettingsDesiredForDisplay(
+  desired: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsDesired"],
+): Record<string, unknown> {
+  return {
+    ...(Object.hasOwn(desired, "description")
+      ? { description: desired.description }
+      : {}),
+    ...(Object.hasOwn(desired, "topics") ? { topics: desired.topics } : {}),
+    ...(Object.hasOwn(desired, "dependabotSecurityUpdates")
+      ? { dependabot_security_updates: desired.dependabotSecurityUpdates }
+      : {}),
+  };
 }
 
 function escapeSlack(value: string): string {

@@ -7,8 +7,10 @@ import {
   CoreError,
   type DelegationResultMessage,
   type GatewayAgentEvent,
+  type WorkspaceGitApprovalPlan,
 } from "../../src/core/index.js";
 import { projectDelegationContinuation } from "../../src/slack/delegation-continuation.js";
+import { WorkspaceGitApprovalDetailsStore } from "../../src/slack/user-input-blocks.js";
 
 const request: DelegationResultMessage = {
   delegationId: "delegation-1",
@@ -23,6 +25,21 @@ const request: DelegationResultMessage = {
   depth: 1,
   result: "レビュー結果そのもの",
 };
+
+const externallyResolvedGitPlan = {
+  operationId: "22222222-2222-4222-8222-222222222222",
+  planHash: "a".repeat(64),
+  approvalTarget: "primary",
+  operation: "git_publication",
+  repoId: "mini-all",
+  mode: "commit_only",
+  branch: "codex/external-resolution",
+  paths: ["src/fix.ts"],
+  expectedHead: "b".repeat(40),
+  expectedSnapshotId: "c".repeat(64),
+  worktreeId: "primary",
+  expiresAt: "2099-08-14T11:00:00.000Z",
+} satisfies WorkspaceGitApprovalPlan;
 
 test("projects a delayed result as the source Koe final reply", async () => {
   const posts: Array<Record<string, unknown>> = [];
@@ -183,7 +200,23 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
     /Slack update failed/u,
   );
 
-  assert.deepEqual(rejected, [
+  assert.equal(rejected.length, 1);
+  const failure = rejected[0] as {
+    readonly kind: string;
+    readonly plan: WorkspaceGitApprovalPlan;
+    readonly sessionId: string;
+    readonly channelId: string;
+    readonly rootThreadTs: string;
+    readonly requestId: string;
+  };
+  assert.deepEqual(
+    {
+      kind: failure.kind,
+      sessionId: failure.sessionId,
+      channelId: failure.channelId,
+      rootThreadTs: failure.rootThreadTs,
+      requestId: failure.requestId,
+    },
     {
       kind: "git_approval",
       sessionId: "source-session",
@@ -191,9 +224,115 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
       rootThreadTs: "100.1",
       requestId: "codex-input:11111111-1111-4111-8111-111111111111",
     },
-  ]);
+  );
+  assert.equal(
+    failure.plan.operationId,
+    "22222222-2222-4222-8222-222222222222",
+  );
   assert.ok(posts.length >= 2);
   assert.ok(updates.length >= 1);
+});
+
+test("settles an externally resolved delayed Git request even when terminal Slack projection fails", async () => {
+  const posts: Array<Record<string, unknown>> = [];
+  const client = {
+    chat: {
+      postMessage: async (input: Record<string, unknown>) => {
+        posts.push(input);
+        return { ok: true, ts: `${100 + posts.length}.1` };
+      },
+      update: async (input: Record<string, unknown>) => {
+        if (String(input.text).includes("別のCodexクライアント")) {
+          throw new Error("terminal Slack update failed");
+        }
+        return { ok: true };
+      },
+    },
+  } as unknown as WebClient;
+  const plan = externallyResolvedGitPlan;
+  const settled: string[] = [];
+
+  await projectDelegationContinuation(
+    client,
+    request,
+    events([
+        gatewayEvent({
+          type: "user_input.requested",
+          requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+          expiresAt: plan.expiresAt,
+          prompt: "Approve?",
+          options: [
+            { id: "approve", label: "承認して実行" },
+            { id: "reject", label: "拒否・保留" },
+          ],
+          plan,
+        }),
+        gatewayEvent({
+          type: "git_approval.resolved_externally",
+          requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+          plan,
+        }),
+        gatewayEvent({ type: "status.changed", status: "idle" }),
+    ]),
+    {},
+    undefined,
+    undefined,
+    new WorkspaceGitApprovalDetailsStore(),
+    async (event) => {
+      settled.push(event.plan.operationId);
+    },
+  );
+
+  assert.deepEqual(settled, [plan.operationId]);
+});
+
+test("terminalizes an externally resolved delayed Git card even when private settlement fails", async () => {
+  const posts: Array<Record<string, unknown>> = [];
+  const updates: Array<Record<string, unknown>> = [];
+  const client = fakeClient(posts, updates);
+  const requestId = "codex-input:99999999-9999-4999-8999-999999999999";
+
+  await assert.rejects(
+    projectDelegationContinuation(
+      client,
+      request,
+      events([
+        gatewayEvent({
+          type: "user_input.requested",
+          requestId,
+          expiresAt: externallyResolvedGitPlan.expiresAt,
+          prompt: "Approve?",
+          options: [
+            { id: "approve", label: "承認して実行" },
+            { id: "reject", label: "拒否・保留" },
+          ],
+          plan: externallyResolvedGitPlan,
+        }),
+        gatewayEvent({
+          type: "git_approval.resolved_externally",
+          requestId,
+          plan: externallyResolvedGitPlan,
+        }),
+      ]),
+      {},
+      undefined,
+      undefined,
+      new WorkspaceGitApprovalDetailsStore(),
+      async () => {
+        throw new Error("private broker unavailable");
+      },
+    ),
+    /private broker unavailable/u,
+  );
+
+  const terminalUpdate = updates.find((update) =>
+    String(update.text).includes("別のCodexクライアント"),
+  );
+  assert.match(String(terminalUpdate?.text), /別のCodexクライアント/u);
+  assert.doesNotMatch(
+    JSON.stringify(terminalUpdate?.blocks),
+    /承認して実行|拒否・保留|"type":"button"/u,
+  );
 });
 
 test("cancels a delayed native approval when its Slack buttons cannot be projected", async () => {

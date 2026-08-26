@@ -43,6 +43,7 @@ import {
 } from "./workspace-git-approval.js";
 import {
   hasFullTurnItems,
+  sameExactWorkspaceGitApprovalPlan,
   WorkspaceGitApprovalLifecycle,
 } from "./workspace-git-approval-lifecycle.js";
 import {
@@ -52,7 +53,7 @@ import {
 } from "./image-generation.js";
 import type { WorkspaceGitApprovalPlan } from "../../core/index.js";
 import {
-  looksLikeWorkspaceGitApproval,
+  hasWorkspaceGitApprovalQuestionId,
   validateOrdinaryChoiceRequest,
   type ValidatedChoiceQuestion,
 } from "./structured-input.js";
@@ -80,6 +81,7 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "ShowTalk Taishi Git approval routing rules:",
   "- A Git approval belongs to the Koe that called workspace-git prepare_* and to the Slack thread that started that same turn.",
   "- When workspace-git returns awaiting_human_approval, immediately call request_user_input in that same turn with exactly two options named `承認して実行` and `拒否・保留`.",
+  "- Those labels alone never create workspace-git authority. For an external write that workspace-git does not implement, use a non-`git_approval` question ID and state the exact target, scope, and impact in the structured question.",
   "- A `承認して実行` answer returned from that exact request_user_input is a fresh authenticated human decision. It is not the assistant approving its own plan, even though App Server resumes the same turn after the human interaction.",
   "- Before the App Server receives `承認して実行`, ShowTalk records the bound human decision through workspace-git's model-inaccessible private broker. Continue the resumed turn instead of ending with prose or deferring execution to another user message. Re-read the exact workspace-git operation status and call the matching execute_approved_* tool exactly once when it is approved and operation ID, full plan hash, approval target, worktree, HEAD/snapshot or PR state, scope, and expiry still match.",
   "- One App Server turn has a pre-approval phase and a post-approval phase separated by the blocking request_user_input. A generic rule that forbids autonomous prepare-and-execute in one turn applies to the pre-approval phase; it does not require another Slack message after the bound human response. The post-approval phase may execute only the exact approved plan.",
@@ -153,6 +155,11 @@ interface PendingChoiceUserInput {
 
 type PendingUserInput = PendingGitUserInput | PendingChoiceUserInput;
 
+interface ExternallyResolvedGitUserInput {
+  readonly sessionId: string;
+  readonly plan: WorkspaceGitApprovalPlan;
+}
+
 interface PendingUserInputBinding {
   readonly rpcId: RpcId;
   readonly serverRequest: ServerRequestEvent;
@@ -161,6 +168,19 @@ interface PendingUserInputBinding {
   readonly queue: AsyncEventQueue;
   readonly receivedAt: number;
   readonly expirationTimer: NodeJS.Timeout;
+}
+
+interface ExternallyResolvedUserInputBinding {
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly queue: AsyncEventQueue;
+}
+
+interface PendingExternalGitRejection {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly plan: WorkspaceGitApprovalPlan;
+  readonly queue: AsyncEventQueue;
 }
 
 export interface CodexAdapterOptions {
@@ -180,8 +200,14 @@ export interface CodexAdapterOptions {
   ambiguousStartRetryMs?: number;
   externalTurnPollMs?: number;
   externalTurnWaitMs?: number;
+  /** Delay between durable external Git rejection write retries. */
+  externalGitRejectionRetryMs?: number;
   /** Per-thread Codex config overrides, used to attach the authenticated Taishi MCP. */
   threadConfig?: Readonly<Record<string, JsonValue>>;
+  /** Durably rejects a private plan before an external-resolution event is released. */
+  recordExternallyResolvedGitPlan?: (
+    plan: WorkspaceGitApprovalPlan,
+  ) => Promise<void>;
 }
 
 export interface CodexRuntimeModelSettings {
@@ -216,6 +242,7 @@ export class CodexAdapter implements AgentAdapter {
     ambiguousStartRetryMs: number;
     externalTurnPollMs: number;
     externalTurnWaitMs: number;
+    externalGitRejectionRetryMs: number;
     threadConfig?: Readonly<Record<string, JsonValue>>;
   };
   readonly #activeTurns = new Map<string, string>();
@@ -223,7 +250,26 @@ export class CodexAdapter implements AgentAdapter {
   readonly #statuses = new Map<string, AgentStatus>();
   readonly #pendingApprovals = new Map<string, PendingApproval>();
   readonly #pendingUserInputs = new Map<string, PendingUserInput>();
+  readonly #externallyResolvedGitUserInputs = new Map<
+    string,
+    ExternallyResolvedGitUserInput
+  >();
   readonly #pendingUserInputBindings = new Map<string, PendingUserInputBinding>();
+  readonly #externallyResolvedUserInputBindings = new Map<
+    string,
+    ExternallyResolvedUserInputBinding
+  >();
+  readonly #externalResolutionSettlementsBySession = new Map<
+    string,
+    Promise<void>
+  >();
+  readonly #pendingExternalGitRejections = new Map<
+    string,
+    PendingExternalGitRejection
+  >();
+  readonly #recordExternallyResolvedGitPlan:
+    | ((plan: WorkspaceGitApprovalPlan) => Promise<void>)
+    | undefined;
   readonly #workspaceGitApprovals = new WorkspaceGitApprovalLifecycle();
   readonly #activeQueues = new Map<string, AsyncEventQueue>();
   readonly #deferredServerRequestsBySession = new Map<
@@ -241,6 +287,8 @@ export class CodexAdapter implements AgentAdapter {
   constructor(client: CodexAppServer, options: CodexAdapterOptions = {}) {
     this.#client = client;
     this.kind = options.kind ?? "codex";
+    this.#recordExternallyResolvedGitPlan =
+      options.recordExternallyResolvedGitPlan;
     this.#options = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.reasoningEffort === undefined
@@ -263,6 +311,8 @@ export class CodexAdapter implements AgentAdapter {
       ambiguousStartRetryMs: options.ambiguousStartRetryMs ?? 100,
       externalTurnPollMs: options.externalTurnPollMs ?? 1_000,
       externalTurnWaitMs: options.externalTurnWaitMs ?? 30 * 60 * 1_000,
+      externalGitRejectionRetryMs:
+        options.externalGitRejectionRetryMs ?? 1_000,
     };
     if (
       this.#options.approvalTimeoutMs < 1 ||
@@ -272,7 +322,8 @@ export class CodexAdapter implements AgentAdapter {
       this.#options.terminalWatchdogMaxRetries < 1 ||
       this.#options.ambiguousStartRetryMs < 1 ||
       this.#options.externalTurnPollMs < 1 ||
-      this.#options.externalTurnWaitMs < 1
+      this.#options.externalTurnWaitMs < 1 ||
+      this.#options.externalGitRejectionRetryMs < 1
     ) {
       throw new Error("Codex adapter timeouts must be positive");
     }
@@ -303,6 +354,33 @@ export class CodexAdapter implements AgentAdapter {
       new Error("ShowTalk Taishi is shutting down the Codex adapter"),
       true,
     );
+  }
+
+  /** Waits until every already-captured external Git rejection is durable. */
+  async waitForSystemRejections(): Promise<void> {
+    const sessionIds = new Set(
+      [...this.#pendingExternalGitRejections.values()]
+        .map((pending) => pending.sessionId),
+    );
+    await Promise.all(
+      [...sessionIds].map((sessionId) =>
+        this.#waitForSessionSystemRejections(sessionId)
+      ),
+    );
+  }
+
+  async #waitForSessionSystemRejections(sessionId: string): Promise<void> {
+    while (
+      [...this.#pendingExternalGitRejections.values()]
+        .some((pending) => pending.sessionId === sessionId)
+    ) {
+      this.#startExternalGitRejectionWorker(sessionId);
+      const task = this.#externalResolutionSettlementsBySession.get(sessionId);
+      if (task === undefined) {
+        throw new Error("External Git rejections are pending without a worker");
+      }
+      await task;
+    }
   }
 
   async createSession(request: CreateSessionRequest): Promise<AdapterSession> {
@@ -388,7 +466,7 @@ export class CodexAdapter implements AgentAdapter {
       terminalWatchdog = setTimeout(() => {
         void this.#reconcileTurnStatus(session.id, queue).then(async (result) => {
           if (result === "terminal") {
-            this.#rejectPendingUserInputBindings(
+            await this.#rejectPendingUserInputBindings(
               session.id,
               queue,
               "The Codex turn ended before its workspace-git plan could be bound",
@@ -423,7 +501,7 @@ export class CodexAdapter implements AgentAdapter {
               this.#activeTurns.delete(session.id);
               this.#runningSessions.delete(session.id);
               this.#statuses.set(session.id, "failed");
-              this.#rejectPendingUserInputBindings(
+              await this.#rejectPendingUserInputBindings(
                 session.id,
                 queue,
                 "The Codex turn could not be reconciled with thread/read",
@@ -469,7 +547,7 @@ export class CodexAdapter implements AgentAdapter {
       turn: Record<string, unknown> | undefined,
       event: AgentEvent | undefined,
     ): Promise<void> => {
-      this.#rejectPendingUserInputBindings(
+      await this.#rejectPendingUserInputBindings(
         session.id,
         queue,
         "The Codex turn completed before its workspace-git plan could be bound",
@@ -477,11 +555,12 @@ export class CodexAdapter implements AgentAdapter {
       clearTerminalWatchdog();
       this.#activeTurns.delete(session.id);
       const status = turnStatus(params);
-      const approvedPlan = this.#workspaceGitApprovals.approvedPlan(session.id);
+      const hasExecutionWatch =
+        this.#workspaceGitApprovals.hasExecutionWatch(session.id);
       let finalTurn = turn;
       const completedTurnId = notificationTurnId(params);
       if (
-        approvedPlan !== undefined &&
+        hasExecutionWatch &&
         !hasFullTurnItems(finalTurn) &&
         completedTurnId !== undefined
       ) {
@@ -490,7 +569,7 @@ export class CodexAdapter implements AgentAdapter {
           finalTurn;
         if (terminal || failed) return;
       }
-      if (approvedPlan !== undefined) {
+      if (hasExecutionWatch) {
         this.#observeApprovedGitTurnSnapshot(session.id, finalTurn, queue);
       }
       const completion = this.#workspaceGitApprovals.assessTurnCompletion(
@@ -576,7 +655,7 @@ export class CodexAdapter implements AgentAdapter {
         (typeof notification?.requestId === "string" ||
           typeof notification?.requestId === "number")
       ) {
-        this.#removePendingServerRequestByRpcId(notification.requestId);
+        this.#removePendingServerRequestByRpcId(notification.requestId, queue);
       }
       const item = asRecord(notification?.item);
       if (method === "item/started" && typeof item?.id === "string") {
@@ -592,6 +671,10 @@ export class CodexAdapter implements AgentAdapter {
           );
           if (capture !== undefined) {
             this.#rememberWorkspaceGitPlan(session.id, capture.turnId, capture.plan);
+            this.#queueExternallyResolvedUserInputPlans(
+              session.id,
+              capture.turnId,
+            );
             // Let adjacent App Server completion notifications settle before
             // deciding that exactly one plan exists. This preserves the
             // fail-closed rule when parallel prepares complete together.
@@ -786,7 +869,7 @@ export class CodexAdapter implements AgentAdapter {
       this.#activeQueues.delete(session.id);
       this.#removePendingApprovals(session.id);
       this.#removePendingUserInputs(session.id);
-      this.#rejectPendingUserInputBindings(
+      await this.#rejectPendingUserInputBindings(
         session.id,
         queue,
         "The Slack turn ended before its workspace-git plan could be bound",
@@ -854,6 +937,18 @@ export class CodexAdapter implements AgentAdapter {
   ): Promise<void> {
     const pending = this.#pendingUserInputs.get(response.requestId);
     if (pending === undefined || pending.sessionId !== session.id) {
+      const externallyResolved = this.#externallyResolvedGitUserInputs.get(
+        response.requestId,
+      );
+      if (
+        externallyResolved?.sessionId === session.id &&
+        "optionId" in response &&
+        response.optionId === "reject" &&
+        response.plan !== undefined &&
+        sameExactWorkspaceGitApprovalPlan(externallyResolved.plan, response.plan)
+      ) {
+        return;
+      }
       throw new Error(`Unknown structured input request: ${response.requestId}`);
     }
     if (Date.now() >= pending.expiresAt) {
@@ -1172,19 +1267,47 @@ export class CodexAdapter implements AgentAdapter {
     receivedAt = Date.now(),
   ): void {
     let requestTurnId: string | undefined;
-    let mustUseGitApprovalPath = looksLikeWorkspaceGitApproval(serverRequest.params);
+    const shouldWaitForGitPlan = hasWorkspaceGitApprovalQuestionId(
+      serverRequest.params,
+    );
+    let mustUseGitApprovalPath = shouldWaitForGitPlan;
     try {
-      const params = toolRequestUserInputParams(serverRequest.params);
+      let params: ReturnType<typeof toolRequestUserInputParams>;
+      try {
+        params = toolRequestUserInputParams(serverRequest.params);
+      } catch (error) {
+        throw new InvalidGitApprovalRequestError(publicStructuredInputError(error));
+      }
       requestTurnId = params.turnId;
       if (params.threadId !== sessionId) {
-        throw new Error("Structured input thread does not match the active session");
+        throw new InvalidGitApprovalRequestError(
+          "Structured input thread does not match the active session",
+        );
       }
       const binding = this.#workspaceGitApprovals.inspectPlanBinding(
         sessionId,
         params.turnId,
       );
       if (binding.kind !== "missing") mustUseGitApprovalPath = true;
-      if (binding.kind === "missing" && allowBindingWait) {
+      if (
+        mustUseGitApprovalPath &&
+        this.#workspaceGitApprovals.isRequestInvalid(sessionId, params.turnId)
+      ) {
+        this.#workspaceGitApprovals.discardTurnPlans(sessionId, params.turnId);
+        this.#rejectInvalidGitApprovalRequest(
+          serverRequest.id,
+          sessionId,
+          params.turnId,
+          queue,
+          new Error("A malformed Git approval request already terminated this turn"),
+        );
+        return;
+      }
+      if (
+        binding.kind === "missing" &&
+        allowBindingWait &&
+        shouldWaitForGitPlan
+      ) {
         this.#waitForWorkspaceGitPlan(
           serverRequest,
           sessionId,
@@ -1201,15 +1324,52 @@ export class CodexAdapter implements AgentAdapter {
         this.#handleOrdinaryChoiceRequest(serverRequest, sessionId, queue, receivedAt);
         return;
       }
-      const question = validateWorkspaceGitPlanQuestion(serverRequest.params);
+      let question: ReturnType<typeof validateWorkspaceGitPlanQuestion>;
+      try {
+        question = validateWorkspaceGitPlanQuestion(serverRequest.params);
+      } catch (error) {
+        if (binding.kind === "exact") {
+          this.#workspaceGitApprovals.consumeExactPlan(
+            sessionId,
+            params.turnId,
+            binding.plan,
+          );
+        }
+        this.#rejectInvalidGitApprovalRequest(
+          serverRequest.id,
+          sessionId,
+          params.turnId,
+          queue,
+          error,
+        );
+        return;
+      }
       if (binding.kind !== "exact") {
-        throw new Error(
+        throw new RepreparableGitApprovalError(
           binding.kind === "missing"
             ? "No exact workspace-git plan is bound to this structured request"
             : "More than one workspace-git plan is pending in this turn",
         );
       }
       const plan = binding.plan;
+      if (
+        this.#workspaceGitApprovals.isCompletedOperation(
+          sessionId,
+          plan.operationId,
+        )
+      ) {
+        this.#workspaceGitApprovals.consumeExactPlan(
+          sessionId,
+          params.turnId,
+          plan,
+        );
+        this.#rejectCompletedGitUserInput(
+          serverRequest.id,
+          sessionId,
+          queue,
+        );
+        return;
+      }
       if (
         this.#workspaceGitApprovals.approvedPlan(sessionId) !== undefined ||
         this.#hasPendingGitUserInput(sessionId)
@@ -1236,7 +1396,9 @@ export class CodexAdapter implements AgentAdapter {
           : receivedAt + question.autoResolutionMs - now,
       );
       if (!Number.isFinite(planExpiry) || timeoutMs <= 0) {
-        throw new Error("The workspace-git plan has already expired");
+        throw new RepreparableGitApprovalError(
+          "The workspace-git plan has already expired",
+        );
       }
       this.#workspaceGitApprovals.consumeExactPlan(sessionId, params.turnId, plan);
       const requestId = `codex-input:${randomUUID()}`;
@@ -1291,8 +1453,18 @@ export class CodexAdapter implements AgentAdapter {
         });
         return;
       }
-      this.#rejectUnboundGitApproval(
-        serverRequest,
+      if (error instanceof RepreparableGitApprovalError) {
+        this.#rejectUnboundGitApproval(
+          serverRequest,
+          sessionId,
+          requestTurnId,
+          queue,
+          error,
+        );
+        return;
+      }
+      this.#rejectInvalidGitApprovalRequest(
+        serverRequest.id,
         sessionId,
         requestTurnId,
         queue,
@@ -1365,7 +1537,8 @@ export class CodexAdapter implements AgentAdapter {
         type: "error",
         message:
           "この入力形式はSlackでは安全に表示できません。" +
-          "通常の文章で質問し直してください。",
+          "通常の文章で質問し直してください。" +
+          ` 診断: ${reason}`,
         code: "UNSUPPORTED_STRUCTURED_INPUT",
       });
     }
@@ -1386,16 +1559,6 @@ export class CodexAdapter implements AgentAdapter {
       const pending = this.#pendingUserInputBindings.get(key);
       if (pending === undefined) return;
       this.#pendingUserInputBindings.delete(key);
-      if (looksLikeWorkspaceGitApproval(pending.serverRequest.params)) {
-        this.#rejectUserInputBinding(
-          pending.serverRequest,
-          pending.sessionId,
-          pending.turnId,
-          pending.queue,
-          new Error("No exact workspace-git plan arrived for this structured request"),
-        );
-        return;
-      }
       this.#handleUserInputRequest(
         pending.serverRequest,
         pending.sessionId,
@@ -1431,11 +1594,171 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
-  #rejectPendingUserInputBindings(
+  #queueExternallyResolvedUserInputPlans(
+    sessionId: string,
+    turnId: string,
+  ): void {
+    const matchingBindings = [...this.#externallyResolvedUserInputBindings]
+      .filter(([, pending]) =>
+        pending.sessionId === sessionId && pending.turnId === turnId
+      );
+    if (matchingBindings.length === 0) return;
+
+    const plans = this.#workspaceGitApprovals.takeTurnPlans(sessionId, turnId);
+    if (plans.length === 0) return;
+
+    // The App Server request has already been resolved elsewhere, so no Slack
+    // decision can authorize any plan captured for this binding. Emit each
+    // exact plan once so the frontend can durably reject its private broker
+    // operation. Multiple plans are intentionally all rejected: their mapping
+    // is ambiguous and choosing one would manufacture approval authority.
+    const queue = matchingBindings[0]![1].queue;
+    for (const plan of plans) {
+      this.#enqueueExternalGitRejection({
+        requestId: `codex-input:${randomUUID()}`,
+        sessionId,
+        plan,
+        queue,
+      });
+    }
+  }
+
+  #enqueueExternalGitRejection(pending: PendingExternalGitRejection): void {
+    const existing = this.#pendingExternalGitRejections.get(pending.requestId);
+    if (existing !== undefined) {
+      if (
+        existing.sessionId !== pending.sessionId ||
+        !sameExactWorkspaceGitApprovalPlan(existing.plan, pending.plan)
+      ) {
+        pending.queue.fail(
+          new Error("Conflicting external Git rejection request identity"),
+        );
+      }
+      return;
+    }
+    this.#pendingExternalGitRejections.set(pending.requestId, pending);
+    this.#startExternalGitRejectionWorker(pending.sessionId);
+  }
+
+  #startExternalGitRejectionWorker(sessionId: string): void {
+    if (this.#externalResolutionSettlementsBySession.has(sessionId)) return;
+    const settle = async (): Promise<void> => {
+      while (true) {
+        const entry = [...this.#pendingExternalGitRejections]
+          .find(([, pending]) => pending.sessionId === sessionId);
+        if (entry === undefined) return;
+        const [key, pending] = entry;
+        const expiresAt = Date.parse(pending.plan.expiresAt);
+        if (expiresAt <= Date.now()) {
+          // workspace-git no longer accepts this plan, so there is no approval
+          // authority left to preserve in the private broker. Close any
+          // visible Slack card and release shutdown without manufacturing a
+          // system decision after the exact plan's deadline.
+          this.#pendingExternalGitRejections.delete(key);
+          this.#rememberExternallyResolvedGitUserInput(
+            pending.requestId,
+            pending.sessionId,
+            pending.plan,
+          );
+          pending.queue.push({
+            type: "git_approval.expired",
+            requestId: pending.requestId,
+          });
+          this.#statuses.set(pending.sessionId, "running");
+          pending.queue.push({ type: "status.changed", status: "running" });
+          continue;
+        }
+        if (this.#recordExternallyResolvedGitPlan !== undefined) {
+          // A failed state write must not release or forget the private Git
+          // operation. Keep retrying this exact plan in the worker itself so
+          // recovery does not depend on another App Server event, turn
+          // cleanup, or a caller invoking waitForSystemRejections(). Runtime
+          // shutdown waits for this worker and therefore cannot report a
+          // normal stop while an unrecorded rejection still exists.
+          while (true) {
+            if (expiresAt <= Date.now()) break;
+            try {
+              await this.#recordExternallyResolvedGitPlan(pending.plan);
+              break;
+            } catch {
+              const remainingMs = expiresAt - Date.now();
+              if (remainingMs <= 0) break;
+              await delay(Math.min(
+                this.#options.externalGitRejectionRetryMs,
+                remainingMs,
+              ));
+            }
+          }
+          // The last write may have failed exactly as the plan expired. Let
+          // the outer loop terminalize it as expired rather than releasing a
+          // resolved event without a durable rejection.
+          if (expiresAt <= Date.now()) continue;
+        }
+        // The exact plan remains in this queue until its durable rejection
+        // succeeds. Once durable, losing only the cosmetic Slack event cannot
+        // restore approval authority.
+        this.#pendingExternalGitRejections.delete(key);
+        this.#rememberExternallyResolvedGitUserInput(
+          pending.requestId,
+          pending.sessionId,
+          pending.plan,
+        );
+        pending.queue.push({
+          type: "git_approval.resolved_externally",
+          requestId: pending.requestId,
+          plan: pending.plan,
+          ...(this.#recordExternallyResolvedGitPlan === undefined
+            ? {}
+            : { systemRejectionRecorded: true as const }),
+        });
+        this.#statuses.set(pending.sessionId, "running");
+        pending.queue.push({ type: "status.changed", status: "running" });
+      }
+    };
+    const task = settle();
+    this.#externalResolutionSettlementsBySession.set(sessionId, task);
+    void task.then(
+      () => {
+        if (this.#externalResolutionSettlementsBySession.get(sessionId) === task) {
+          this.#externalResolutionSettlementsBySession.delete(sessionId);
+        }
+      },
+      (error: unknown) => {
+        if (this.#externalResolutionSettlementsBySession.get(sessionId) === task) {
+          this.#externalResolutionSettlementsBySession.delete(sessionId);
+        }
+        const queue = [...this.#pendingExternalGitRejections.values()]
+          .find((pending) => pending.sessionId === sessionId)?.queue ??
+          this.#activeQueues.get(sessionId);
+        queue?.fail(
+          error instanceof Error
+            ? error
+            : new Error("The external Git rejection could not be persisted"),
+        );
+      },
+    );
+  }
+
+  async #rejectPendingUserInputBindings(
     sessionId: string,
     queue: AsyncEventQueue,
     reason: string,
-  ): void {
+  ): Promise<void> {
+    const externallyResolvedTurnIds = new Set<string>();
+    for (const pending of this.#externallyResolvedUserInputBindings.values()) {
+      if (pending.sessionId === sessionId) {
+        externallyResolvedTurnIds.add(pending.turnId);
+      }
+    }
+    for (const turnId of externallyResolvedTurnIds) {
+      this.#queueExternallyResolvedUserInputPlans(sessionId, turnId);
+    }
+    await this.#waitForSessionSystemRejections(sessionId);
+    for (const [key, pending] of this.#externallyResolvedUserInputBindings) {
+      if (pending.sessionId === sessionId) {
+        this.#externallyResolvedUserInputBindings.delete(key);
+      }
+    }
     for (const [key, pending] of this.#pendingUserInputBindings) {
       if (pending.sessionId !== sessionId) continue;
       clearTimeout(pending.expirationTimer);
@@ -1474,6 +1797,9 @@ export class CodexAdapter implements AgentAdapter {
     error: unknown,
   ): void {
     const message = gitApprovalBindingErrorMessage(error);
+    if (turnId !== undefined) {
+      this.#workspaceGitApprovals.discardTurnPlans(sessionId, turnId);
+    }
     this.#client.respondError(serverRequest.id, {
       code: -32602,
       message,
@@ -1528,6 +1854,8 @@ export class CodexAdapter implements AgentAdapter {
       clearTimeout(pending.expirationTimer);
     }
     this.#pendingUserInputs.clear();
+    this.#externallyResolvedGitUserInputs.clear();
+    this.#externallyResolvedUserInputBindings.clear();
     for (const pending of this.#pendingUserInputBindings.values()) {
       clearTimeout(pending.expirationTimer);
     }
@@ -1545,7 +1873,10 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
-  #removePendingServerRequestByRpcId(rpcId: RpcId): void {
+  #removePendingServerRequestByRpcId(
+    rpcId: RpcId,
+    queue: AsyncEventQueue,
+  ): void {
     for (const [requestId, pending] of this.#pendingApprovals) {
       if (pending.rpcId === rpcId) {
         clearTimeout(pending.expirationTimer);
@@ -1556,6 +1887,21 @@ export class CodexAdapter implements AgentAdapter {
       if (pending.rpcId === rpcId) {
         clearTimeout(pending.expirationTimer);
         this.#pendingUserInputs.delete(requestId);
+        if (pending.kind === "git_approval") {
+          this.#enqueueExternalGitRejection({
+            requestId,
+            sessionId: pending.sessionId,
+            plan: pending.plan,
+            queue,
+          });
+        } else {
+          queue.push({
+            type: "choice.resolved_externally",
+            requestId,
+          });
+          this.#statuses.set(pending.sessionId, "running");
+          queue.push({ type: "status.changed", status: "running" });
+        }
       }
     }
     const bindingKey = rpcKey(rpcId);
@@ -1563,6 +1909,15 @@ export class CodexAdapter implements AgentAdapter {
     if (binding !== undefined) {
       clearTimeout(binding.expirationTimer);
       this.#pendingUserInputBindings.delete(bindingKey);
+      this.#externallyResolvedUserInputBindings.set(bindingKey, {
+        sessionId: binding.sessionId,
+        turnId: binding.turnId,
+        queue: binding.queue,
+      });
+      this.#queueExternallyResolvedUserInputPlans(
+        binding.sessionId,
+        binding.turnId,
+      );
     }
   }
 
@@ -1584,6 +1939,23 @@ export class CodexAdapter implements AgentAdapter {
     return false;
   }
 
+  #rememberExternallyResolvedGitUserInput(
+    requestId: string,
+    sessionId: string,
+    plan: WorkspaceGitApprovalPlan,
+  ): void {
+    this.#externallyResolvedGitUserInputs.delete(requestId);
+    this.#externallyResolvedGitUserInputs.set(requestId, {
+      sessionId,
+      plan,
+    });
+    while (this.#externallyResolvedGitUserInputs.size > 1_024) {
+      const oldest = this.#externallyResolvedGitUserInputs.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#externallyResolvedGitUserInputs.delete(oldest);
+    }
+  }
+
   #rejectConcurrentGitUserInput(
     rpcId: RpcId,
     sessionId: string,
@@ -1597,8 +1969,59 @@ export class CodexAdapter implements AgentAdapter {
       type: "error",
       code: "CONCURRENT_GIT_APPROVAL_NOT_SUPPORTED",
       message:
-        "同じターンでは複数のGit承認を同時に処理できません。" +
-        "先の承認処理を維持し、追加の承認要求は実行せず終了しました。",
+        "未完了のGit承認を複数同時には処理できません。" +
+        "先の承認処理を維持します。exact executeの完了後は、" +
+        "同じターン内でも次の承認要求を表示できます。",
+    });
+  }
+
+  #rejectInvalidGitApprovalRequest(
+    rpcId: RpcId,
+    sessionId: string,
+    turnId: string | undefined,
+    queue: AsyncEventQueue,
+    error: unknown,
+  ): void {
+    const reason = publicStructuredInputError(error);
+    const firstInvalidRequest = turnId === undefined
+      ? true
+      : this.#workspaceGitApprovals.markRequestInvalid(sessionId, turnId);
+    if (turnId !== undefined) {
+      this.#workspaceGitApprovals.discardTurnPlans(sessionId, turnId);
+    }
+    this.#client.respondError(rpcId, {
+      code: -32602,
+      message:
+        `INVALID_GIT_APPROVAL_REQUEST: ${reason}. ` +
+        "Do not call request_user_input again in this turn. " +
+        "The operation remains unapproved; start a new turn and prepare a fresh exact plan.",
+    });
+    if (!firstInvalidRequest) return;
+    queue.push({
+      type: "error",
+      code: "INVALID_GIT_APPROVAL_REQUEST",
+      message:
+        "Git承認要求の形式が現行App Server契約と一致しないため、" +
+        "承認画面を表示しませんでした。操作は未承認です。" +
+        `新しいターンで再試行してください。診断: ${reason}`,
+    });
+  }
+
+  #rejectCompletedGitUserInput(
+    rpcId: RpcId,
+    sessionId: string,
+    queue = this.#activeQueues.get(sessionId),
+  ): void {
+    const message =
+      "GIT_APPROVAL_OPERATION_ALREADY_COMPLETED: " +
+      "This exact workspace-git operation has already completed";
+    this.#client.respondError(rpcId, { code: -32000, message });
+    queue?.push({
+      type: "error",
+      code: "GIT_APPROVAL_OPERATION_ALREADY_COMPLETED",
+      message:
+        "このGit操作はすでに完了しているため、承認画面を再表示しません。" +
+        "同じoperationの再実行も行いません。",
     });
   }
 
@@ -1775,6 +2198,21 @@ export class CodexAdapter implements AgentAdapter {
     queue.push({
       type: "choice.requested",
       requestId,
+      expiresAt: new Date(pending.expiresAt).toISOString(),
+      completedAnswers: pending.questions
+        .slice(0, pending.currentQuestionIndex)
+        .flatMap((completedQuestion) => {
+          const answers = pending.answers.get(
+            completedQuestion.appServerQuestionId,
+          );
+          return answers === undefined
+            ? []
+            : [{
+              header: completedQuestion.header,
+              prompt: completedQuestion.prompt,
+              answers,
+            }];
+        }),
       question: {
         id: question.id,
         header: question.header,
@@ -2068,6 +2506,20 @@ function gitApprovalBindingErrorMessage(error: unknown): string {
     "re-run the matching prepare_* operation in the current turn, and then " +
     "request the fixed structured approval again."
   );
+}
+
+class RepreparableGitApprovalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RepreparableGitApprovalError";
+  }
+}
+
+class InvalidGitApprovalRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidGitApprovalRequestError";
+  }
 }
 
 function publicStructuredInputError(error: unknown): string {

@@ -21,12 +21,22 @@ export function validateWorkspaceGitPlanQuestion(
   value: unknown,
 ): ValidatedPlanQuestion {
   const params = requiredRecord(value, "user input request");
+  if (typeof params.isBlocking !== "boolean") {
+    throw new Error("Git plan approval blocking mode is invalid");
+  }
   const questions = params.questions;
   if (!Array.isArray(questions) || questions.length !== 1) {
     throw new Error("Git plan approval requires exactly one structured question");
   }
   const question = requiredRecord(questions[0], "question") as unknown as
     ToolRequestUserInputQuestion;
+  // Current Codex normalizes request_user_input questions to isOther=true and
+  // marks them non-blocking outside Plan mode. App Server still awaits the
+  // response; ShowTalk owns the bounded timeout and never exposes free-form Git
+  // approval. The exact two labels below remain the only projected and accepted
+  // answers for either wire mode.
+  const isOther = question.isOther ?? false;
+  const isSecret = question.isSecret ?? false;
   if (
     typeof question.id !== "string" ||
     question.id.length < 1 ||
@@ -34,8 +44,8 @@ export function validateWorkspaceGitPlanQuestion(
     typeof question.question !== "string" ||
     question.question.length < 1 ||
     question.question.length > 2_000 ||
-    typeof question.isOther !== "boolean" ||
-    question.isSecret !== false ||
+    typeof isOther !== "boolean" ||
+    isSecret !== false ||
     !Array.isArray(question.options) ||
     question.options.length !== 2 ||
     question.options[0]?.label !== APPROVE_LABEL ||
@@ -45,6 +55,7 @@ export function validateWorkspaceGitPlanQuestion(
   }
   const autoResolutionMs = params.autoResolutionMs;
   if (
+    autoResolutionMs !== undefined &&
     autoResolutionMs !== null &&
     (typeof autoResolutionMs !== "number" ||
       !Number.isSafeInteger(autoResolutionMs) ||

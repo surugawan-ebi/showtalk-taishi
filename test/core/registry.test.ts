@@ -106,12 +106,24 @@ test("snapshot round-trips without storage-specific types", () => {
     agentId: "reviewer",
     sessionId: "session-review",
   });
+  registry.replacePendingWorkspaceGitSystemRejections([{
+    operationId: "11111111-1111-4111-8111-111111111111",
+    planHash: "a".repeat(64),
+    approvalTarget: "primary",
+    repoId: "showtalk-taishi",
+    expiresAt: "2099-08-26T20:00:00.000Z",
+    actor: "showtalk:slack-projection-failure",
+  }]);
 
   const json = JSON.stringify(registry.snapshot());
   const restored = new InMemoryAgentRegistry(JSON.parse(json));
 
   assert.deepEqual(restored.snapshot(), registry.snapshot());
   assert.equal(restored.requireAgentByAddress("レビュー係").id, "reviewer");
+  assert.equal(
+    restored.listPendingWorkspaceGitSystemRejections()[0]?.repoId,
+    "showtalk-taishi",
+  );
 });
 
 test("rejects one backend adapter session being restored for different Koe", () => {

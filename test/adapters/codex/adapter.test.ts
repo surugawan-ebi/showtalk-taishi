@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { CodexAdapter, type CodexAppServer } from "../../../src/adapters/codex/adapter.js";
-import type { AgentEvent } from "../../../src/core/index.js";
+import type {
+  AgentEvent,
+  WorkspaceGitApprovalPlan,
+} from "../../../src/core/index.js";
 import type { ServerRequestEvent } from "../../../src/adapters/codex/app-server-client.js";
 import { CodexRpcError } from "../../../src/adapters/codex/protocol.js";
 import type {
@@ -276,7 +279,7 @@ function workspaceGitQuestionForTurn(turnId: string) {
         id: "git_approval",
         header: "Git approval",
         question: "表示されたexact Git planを承認しますか？",
-        isOther: true,
+        isOther: false,
         isSecret: false,
         options: [
           { label: "承認して実行", description: "再検証して実行へ進む" },
@@ -310,6 +313,7 @@ function ordinaryChoiceQuestion(
     turnId: "turn_1",
     itemId: "request-choice-1",
     questions,
+    isBlocking: true,
     autoResolutionMs: null,
   };
 }
@@ -383,6 +387,82 @@ function notifyPublicationPlan(
       },
     },
   });
+}
+
+function notifyRepositorySettingsPlan(server: FakeAppServer): void {
+  const argumentsValue = {
+    repo_id: "showtalk-taishi",
+    description: "SlackをAI coding agentsのフロントにするOSS",
+    topics: ["Slack", "ai-agents", "slack"],
+    dependabot_security_updates: true,
+  };
+  const item = {
+    type: "mcpToolCall",
+    id: "mcp-settings-plan-1",
+    server: "workspace-git",
+    tool: "prepare_github_repository_settings",
+    arguments: argumentsValue,
+  };
+  server.notify("item/started", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: { ...item, status: "inProgress" },
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: {
+      ...item,
+      status: "completed",
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "33333333-3333-4333-8333-333333333333",
+          approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
+          scope: {
+            repo_id: "showtalk-taishi",
+            before: {
+              description: "Old description",
+              topics: ["slack"],
+              dependabot_security_updates: "disabled",
+            },
+            desired: {
+              description: "SlackをAI coding agentsのフロントにするOSS",
+              topics: ["ai-agents", "slack"],
+              dependabot_security_updates: true,
+            },
+            resulting_state: {
+              description: "SlackをAI coding agentsのフロントにするOSS",
+              topics: ["ai-agents", "slack"],
+              dependabot_security_updates: "enabled",
+            },
+          },
+          approval_target: "repo_settings_showtalk-taishi",
+          plan_hash: "f".repeat(64),
+          execute_tool: "execute_approved_github_repository_settings",
+          external_write: false,
+        },
+      },
+    },
+  });
+}
+
+function repositorySettingsExecutionItem() {
+  return {
+    type: "mcpToolCall",
+    id: "mcp-settings-execute-1",
+    server: "workspace-git",
+    tool: "execute_approved_github_repository_settings",
+    arguments: { operation_id: "33333333-3333-4333-8333-333333333333" },
+    status: "completed",
+    result: {
+      structuredContent: {
+        operation_id: "33333333-3333-4333-8333-333333333333",
+        status: "succeeded",
+      },
+    },
+    error: null,
+  };
 }
 
 function notifyPublicationExecution(
@@ -581,6 +661,10 @@ test("creates a Codex thread with workspace and role instructions", async () => 
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
     /same turn.*request_user_input.*Never use agent\.send/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /labels alone never create workspace-git authority.*external write.*exact target.*scope.*impact/su,
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -1893,6 +1977,7 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
   await firstReady;
   assert.equal(choices[0]?.question.header, "地形");
   assert.equal(choices[0]?.question.options[0]?.label, "砂漠盆地");
+  assert.deepEqual(choices[0]?.completedAnswers, []);
   await adapter.respondToUserInput(session, {
     requestId: choices[0]!.requestId,
     answer: { questionId: "question_1", optionId: "option_1" },
@@ -1901,6 +1986,11 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
   await secondReady;
   assert.equal(choices[1]?.requestId, choices[0]?.requestId);
   assert.equal(choices[1]?.question.header, "仕上げ");
+  assert.deepEqual(choices[1]?.completedAnswers, [{
+    header: "地形",
+    prompt: "どの地形を作りますか？",
+    answers: ["砂漠盆地"],
+  }]);
   await adapter.respondToUserInput(session, {
     requestId: choices[1]!.requestId,
     answer: { questionId: "question_2", text: "風化した岩肌" },
@@ -1927,6 +2017,233 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
     events.some((event) => event.type === "git_approval.reprepare_required"),
     false,
   );
+});
+
+test("bridges non-blocking ordinary structured choices from current Codex normalization", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "通常の選択肢を表示する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "choice.requested") continue;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId: "option_2" },
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 904,
+    method: "item/tool/requestUserInput",
+    params: { ...ordinaryChoiceQuestion(), isBlocking: false },
+  });
+  await consuming;
+
+  assert.ok(events.some((event) => event.type === "choice.requested"));
+  assert.equal(
+    events.some((event) => event.type === "git_approval.reprepare_required"),
+    false,
+  );
+  assert.deepEqual(server.errorResponses, []);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 904,
+    response: {
+      answers: { terrain: { answers: ["乾燥岩盤平原"] } },
+    },
+  }]);
+});
+
+test("terminalizes a non-blocking ordinary choice when App Server resolves it first", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  let displayedRequestId = "";
+  let releaseDisplayed!: () => void;
+  let releaseResolved!: () => void;
+  const displayed = new Promise<void>((resolve) => {
+    releaseDisplayed = resolve;
+  });
+  const resolved = new Promise<void>((resolve) => {
+    releaseResolved = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "通常の選択肢を表示する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type === "choice.requested") {
+        displayedRequestId = event.requestId;
+        releaseDisplayed();
+      }
+      if (event.type === "choice.resolved_externally") releaseResolved();
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 905,
+    method: "item/tool/requestUserInput",
+    params: { ...ordinaryChoiceQuestion(), isBlocking: false },
+  });
+  await displayed;
+  server.notify("serverRequest/resolved", {
+    threadId: "thr_1",
+    requestId: 905,
+  });
+  await resolved;
+  await assert.rejects(
+    adapter.respondToUserInput(session, {
+      requestId: displayedRequestId,
+      answer: { questionId: "question_1", optionId: "option_1" },
+    }),
+    /Unknown structured input request/u,
+  );
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.ok(events.some(
+    (event) =>
+      event.type === "choice.resolved_externally" &&
+      event.requestId === displayedRequestId,
+  ));
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("projects plan-less reserved labels as an ordinary external action", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 60_000 });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  let releaseChoice!: () => void;
+  const choiceReady = new Promise<void>((resolve) => {
+    releaseChoice = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "main保護を確認する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "choice.requested") continue;
+      assert.equal(event.question.header, "Git approval");
+      assert.deepEqual(
+        event.question.options.map((option) => option.label),
+        ["承認して実行", "拒否・保留"],
+      );
+      releaseChoice();
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId: "option_1" },
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const params = workspaceGitQuestion();
+  const question = params.questions[0];
+  assert.ok(question);
+  server.request({
+    id: 902,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{ ...question, id: "main_protection" }],
+    },
+  });
+  await Promise.race([
+    choiceReady,
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(
+        () => reject(new Error("ordinary choice waited for a Git plan")),
+        250,
+      ).unref();
+    }),
+  ]);
+  await consuming;
+
+  assert.equal(
+    events.some((event) => event.type === "git_approval.reprepare_required"),
+    false,
+  );
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    false,
+  );
+  assert.deepEqual(server.errorResponses, []);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 902,
+    response: {
+      answers: { main_protection: { answers: ["承認して実行"] } },
+    },
+  }]);
+});
+
+test("keeps an exact plan on the Git path with an ordinary question ID", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "公開計画を確認する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "user_input.requested") continue;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        optionId: "reject",
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  const params = workspaceGitQuestion();
+  const question = params.questions[0];
+  assert.ok(question);
+  server.request({
+    id: 903,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{ ...question, id: "publication_confirmation" }],
+    },
+  });
+  await consuming;
+
+  assert.equal(events.some((event) => event.type === "choice.requested"), false);
+  assert.ok(events.some((event) => event.type === "user_input.requested"));
+  assert.deepEqual(server.userInputResponses, [{
+    id: 903,
+    response: {
+      answers: { publication_confirmation: { answers: ["拒否・保留"] } },
+    },
+  }]);
 });
 
 test("keeps ordinary questions about Git approval on the choice path", async () => {
@@ -2027,7 +2344,7 @@ test("rejects secret ordinary input without showing Git recovery", async () => {
   );
 });
 
-test("does not downgrade a turn with an exact Git plan to an ordinary choice", async () => {
+test("rejects a malformed approval bound to an exact Git plan without offering recovery", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
   const eventsPromise = collectEvents(
@@ -2041,7 +2358,7 @@ test("does not downgrade a turn with an exact Git plan to an ordinary choice", a
   server.request({
     id: 92,
     method: "item/tool/requestUserInput",
-    params: ordinaryChoiceQuestion(),
+    params: { ...ordinaryChoiceQuestion(), isBlocking: true },
   });
   server.notify("turn/completed", {
     threadId: "thr_1",
@@ -2049,17 +2366,181 @@ test("does not downgrade a turn with an exact Git plan to an ordinary choice", a
   });
   const events = await eventsPromise;
 
+  assert.equal(
+    events.some((event) => event.type === "git_approval.reprepare_required"),
+    false,
+  );
   assert.ok(events.some(
-    (event) => event.type === "git_approval.reprepare_required",
+    (event) =>
+      event.type === "error" &&
+      event.code === "INVALID_GIT_APPROVAL_REQUEST",
   ));
   assert.equal(events.some((event) => event.type === "choice.requested"), false);
   assert.match(
     server.errorResponses[0]?.message ?? "",
-    /Git plan approval question has unsupported choices/u,
+    /INVALID_GIT_APPROVAL_REQUEST.*unsupported choices/u,
   );
 });
 
-test("does not downgrade a malformed Git-looking approval to an ordinary choice", async () => {
+test("does not reopen Git approval in the same turn after a malformed exact request", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const eventsPromise = collectEvents(
+    adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Do not retry malformed approval", source: { type: "human" } },
+    ),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  notifyPublicationPlan(server);
+  server.request({
+    id: 922,
+    method: "item/tool/requestUserInput",
+    params: { ...ordinaryChoiceQuestion(), isBlocking: true },
+  });
+
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-after-malformed",
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  server.request({
+    id: 923,
+    method: "item/tool/requestUserInput",
+    params: { ...workspaceGitQuestion(), itemId: "request-after-malformed" },
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(
+    events.filter((event) =>
+      event.type === "error" && event.code === "INVALID_GIT_APPROVAL_REQUEST"
+    ).length,
+    1,
+  );
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    false,
+  );
+  assert.equal(
+    events.some((event) => event.type === "git_approval.reprepare_required"),
+    false,
+  );
+  assert.match(
+    server.errorResponses.find((response) => response.id === 923)?.message ?? "",
+    /INVALID_GIT_APPROVAL_REQUEST.*already terminated this turn/u,
+  );
+});
+
+test("accepts an exact Git approval when App Server omits schema-default fields", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Publish with schema defaults omitted",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "user_input.requested") continue;
+      requested = event;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        optionId: "reject",
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  const params = workspaceGitQuestion();
+  server.request({
+    id: 921,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      autoResolutionMs: undefined,
+      questions: params.questions.map((question) => ({
+        ...question,
+        isOther: undefined,
+        isSecret: undefined,
+      })),
+    },
+  });
+  await consuming;
+
+  assert.equal(requested?.plan.operationId, "11111111-1111-4111-8111-111111111111");
+  assert.equal(server.errorResponses.length, 0);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 921,
+    response: {
+      answers: { git_approval: { answers: ["拒否・保留"] } },
+    },
+  }]);
+});
+
+test("accepts current Default-mode App Server flags without weakening Git approval", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Publish with current request_user_input normalization",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "user_input.requested") continue;
+      requested = event;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        optionId: "reject",
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  const params = workspaceGitQuestion();
+  server.request({
+    id: 922,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      isBlocking: false,
+      questions: params.questions.map((question) => ({
+        ...question,
+        isOther: true,
+      })),
+    },
+  });
+  await consuming;
+
+  assert.deepEqual(requested?.options, [
+    { id: "approve", label: "承認して実行" },
+    { id: "reject", label: "拒否・保留" },
+  ]);
+  assert.equal(server.errorResponses.length, 0);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 922,
+    response: {
+      answers: { git_approval: { answers: ["拒否・保留"] } },
+    },
+  }]);
+});
+
+test("terminates a malformed Git-looking approval without offering recovery", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
   const eventsPromise = collectEvents(
@@ -2074,7 +2555,7 @@ test("does not downgrade a malformed Git-looking approval to an ordinary choice"
     method: "item/tool/requestUserInput",
     params: ordinaryChoiceQuestion([
       {
-        id: "publish_confirmation",
+        id: "git_approval",
         header: "Git publication approval",
         question: "このGit planを承認しますか？",
         isOther: false,
@@ -2094,13 +2575,19 @@ test("does not downgrade a malformed Git-looking approval to an ordinary choice"
   });
   const events = await eventsPromise;
 
+  assert.equal(
+    events.some((event) => event.type === "git_approval.reprepare_required"),
+    false,
+  );
   assert.ok(events.some(
-    (event) => event.type === "git_approval.reprepare_required",
+    (event) =>
+      event.type === "error" &&
+      event.code === "INVALID_GIT_APPROVAL_REQUEST",
   ));
   assert.equal(events.some((event) => event.type === "choice.requested"), false);
   assert.match(
     server.errorResponses[0]?.message ?? "",
-    /REPREPARE_REQUIRED/u,
+    /INVALID_GIT_APPROVAL_REQUEST/u,
   );
 });
 
@@ -2188,7 +2675,7 @@ test("bridges one exact workspace-git publication choice to the same App Server 
   assert.equal(server.turnStarts.length, 1);
 });
 
-test("rejects a second same-turn Git approval without losing the active execution", async () => {
+test("rejects a second same-turn Git approval while the first execution is unfinished", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
   const session = { id: "thr_1" };
@@ -2250,6 +2737,210 @@ test("rejects a second same-turn Git approval without losing the active executio
   });
   await consuming;
   assert.equal(server.turnStarts.length, 1);
+});
+
+test("accepts a second same-turn Git approval after the first exact execution succeeds", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
+  let releaseSecondRequest!: () => void;
+  const secondRequestReady = new Promise<void>((resolve) => {
+    releaseSecondRequest = resolve;
+  });
+  const consuming = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(session, {
+      text: "Publish two exact plans sequentially",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "user_input.requested") continue;
+      requests.push(event);
+      if (requests.length === 2) releaseSecondRequest();
+    }
+    return events;
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 813,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (requests.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  await adapter.respondToUserInput(session, {
+    requestId: requests[0]?.requestId ?? "",
+    optionId: "approve",
+  });
+  notifyPublicationExecution(server);
+
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-2",
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  server.request({
+    id: 814,
+    method: "item/tool/requestUserInput",
+    params: { ...workspaceGitQuestion(), itemId: "request-input-2" },
+  });
+  await secondRequestReady;
+  await adapter.respondToUserInput(session, {
+    requestId: requests[1]?.requestId ?? "",
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem()],
+    },
+  });
+  const events = await consuming;
+
+  assert.equal(requests.length, 2);
+  assert.equal(
+    server.errorResponses.some((response) => response.id === 814),
+    false,
+  );
+  assert.equal(
+    events.some((event) =>
+      event.type === "error" &&
+      event.code === "CONCURRENT_GIT_APPROVAL_NOT_SUPPORTED"
+    ),
+    false,
+  );
+  assert.equal(
+    requests[1]?.plan.operationId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+});
+
+test("rejects a completed operation before projecting another approval UI", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
+  let releaseFirstRequest!: () => void;
+  const firstRequestReady = new Promise<void>((resolve) => {
+    releaseFirstRequest = resolve;
+  });
+  const consuming = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(session, {
+      text: "Do not replay a completed Git operation",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "user_input.requested") continue;
+      requests.push(event);
+      if (requests.length === 1) releaseFirstRequest();
+    }
+    return events;
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 818,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await firstRequestReady;
+  await adapter.respondToUserInput(session, {
+    requestId: requests[0]?.requestId ?? "",
+    optionId: "approve",
+  });
+  notifyPublicationExecution(server);
+
+  notifyPublicationPlan(server, { itemId: "mcp-plan-replayed" });
+  server.request({
+    id: 819,
+    method: "item/tool/requestUserInput",
+    params: { ...workspaceGitQuestion(), itemId: "request-input-replayed" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem()],
+    },
+  });
+  const events = await consuming;
+
+  assert.equal(requests.length, 1);
+  assert.match(
+    server.errorResponses.find((response) => response.id === 819)?.message ?? "",
+    /GIT_APPROVAL_OPERATION_ALREADY_COMPLETED/u,
+  );
+  assert.ok(events.some((event) =>
+    event.type === "error" &&
+    event.code === "GIT_APPROVAL_OPERATION_ALREADY_COMPLETED"
+  ));
+});
+
+test("projects and completes an exact GitHub repository settings approval", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  let releaseRequest!: () => void;
+  const requestReady = new Promise<void>((resolve) => {
+    releaseRequest = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Update the repository settings",
+      source: { type: "human" },
+    })) {
+      if (event.type === "user_input.requested") {
+        requested = event;
+        releaseRequest();
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyRepositorySettingsPlan(server);
+  server.request({
+    id: 815,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await requestReady;
+  assert.equal(requested?.plan.operation, "github_repository_settings");
+  await adapter.respondToUserInput(session, {
+    requestId: requested?.requestId ?? "",
+    optionId: "approve",
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: repositorySettingsExecutionItem(),
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [repositorySettingsExecutionItem()],
+    },
+  });
+  await consuming;
+  assert.deepEqual(server.userInputResponses.at(-1), {
+    id: 815,
+    response: {
+      answers: { git_approval: { answers: ["承認して実行"] } },
+    },
+  });
 });
 
 test("continues one bounded turn when an approved Git plan was not executed", async () => {
@@ -2466,6 +3157,38 @@ test("uses a hydrated execution result instead of starting a duplicate continuat
     events.some((event) => event.type === "error"),
     false,
   );
+});
+
+test("audits a hydrated final snapshot after live execution already succeeded", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 111);
+  notifyPublicationExecution(server);
+  server.hydratedTurns.set("turn_1", {
+    id: "turn_1",
+    status: "completed",
+    itemsView: "full",
+    items: [
+      publicationExecutionItem(),
+      publicationExecutionItem({ itemId: "mcp-execute-replay" }),
+    ],
+  });
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "summary",
+      items: [],
+    },
+  });
+  const events = await eventsPromise;
+
+  assert.ok(events.some((event) =>
+    event.type === "error" && event.code === "GIT_APPROVAL_EXECUTION_REPLAY"
+  ));
 });
 
 test("rolls back execution watching when the App Server answer cannot be sent", async () => {
@@ -2873,6 +3596,145 @@ test("waits briefly when structured input arrives before its same-turn Git plan"
   ]);
 });
 
+test("durably closes a late Git plan after its waiting request was resolved externally", async () => {
+  const server = new FakeAppServer();
+  const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  let releasePersistence!: () => void;
+  const persistenceGate = new Promise<void>((resolve) => {
+    releasePersistence = resolve;
+  });
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async (plan) => {
+      recordedPlans.push(plan);
+      await persistenceGate;
+    },
+  });
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Publish after transport reordering", source: { type: "human" } },
+    )) {
+      events.push(event);
+      if (event.type === "git_approval.resolved_externally") {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 891,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("serverRequest/resolved", {
+    threadId: "thr_1",
+    requestId: 891,
+  });
+  notifyPublicationPlan(server);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(recordedPlans.length, 1);
+  assert.equal(
+    events.some((event) => event.type === "git_approval.resolved_externally"),
+    false,
+  );
+  releasePersistence();
+  await consuming;
+
+  const resolved = events.filter(
+    (event): event is Extract<AgentEvent, {
+      type: "git_approval.resolved_externally";
+    }> => event.type === "git_approval.resolved_externally",
+  );
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0]?.systemRejectionRecorded, true);
+  assert.equal(
+    resolved[0]?.plan.operationId,
+    "11111111-1111-4111-8111-111111111111",
+  );
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    false,
+  );
+  assert.deepEqual(server.userInputResponses, []);
+  assert.deepEqual(server.errorResponses, []);
+});
+
+test("durably closes every delayed plan after one waiting request was resolved externally", async () => {
+  const server = new FakeAppServer();
+  const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async (plan) => {
+      recordedPlans.push(plan);
+    },
+  });
+  const resolvedPlans: WorkspaceGitApprovalPlan[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Reject every ambiguous publication", source: { type: "human" } },
+    )) {
+      if (event.type !== "git_approval.resolved_externally") continue;
+      resolvedPlans.push(event.plan);
+      if (resolvedPlans.length === 3) {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 892,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  server.notify("serverRequest/resolved", {
+    threadId: "thr_1",
+    requestId: 892,
+  });
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-delayed-1",
+    operationId: "11111111-1111-4111-8111-111111111111",
+    planHash: "1".repeat(64),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-delayed-2",
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "2".repeat(64),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-delayed-3",
+    operationId: "33333333-3333-4333-8333-333333333333",
+    planHash: "3".repeat(64),
+  });
+  await consuming;
+
+  assert.deepEqual(
+    recordedPlans.map((plan) => plan.operationId),
+    [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ],
+  );
+  assert.deepEqual(
+    resolvedPlans.map((plan) => plan.operationId),
+    recordedPlans.map((plan) => plan.operationId),
+  );
+  assert.deepEqual(server.userInputResponses, []);
+  assert.deepEqual(server.errorResponses, []);
+});
+
 test("does not bind a structured request to a Git plan from another turn", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
@@ -2900,7 +3762,7 @@ test("does not bind a structured request to a Git plan from another turn", async
   assert.equal(server.errorResponses[0]?.id, 85);
   assert.match(
     server.errorResponses[0]?.message ?? "",
-    /No exact workspace-git plan arrived/u,
+    /No exact workspace-git plan is bound to this structured request/u,
   );
   assert.ok(
     events.some(
@@ -3064,6 +3926,333 @@ test("rejects an expired structured choice and resumes the App Server once", asy
       },
     },
   ]);
+});
+
+test("emits a terminal Git lifecycle event when another App Server client resolves the request", async () => {
+  const server = new FakeAppServer();
+  const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  let releasePersistence!: () => void;
+  const persistenceGate = new Promise<void>((resolve) => {
+    releasePersistence = resolve;
+  });
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async (plan) => {
+      recordedPlans.push(plan);
+      await persistenceGate;
+    },
+  });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  let slackRequestId: string | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Wait for an external decision",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type === "user_input.requested") {
+        slackRequestId = event.requestId;
+        server.notify("serverRequest/resolved", {
+          threadId: "thr_1",
+          requestId: 890,
+        });
+      }
+      if (event.type === "git_approval.resolved_externally") {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+        });
+      }
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 890,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(recordedPlans.length, 1);
+  assert.equal(
+    events.some((event) => event.type === "git_approval.resolved_externally"),
+    false,
+  );
+  releasePersistence();
+  await consuming;
+
+  const resolved = events.find(
+    (event): event is Extract<AgentEvent, {
+      type: "git_approval.resolved_externally";
+    }> => event.type === "git_approval.resolved_externally",
+  );
+  assert.ok(resolved);
+  assert.equal(resolved?.systemRejectionRecorded, true);
+  assert.equal(resolved?.requestId, slackRequestId);
+  assert.equal(
+    resolved?.plan.operationId,
+    "11111111-1111-4111-8111-111111111111",
+  );
+  assert.deepEqual(server.userInputResponses, []);
+  await adapter.respondToUserInput(session, {
+    requestId: slackRequestId ?? "missing",
+    optionId: "reject",
+    plan: resolved.plan,
+  });
+  await adapter.respondToUserInput(session, {
+    requestId: slackRequestId ?? "missing",
+    optionId: "reject",
+    plan: resolved.plan,
+  });
+  await assert.rejects(
+    adapter.respondToUserInput(session, {
+      requestId: slackRequestId ?? "missing",
+      optionId: "reject",
+      plan: { ...resolved.plan, planHash: "f".repeat(64) },
+    }),
+    /Unknown structured input request/u,
+  );
+  await assert.rejects(
+    adapter.respondToUserInput(session, {
+      requestId: slackRequestId ?? "missing",
+      optionId: "approve",
+    }),
+    /Unknown structured input request/u,
+  );
+});
+
+test("automatically retries an externally resolved plan until rejection is durable", async () => {
+  const server = new FakeAppServer();
+  let attempts = 0;
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async () => {
+      attempts += 1;
+      if (attempts <= 2) throw new Error("state write failed");
+    },
+    externalGitRejectionRetryMs: 1,
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Keep the rejected plan until persistence recovers", source: { type: "human" } },
+    )) {
+      if (event.type === "user_input.requested") {
+        server.notify("serverRequest/resolved", {
+          threadId: "thr_1",
+          requestId: 893,
+        });
+      }
+      if (event.type === "git_approval.resolved_externally") {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 893,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await consuming;
+
+  assert.equal(attempts, 3);
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("does not finish shutdown while an external Git rejection is not durable", async () => {
+  const server = new FakeAppServer();
+  let attempts = 0;
+  let persistenceAvailable = false;
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async () => {
+      attempts += 1;
+      if (!persistenceAvailable) throw new Error("state write unavailable");
+    },
+    externalGitRejectionRetryMs: 1,
+  });
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Do not drop the rejected plan during shutdown", source: { type: "human" } },
+    )) {
+      events.push(event);
+      if (event.type === "user_input.requested") {
+        server.notify("serverRequest/resolved", {
+          threadId: "thr_1",
+          requestId: 894,
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 894,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (attempts < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+
+  adapter.shutdown();
+  let shutdownSettled = false;
+  const shutdownWait = adapter.waitForSystemRejections().then(() => {
+    shutdownSettled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(shutdownSettled, false);
+  assert.equal(
+    events.some((event) => event.type === "git_approval.resolved_externally"),
+    false,
+  );
+
+  persistenceAvailable = true;
+  await shutdownWait;
+  await consuming;
+  assert.ok(attempts >= 3);
+});
+
+test("expires an external Git rejection instead of blocking shutdown forever", async () => {
+  const server = new FakeAppServer();
+  let attempts = 0;
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async () => {
+      attempts += 1;
+      throw new Error("state write remains unavailable");
+    },
+    externalGitRejectionRetryMs: 1,
+  });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      session,
+      { text: "Stop retrying after exact expiry", source: { type: "human" } },
+    )) {
+      events.push(event);
+      if (event.type === "user_input.requested") {
+        requested = event;
+        server.notify("serverRequest/resolved", {
+          threadId: "thr_1",
+          requestId: 895,
+        });
+      }
+      if (event.type === "git_approval.expired") {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server, {
+    expiresAt: new Date(Date.now() + 20).toISOString(),
+  });
+  server.request({
+    id: 895,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await consuming;
+  await adapter.waitForSystemRejections();
+
+  assert.ok(attempts >= 1);
+  assert.ok(events.some((event) => event.type === "git_approval.expired"));
+  assert.equal(
+    events.some((event) => event.type === "git_approval.resolved_externally"),
+    false,
+  );
+  assert.ok(requested);
+  await assert.rejects(
+    adapter.respondToUserInput(session, {
+      requestId: requested.requestId,
+      optionId: "approve",
+      plan: requested.plan,
+    }),
+    /Unknown structured input request/u,
+  );
+  adapter.shutdown();
+  await adapter.waitForSystemRejections();
+});
+
+test("allows a fresh exact approval in the same turn after the previous one expires", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { approvalTimeoutMs: 10 });
+  const session = { id: "thr_1" };
+  const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
+  let freshPlanSent = false;
+  const consuming = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(session, {
+      text: "Retry the exact plan after expiry",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type === "user_input.requested") {
+        requests.push(event);
+        if (requests.length === 2) {
+          await adapter.respondToUserInput(session, {
+            requestId: event.requestId,
+            optionId: "reject",
+          });
+          server.notify("turn/completed", {
+            threadId: "thr_1",
+            turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+          });
+        }
+      }
+      if (event.type === "git_approval.expired" && !freshPlanSent) {
+        freshPlanSent = true;
+        notifyPublicationPlan(server, {
+          itemId: "mcp-plan-after-expiry",
+          operationId: "22222222-2222-4222-8222-222222222222",
+          planHash: "d".repeat(64),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        });
+        server.request({
+          id: 816,
+          method: "item/tool/requestUserInput",
+          params: { ...workspaceGitQuestion(), itemId: "request-after-expiry" },
+        });
+      }
+    }
+    return events;
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 817,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  const events = await consuming;
+
+  assert.equal(requests.length, 2);
+  assert.equal(
+    requests[1]?.plan.operationId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+  assert.equal(requests[1]?.plan.planHash, "d".repeat(64));
+  assert.equal(
+    events.some((event) =>
+      event.type === "error" &&
+      event.code === "CONCURRENT_GIT_APPROVAL_NOT_SUPPORTED"
+    ),
+    false,
+  );
+  assert.equal(
+    server.errorResponses.some((response) => response.id === 816),
+    false,
+  );
 });
 
 test("projects an expired Git approval before a rejection transport failure", async () => {

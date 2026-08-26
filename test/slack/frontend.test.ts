@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   cancelUnprojectedNativeApproval,
+  consumeContinuationIterator,
   parseHumanSlackMessage,
   parseTrustedApprovalAction,
   parseTrustedConversationControlAction,
@@ -14,6 +15,8 @@ import {
   permissionApprovalPostArguments,
   permissionApprovalSettlementUpdateArguments,
   recordGitDecisionBeforeAppServerResume,
+  recordGitProjectionFailureBeforeAppServerResume,
+  recordSystemGitRejection,
 } from "../../src/slack/frontend.js";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
@@ -32,6 +35,61 @@ const exactGitPlan = {
   commitMessage: "Record private approval",
   expiresAt: "2099-08-24T02:30:00+09:00",
 } satisfies WorkspaceGitApprovalPlan;
+
+test("releases a continuation iterator when admission projection fails", async () => {
+  let released = false;
+  const iterator: AsyncIterator<string> = {
+    next: async () => ({ done: false, value: "running" }),
+    return: async () => {
+      released = true;
+      return { done: true, value: undefined };
+    },
+  };
+  await assert.rejects(
+    consumeContinuationIterator(
+      iterator,
+      async () => Promise.reject(new Error("Slack update failed")),
+      async () => undefined,
+    ),
+    /Slack update failed/u,
+  );
+  assert.equal(released, true);
+});
+
+test("releases a failed continuation before another turn is consumed", async () => {
+  let firstReleased = false;
+  const failedIterator: AsyncIterator<string> = {
+    next: async () => ({ done: false, value: "first event" }),
+    return: async () => {
+      firstReleased = true;
+      return { done: true, value: undefined };
+    },
+  };
+  await assert.rejects(
+    consumeContinuationIterator(
+      failedIterator,
+      async () => undefined,
+      async () => Promise.reject(new Error("projection failed")),
+    ),
+    /projection failed/u,
+  );
+  assert.equal(firstReleased, true);
+
+  const events: string[] = [];
+  let step = 0;
+  await consumeContinuationIterator<string>(
+    {
+      next: async () => step++ === 0
+        ? { done: false, value: "next turn" }
+        : { done: true, value: undefined },
+    } as AsyncIterator<string>,
+    async () => undefined,
+    async (event) => {
+      events.push(event);
+    },
+  );
+  assert.deepEqual(events, ["next turn"]);
+});
 
 test("records the exact private Git decision before resuming App Server", async () => {
   const order: string[] = [];
@@ -71,6 +129,59 @@ test("does not resume App Server when the private Git decision fails", async () 
     /private mismatch/u,
   );
   assert.equal(resumed, false);
+});
+
+test("records a system Git rejection before closing an unprojected App Server request", async () => {
+  const order: string[] = [];
+  await recordGitProjectionFailureBeforeAppServerResume(
+    {
+      recordRejection: async (plan, actor) => {
+        order.push("broker");
+        assert.equal(actor, "showtalk:slack-projection-failure");
+        assert.equal(plan, exactGitPlan);
+      },
+    },
+    exactGitPlan,
+    async () => {
+      order.push("app-server");
+    },
+  );
+  assert.deepEqual(order, ["broker", "app-server"]);
+});
+
+test("leaves an unprojected App Server request pending when its system rejection cannot be recorded", async () => {
+  let resumed = false;
+  await assert.rejects(
+    recordGitProjectionFailureBeforeAppServerResume(
+      {
+        recordRejection: async () => Promise.reject(new Error("broker unavailable")),
+      },
+      exactGitPlan,
+      async () => {
+        resumed = true;
+      },
+    ),
+    /broker unavailable/u,
+  );
+  assert.equal(resumed, false);
+});
+
+test("records externally resolved App Server Git requests as private rejections", async () => {
+  const decisions: unknown[] = [];
+  await recordSystemGitRejection(
+    {
+      recordRejection: async (plan, actor) => {
+        decisions.push({ decision: "reject", plan, actor });
+      },
+    },
+    exactGitPlan,
+    "showtalk:external-app-server-resolution",
+  );
+  assert.deepEqual(decisions, [{
+    decision: "reject",
+    plan: exactGitPlan,
+    actor: "showtalk:external-app-server-resolution",
+  }]);
 });
 
 test("accepts permission and control actions only from their exact Slack message", () => {
