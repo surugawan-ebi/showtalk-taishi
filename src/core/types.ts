@@ -115,13 +115,13 @@ interface WorkspaceGitApprovalPlanBase {
   /** Exact private approval target emitted by workspace-git prepare_*. */
   readonly approvalTarget: string;
   readonly repoId: string;
-  readonly branch: string;
-  readonly paths: readonly string[];
   readonly expiresAt: string;
 }
 
 interface WorkspaceGitPublicationPlanFields extends WorkspaceGitApprovalPlanBase {
   readonly operation: "git_publication";
+  readonly branch: string;
+  readonly paths: readonly string[];
   readonly expectedSnapshotId: string;
   readonly worktreeId: string;
   readonly commitMessage?: string;
@@ -171,6 +171,7 @@ type WorkspaceGitEstablishedPublicationApprovalPlan =
 interface WorkspaceGitPullRequestApprovalPlan extends WorkspaceGitApprovalPlanBase {
   readonly operation: "pull_request_ready" | "pull_request_merge";
   readonly mode: "mark_ready_for_review" | "merge";
+  readonly branch: string;
   readonly paths: readonly string[];
   readonly expectedHead: string;
   readonly expectedSnapshotId?: never;
@@ -186,16 +187,62 @@ interface WorkspaceGitPullRequestApprovalPlan extends WorkspaceGitApprovalPlanBa
   readonly mergeMethod?: "merge" | "squash" | "rebase";
 }
 
+export type WorkspaceGitDependabotSecurityUpdateState =
+  | "enabled"
+  | "paused"
+  | "disabled";
+
+export interface WorkspaceGitRepositorySettingsState {
+  readonly description: string | null;
+  readonly topics: readonly string[];
+  readonly dependabotSecurityUpdates: WorkspaceGitDependabotSecurityUpdateState;
+}
+
+export interface WorkspaceGitRepositorySettingsDesired {
+  readonly description?: string | null;
+  readonly topics?: readonly string[];
+  readonly dependabotSecurityUpdates?: boolean;
+}
+
+interface WorkspaceGitRepositorySettingsApprovalPlan
+  extends WorkspaceGitApprovalPlanBase {
+  readonly operation: "github_repository_settings";
+  readonly mode: "repository_settings";
+  readonly paths: readonly [];
+  readonly branch?: never;
+  readonly expectedHead?: never;
+  readonly expectedSnapshotId?: never;
+  readonly worktreeId?: never;
+  readonly commitMessage?: never;
+  readonly pushTarget?: never;
+  readonly pullRequestTitle?: never;
+  readonly pullRequestBody?: never;
+  readonly pullRequestBaseBranch?: never;
+  readonly pullRequestNumber?: never;
+  readonly pullRequestUrl?: never;
+  readonly baseBranch?: never;
+  readonly mergeMethod?: never;
+  readonly repositorySettingsBefore: WorkspaceGitRepositorySettingsState;
+  readonly repositorySettingsDesired: WorkspaceGitRepositorySettingsDesired;
+  readonly repositorySettingsResultingState: WorkspaceGitRepositorySettingsState;
+}
+
 /** Exact workspace-git plan that is safe to project onto the Slack approval UI. */
 export type WorkspaceGitApprovalPlan =
   | WorkspaceGitInitialCommitApprovalPlan
   | WorkspaceGitInitialPushApprovalPlan
   | WorkspaceGitEstablishedPublicationApprovalPlan
-  | WorkspaceGitPullRequestApprovalPlan;
+  | WorkspaceGitPullRequestApprovalPlan
+  | WorkspaceGitRepositorySettingsApprovalPlan;
 
 export interface AgentGitApprovalInputResponse {
   readonly requestId: string;
   readonly optionId: "approve" | "reject";
+  /**
+   * Exact plan required only for a fail-closed rejection that may race an
+   * App Server `serverRequest/resolved` notification. It never grants approval.
+   */
+  readonly plan?: WorkspaceGitApprovalPlan;
 }
 
 export type AgentChoiceAnswer =
@@ -241,6 +288,12 @@ export interface AgentChoiceQuestion {
   readonly prompt: string;
   readonly options: readonly AgentChoiceOption[];
   readonly allowsOther: boolean;
+}
+
+export interface AgentChoiceCompletedAnswer {
+  readonly header: string;
+  readonly prompt: string;
+  readonly answers: readonly string[];
 }
 
 /** Immutable binary output produced by an Agent during the current turn. */
@@ -309,10 +362,26 @@ export type AgentEvent =
       readonly requestId: string;
     }
   | {
+      /** Another App Server client resolved this request before Slack did. */
+      readonly type: "git_approval.resolved_externally";
+      readonly requestId: string;
+      readonly plan: WorkspaceGitApprovalPlan;
+      /** The private rejection intent was persisted before this event. */
+      readonly systemRejectionRecorded?: true;
+    }
+  | {
       /** Ordinary, non-secret model question. This is not an approval request. */
       readonly type: "choice.requested";
       readonly requestId: string;
+      readonly expiresAt: string;
       readonly question: AgentChoiceQuestion;
+      /** Earlier answers from the same multi-question App Server request. */
+      readonly completedAnswers: readonly AgentChoiceCompletedAnswer[];
+    }
+  | {
+      /** The original ordinary-choice RPC ended before Slack supplied an answer. */
+      readonly type: "choice.resolved_externally";
+      readonly requestId: string;
     }
   | {
       /**
@@ -335,6 +404,18 @@ export interface PrimarySessionBinding {
   readonly sessionId: SessionId;
 }
 
+/** Durable intent to fail-close a Git approval that no longer has a visible UI. */
+export interface PendingWorkspaceGitSystemRejection {
+  readonly operationId: string;
+  readonly planHash: string;
+  readonly approvalTarget: string;
+  readonly repoId: string;
+  readonly expiresAt: string;
+  readonly actor:
+    | "showtalk:slack-projection-failure"
+    | "showtalk:external-app-server-resolution";
+}
+
 /** Versioned now so state.json can evolve without leaking Map-specific storage. */
 export interface CoreStateSnapshot {
   readonly version: 1;
@@ -348,4 +429,6 @@ export interface CoreStateSnapshot {
   readonly usedContinuationDelegations?: readonly string[];
   /** Recently completed Slack Events API deliveries (durable retry guard). */
   readonly handledSlackEvents?: readonly string[];
+  /** Fail-closed Git decisions queued before an App Server request was released. */
+  readonly pendingWorkspaceGitSystemRejections?: readonly PendingWorkspaceGitSystemRejection[];
 }

@@ -30,6 +30,7 @@ export function emptyRuntimeState(): RuntimeState {
       handledDelegationResults: [],
       usedContinuationDelegations: [],
       handledSlackEvents: [],
+      pendingWorkspaceGitSystemRejections: [],
     },
   };
 }
@@ -260,11 +261,59 @@ function validateRuntimeState(value: unknown): RuntimeState {
         core.handledSlackEvents.length > 10_000 ||
         !core.handledSlackEvents.every(
           (item) => typeof item === "string" && item.trim().length > 0,
+        ))) ||
+    (core.pendingWorkspaceGitSystemRejections !== undefined &&
+      (!Array.isArray(core.pendingWorkspaceGitSystemRejections) ||
+        core.pendingWorkspaceGitSystemRejections.length > 1_024 ||
+        !core.pendingWorkspaceGitSystemRejections.every(
+          isPendingWorkspaceGitSystemRejection,
         )))
   ) {
     throw new Error("Unsupported or corrupt ShowTalk Taishi core state");
   }
   return value as RuntimeState;
+}
+
+function isPendingWorkspaceGitSystemRejection(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (
+    keys.join("\u0000") !==
+    [
+      "actor",
+      "approvalTarget",
+      "expiresAt",
+      "operationId",
+      "planHash",
+      "repoId",
+    ].sort().join("\u0000")
+  ) {
+    return false;
+  }
+  return (
+    boundedStateString(record.operationId, 64) &&
+    typeof record.planHash === "string" &&
+    /^[0-9a-f]{64}$/u.test(record.planHash) &&
+    boundedStateString(record.approvalTarget, 256) &&
+    boundedStateString(record.repoId, 128) &&
+    boundedStateString(record.expiresAt, 64) &&
+    Number.isFinite(Date.parse(record.expiresAt as string)) &&
+    (record.actor === "showtalk:slack-projection-failure" ||
+      record.actor === "showtalk:external-app-server-resolution")
+  );
+}
+
+function boundedStateString(value: unknown, maxLength: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= maxLength &&
+    value === value.trim() &&
+    !/[\u0000-\u001f\u007f]/u.test(value)
+  );
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

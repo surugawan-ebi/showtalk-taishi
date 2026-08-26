@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
 import { createWorkspaceGitDecisionBrokerFromEnvironment } from "./approvals/workspace-git-decision-broker.js";
+import { WorkspaceGitSystemRejectionCoordinator } from "./approvals/workspace-git-system-rejection-coordinator.js";
 import {
   CodexModelCatalog,
   type CodexModelCatalogSnapshot,
@@ -113,6 +114,12 @@ async function createLockedRuntime(
   const workspaceGitDecisionBroker =
     await createWorkspaceGitDecisionBrokerFromEnvironment(process.env);
   const registry = createRegistry(config, state);
+  const persist = async () => {
+    await stateStore.save({
+      version: 1,
+      core: registry.snapshot(),
+    });
+  };
   const clients: CodexAppServerClient[] = [];
   const codexAdapters: CodexAdapter[] = [];
   const permissions = new PermissionEngine(config.permissions, config.agents);
@@ -135,9 +142,40 @@ async function createLockedRuntime(
     },
   );
   const mcpServer = new AuthenticatedMcpHttpServer(mcpService);
+  let workspaceGitSystemRejections:
+    | WorkspaceGitSystemRejectionCoordinator
+    | undefined;
 
   try {
     const mcpEndpoint = await mcpServer.start();
+    if (workspaceGitDecisionBroker !== undefined) {
+      workspaceGitSystemRejections =
+        new WorkspaceGitSystemRejectionCoordinator({
+          broker: workspaceGitDecisionBroker,
+          initialRecords:
+            registry.listPendingWorkspaceGitSystemRejections(),
+          persist: async (records) => {
+            const previous =
+              registry.listPendingWorkspaceGitSystemRejections();
+            registry.replacePendingWorkspaceGitSystemRejections(records);
+            try {
+              await persist();
+            } catch (error) {
+              registry.replacePendingWorkspaceGitSystemRejections(previous);
+              throw error;
+            }
+          },
+          onRetryError: (error, record) => {
+            console.error(
+              "ShowTalk Taishi will retry a durable workspace-git rejection " +
+                `for operation ${record.operationId}: ${
+                  error instanceof Error ? error.message : "unknown error"
+                }`,
+            );
+          },
+        });
+      workspaceGitSystemRejections.start();
+    }
     const childrenByAdapter = new Map<string, Map<string, AgentAdapter>>();
     const codexAdaptersByAgent = new Map<string, CodexAdapter>();
     const modelCatalogsByAgent = new Map<string, CodexModelCatalog>();
@@ -187,6 +225,19 @@ async function createLockedRuntime(
           url: credential.url,
           bearerTokenEnvVar: MCP_TOKEN_ENV_VAR,
         }),
+        ...(workspaceGitSystemRejections === undefined
+          ? {}
+          : {
+              recordExternallyResolvedGitPlan: (
+                plan: Parameters<
+                  WorkspaceGitSystemRejectionCoordinator["recordRejection"]
+                >[0],
+              ) =>
+                workspaceGitSystemRejections!.recordRejection(
+                  plan,
+                  "showtalk:external-app-server-resolution",
+                ),
+            }),
       });
       if (options.onRestartRequested !== undefined) {
         client.onClose(() => options.onRestartRequested?.());
@@ -205,12 +256,6 @@ async function createLockedRuntime(
       ([kind, children]) => new AgentScopedAdapter(kind, children),
     );
 
-    const persist = async () => {
-      await stateStore.save({
-        version: 1,
-        core: registry.snapshot(),
-      });
-    };
     const gateway = new Gateway(registry, adapters, { onStateChanged: persist });
     const router = new AgentRouter(registry, adapters, {
       maxDelegationDepth: config.gateway.agent_message_max_hops,
@@ -259,6 +304,12 @@ async function createLockedRuntime(
       ...(workspaceGitDecisionBroker === undefined
         ? {}
         : { workspaceGitDecisionBroker }),
+      ...(workspaceGitSystemRejections === undefined
+        ? {}
+        : {
+            workspaceGitSystemRejectionRecorder:
+              workspaceGitSystemRejections,
+          }),
       durableEventLedger: {
         has: (eventId) => registry.hasHandledSlackEvent(eventId),
         record: async (eventId) => {
@@ -342,6 +393,9 @@ async function createLockedRuntime(
           codexAdapters,
           clients,
           stateStore,
+          ...(workspaceGitSystemRejections === undefined
+            ? {}
+            : { workspaceGitSystemRejections }),
         });
         return stopPromise;
       },
@@ -349,8 +403,17 @@ async function createLockedRuntime(
   } catch (error) {
     const errors: unknown[] = [error];
     mcpService.beginShutdown();
-    await permissionApprovals.close();
     for (const adapter of codexAdapters) adapter.shutdown();
+    const rejectionResults = await Promise.allSettled(
+      codexAdapters.map((adapter) => adapter.waitForSystemRejections()),
+    );
+    for (const result of rejectionResults) {
+      if (result.status === "rejected") errors.push(result.reason);
+    }
+    await workspaceGitSystemRejections?.close().catch((closeError: unknown) =>
+      errors.push(closeError)
+    );
+    await permissionApprovals.close();
     await mcpServer.close().catch((closeError: unknown) => errors.push(closeError));
     const closeResults = await Promise.allSettled(
       clients.map((client) => client.close({ reportAsFailure: false })),
@@ -424,11 +487,21 @@ async function shutdownRuntime(input: {
   readonly codexAdapters: readonly CodexAdapter[];
   readonly clients: readonly CodexAppServerClient[];
   readonly stateStore: FileStateStore;
+  readonly workspaceGitSystemRejections?: WorkspaceGitSystemRejectionCoordinator;
 }): Promise<void> {
   const errors: unknown[] = [];
   input.mcpService.beginShutdown();
-  await input.permissionApprovals.close().catch((error: unknown) => errors.push(error));
   for (const adapter of input.codexAdapters) adapter.shutdown();
+  const rejectionResults = await Promise.allSettled(
+    input.codexAdapters.map((adapter) => adapter.waitForSystemRejections()),
+  );
+  for (const result of rejectionResults) {
+    if (result.status === "rejected") errors.push(result.reason);
+  }
+  await input.workspaceGitSystemRejections
+    ?.close()
+    .catch((error: unknown) => errors.push(error));
+  await input.permissionApprovals.close().catch((error: unknown) => errors.push(error));
 
   await input.mcpServer.close().catch((error: unknown) => errors.push(error));
   const componentResults = await Promise.allSettled([

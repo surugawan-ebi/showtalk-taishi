@@ -41,6 +41,32 @@ const routing = {
   messageTs: "1786654846.000100",
 };
 
+const repositorySettingsPlan = {
+  operationId: "33333333-3333-4333-8333-333333333333",
+  planHash: "f".repeat(64),
+  approvalTarget: "repo_settings_showtalk-taishi",
+  operation: "github_repository_settings",
+  repoId: "showtalk-taishi",
+  mode: "repository_settings",
+  paths: [],
+  repositorySettingsBefore: {
+    description: "Old description",
+    topics: ["slack"],
+    dependabotSecurityUpdates: "disabled",
+  },
+  repositorySettingsDesired: {
+    description: "SlackをAI coding agentsのフロントにするOSS",
+    topics: ["ai-agents", "slack"],
+    dependabotSecurityUpdates: true,
+  },
+  repositorySettingsResultingState: {
+    description: "SlackをAI coding agentsのフロントにするOSS",
+    topics: ["ai-agents", "slack"],
+    dependabotSecurityUpdates: "enabled",
+  },
+  expiresAt: "2026-08-26T20:00:00+09:00",
+} satisfies WorkspaceGitApprovalPlan;
+
 test("renders an exact Git plan while keeping it out of the action value", () => {
   const blocks = buildWorkspaceGitApprovalBlocks("この計画を承認しますか？", plan, routing);
   const rendered = JSON.stringify(blocks);
@@ -61,6 +87,29 @@ test("renders an exact Git plan while keeping it out of the action value", () =>
   const encoded = "value" in actions.elements[0]! ? actions.elements[0]!.value : undefined;
   assert.equal(encoded, JSON.stringify(routing));
   assert.doesNotMatch(String(encoded), /showtalk-taishi|planHash|operationId/u);
+});
+
+test("renders exact GitHub repository settings without inventing file or branch fields", () => {
+  const blocks = buildWorkspaceGitApprovalBlocks(
+    "Repository設定を承認しますか？",
+    repositorySettingsPlan,
+    routing,
+  );
+  const rendered = JSON.stringify(blocks);
+  assert.match(rendered, /GitHub Repository設定を変更/u);
+  assert.match(rendered, /description, topics, Dependabot Security Updates/u);
+  assert.match(rendered, /Old description/u);
+  assert.match(rendered, /ai-agents/u);
+  assert.match(rendered, /enabled/u);
+  assert.match(rendered, /承認して実行/u);
+  assert.doesNotMatch(rendered, /変更ファイル|Worktree|HEAD|Branch/u);
+
+  const expired = JSON.stringify(buildExpiredWorkspaceGitApprovalBlocks(
+    repositorySettingsPlan,
+    repositorySettingsPlan.expiresAt,
+  ));
+  assert.match(expired, /GitHub Repository設定を変更/u);
+  assert.doesNotMatch(expired, /承認して実行|拒否・保留|Branch/u);
 });
 
 test("collapses changed files and PR body independently without changing approval actions", () => {

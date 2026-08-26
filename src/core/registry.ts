@@ -8,6 +8,7 @@ import type {
   AgentStatus,
   ConversationBinding,
   CoreStateSnapshot,
+  PendingWorkspaceGitSystemRejection,
   SessionId,
   SlackChannelId,
   SlackRootThreadTs,
@@ -18,6 +19,12 @@ function conversationKey(
   rootThreadTs: SlackRootThreadTs,
 ): string {
   return `${channelId}\u0000${rootThreadTs}`;
+}
+
+function gitSystemRejectionKey(
+  record: Pick<PendingWorkspaceGitSystemRejection, "operationId" | "planHash">,
+): string {
+  return `${record.operationId}\u0000${record.planHash}`;
 }
 
 function isTerminalStatus(status: AgentStatus): boolean {
@@ -62,6 +69,10 @@ export class InMemoryAgentRegistry {
   readonly #handledDelegationResults = new Set<string>();
   readonly #usedContinuationDelegations = new Set<string>();
   readonly #handledSlackEvents = new Set<string>();
+  readonly #pendingWorkspaceGitSystemRejections = new Map<
+    string,
+    PendingWorkspaceGitSystemRejection
+  >();
 
   constructor(snapshot?: CoreStateSnapshot) {
     if (snapshot !== undefined) {
@@ -213,6 +224,37 @@ export class InMemoryAgentRegistry {
       const oldest = this.#handledSlackEvents.values().next().value;
       if (typeof oldest !== "string") break;
       this.#handledSlackEvents.delete(oldest);
+    }
+  }
+
+  listPendingWorkspaceGitSystemRejections(): readonly PendingWorkspaceGitSystemRejection[] {
+    return [...this.#pendingWorkspaceGitSystemRejections.values()];
+  }
+
+  replacePendingWorkspaceGitSystemRejections(
+    records: readonly PendingWorkspaceGitSystemRejection[],
+  ): void {
+    if (records.length > 1_024) {
+      throw new CoreError(
+        "INVALID_STATE_SNAPSHOT",
+        "Too many pending workspace-git system rejections",
+      );
+    }
+    const replacement = new Map<string, PendingWorkspaceGitSystemRejection>();
+    for (const record of records) {
+      const key = gitSystemRejectionKey(record);
+      const existing = replacement.get(key);
+      if (existing !== undefined && !sameGitSystemRejection(existing, record)) {
+        throw new CoreError(
+          "INVALID_STATE_SNAPSHOT",
+          "Conflicting pending workspace-git system rejection",
+        );
+      }
+      replacement.set(key, structuredClone(record));
+    }
+    this.#pendingWorkspaceGitSystemRejections.clear();
+    for (const [key, record] of replacement) {
+      this.#pendingWorkspaceGitSystemRejections.set(key, record);
     }
   }
 
@@ -540,6 +582,8 @@ export class InMemoryAgentRegistry {
       handledDelegationResults: [...this.#handledDelegationResults],
       usedContinuationDelegations: [...this.#usedContinuationDelegations],
       handledSlackEvents: [...this.#handledSlackEvents],
+      pendingWorkspaceGitSystemRejections:
+        this.listPendingWorkspaceGitSystemRejections(),
     };
   }
 
@@ -572,5 +616,22 @@ export class InMemoryAgentRegistry {
     for (const eventId of snapshot.handledSlackEvents ?? []) {
       this.recordHandledSlackEvent(eventId);
     }
+    this.replacePendingWorkspaceGitSystemRejections(
+      snapshot.pendingWorkspaceGitSystemRejections ?? [],
+    );
   }
+}
+
+function sameGitSystemRejection(
+  left: PendingWorkspaceGitSystemRejection,
+  right: PendingWorkspaceGitSystemRejection,
+): boolean {
+  return (
+    left.operationId === right.operationId &&
+    left.planHash === right.planHash &&
+    left.approvalTarget === right.approvalTarget &&
+    left.repoId === right.repoId &&
+    left.expiresAt === right.expiresAt &&
+    left.actor === right.actor
+  );
 }

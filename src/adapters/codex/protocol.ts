@@ -218,9 +218,11 @@ export interface ToolRequestUserInputQuestion {
   readonly id: string;
   readonly header: string;
   readonly question: string;
-  readonly isOther: boolean;
-  readonly isSecret: boolean;
-  readonly options: readonly ToolRequestUserInputOption[] | null;
+  /** App Server defaults this to false when omitted on the wire. */
+  readonly isOther?: boolean;
+  /** App Server defaults this to false when omitted on the wire. */
+  readonly isSecret?: boolean;
+  readonly options?: readonly ToolRequestUserInputOption[] | null;
 }
 
 export interface ToolRequestUserInputParams {
@@ -228,7 +230,9 @@ export interface ToolRequestUserInputParams {
   readonly turnId: string;
   readonly itemId: string;
   readonly questions: readonly ToolRequestUserInputQuestion[];
-  readonly autoResolutionMs: number | null;
+  readonly isBlocking: boolean;
+  /** Experimental schema permits omission and treats it the same as null. */
+  readonly autoResolutionMs?: number | null;
 }
 
 export interface ToolRequestUserInputResponse {

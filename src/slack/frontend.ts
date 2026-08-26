@@ -17,6 +17,10 @@ import type {
   PermissionApprovalSettlement,
 } from "../permissions/approval-coordinator.js";
 import type { WorkspaceGitDecisionBroker } from "../approvals/workspace-git-decision-broker.js";
+import type {
+  WorkspaceGitSystemRejectionActor,
+  WorkspaceGitSystemRejectionRecorder,
+} from "../approvals/workspace-git-system-rejection-coordinator.js";
 import {
   APPROVAL_ACTION_PREFIX,
   parseApprovalActionValue,
@@ -74,6 +78,16 @@ import {
   parseChoiceActionValue,
   parseChoiceOtherSubmission,
 } from "./choice-blocks.js";
+import {
+  CHOICE_CONTINUATION_ACTION_PREFIX,
+  CHOICE_CONTINUATION_VIEW_CALLBACK_ID,
+  StructuredChoiceContinuationStore,
+  buildChoiceContinuationOtherModal,
+  parseChoiceContinuationActionId,
+  parseChoiceContinuationId,
+  parseChoiceContinuationOtherSubmission,
+  type StructuredChoiceContinuation,
+} from "./choice-continuation.js";
 import { PermissionApprovalCardTracker } from "./permission-card-tracker.js";
 
 export interface SlackFrontendOptions {
@@ -90,6 +104,7 @@ export interface SlackFrontendOptions {
   readonly attachmentRoot: string;
   readonly permissionApprovals?: PermissionApprovalCoordinator;
   readonly workspaceGitDecisionBroker?: WorkspaceGitDecisionBroker;
+  readonly workspaceGitSystemRejectionRecorder?: WorkspaceGitSystemRejectionRecorder;
   readonly requestRestart?: () => void;
   readonly now?: () => number;
 }
@@ -128,6 +143,9 @@ export class SlackFrontend {
   readonly #fileTransport: SlackFileTransport;
   readonly #permissionApprovals: PermissionApprovalCoordinator | undefined;
   readonly #workspaceGitDecisionBroker: WorkspaceGitDecisionBroker | undefined;
+  readonly #workspaceGitSystemRejectionRecorder:
+    | WorkspaceGitSystemRejectionRecorder
+    | undefined;
   readonly #delegationProjector: SlackDelegationProjector;
   readonly #defaultNotificationUserId: string | undefined;
   readonly #requestRestart: (() => void) | undefined;
@@ -136,6 +154,7 @@ export class SlackFrontend {
   readonly #idleWaiters = new Set<() => void>();
   readonly #gitApprovalRecoveryActions = new GitApprovalRecoveryActionTracker();
   readonly #gitApprovalDetails = new WorkspaceGitApprovalDetailsStore();
+  readonly #choiceContinuations: StructuredChoiceContinuationStore;
   readonly #permissionApprovalCards = new PermissionApprovalCardTracker();
   readonly #now: () => number;
   #activeMessageHandlers = 0;
@@ -153,8 +172,11 @@ export class SlackFrontend {
     });
     this.#permissionApprovals = options.permissionApprovals;
     this.#workspaceGitDecisionBroker = options.workspaceGitDecisionBroker;
+    this.#workspaceGitSystemRejectionRecorder =
+      options.workspaceGitSystemRejectionRecorder;
     this.#requestRestart = options.requestRestart;
     this.#now = options.now ?? Date.now;
+    this.#choiceContinuations = new StructuredChoiceContinuationStore(this.#now);
     this.#presentationsByChannel = options.presentationsByChannel ?? {};
     this.#durableEventLedger = options.durableEventLedger;
     this.#defaultNotificationUserId = options.approverUserIds[0];
@@ -318,12 +340,19 @@ export class SlackFrontend {
             requestId: failure.requestId,
             decision: "cancel",
           });
+        } else if (failure.kind === "git_approval") {
+          await this.#rejectUnprojectedGitApproval(
+            this.#app.client,
+            failure.sessionId,
+            failure.channelId,
+            failure.rootThreadTs,
+            failure.requestId,
+            failure.plan,
+          );
         } else {
           await this.#gateway.resolveSessionUserInput(failure.sessionId, {
             requestId: failure.requestId,
-            ...(failure.kind === "git_approval"
-              ? { optionId: "reject" as const }
-              : { cancelled: true as const }),
+            cancelled: true,
           });
         }
         await this.#app.client.chat
@@ -345,6 +374,14 @@ export class SlackFrontend {
           .catch(() => undefined);
       },
       this.#gitApprovalDetails,
+      async (event) => {
+        await recordSystemGitRejection(
+          this.#workspaceGitSystemRejectionRecorder,
+          event.plan,
+          "showtalk:external-app-server-resolution",
+        );
+      },
+      this.#choiceContinuations,
     );
   }
 
@@ -440,6 +477,232 @@ export class SlackFrontend {
     });
   }
 
+  async #rejectUnprojectedGitApproval(
+    client: WebClient,
+    sessionId: string,
+    channelId: string,
+    rootThreadTs: string,
+    requestId: string,
+    plan: WorkspaceGitApprovalPlan,
+  ): Promise<void> {
+    let resolutionError: unknown;
+    try {
+      await recordGitProjectionFailureBeforeAppServerResume(
+        this.#workspaceGitSystemRejectionRecorder,
+        plan,
+        () => this.#gateway.resolveSessionUserInput(sessionId, {
+          requestId,
+          optionId: "reject",
+          plan,
+        }),
+      );
+    } catch (error) {
+      resolutionError = error;
+    }
+
+    const details = this.#gitApprovalDetails.getForRequest(
+      requestId,
+      channelId,
+      rootThreadTs,
+    );
+    if (details !== undefined) {
+      let terminalizationError: unknown;
+      try {
+        await client.chat.update({
+          channel: details.routing.channelId,
+          ts: details.routing.messageTs,
+          text:
+            resolutionError === undefined
+              ? "Git承認UIを表示できなかったため、この計画は安全に拒否されました。"
+              : "Git承認UIを表示できませんでした。Git操作は実行されていません。" +
+                "この画面は使用できません。状態確認後に再作成してください。",
+          blocks:
+            details.sourceUserMention === undefined
+              ? buildUnavailableWorkspaceGitApprovalBlocks()
+              : [
+                  gitApprovalMentionBlock(details.sourceUserMention),
+                  ...buildUnavailableWorkspaceGitApprovalBlocks(),
+                ],
+        });
+        this.#gitApprovalDetails.forget(details.routing);
+      } catch (error) {
+        terminalizationError = error;
+      }
+      if (
+        resolutionError !== undefined &&
+        terminalizationError !== undefined
+      ) {
+        throw new AggregateError(
+          [resolutionError, terminalizationError],
+          "Invisible Git approval could not be safely closed",
+        );
+      }
+    }
+    if (resolutionError !== undefined) throw resolutionError;
+    // A terminal Slack update is cosmetic once the durable reject intent and
+    // App Server response both succeeded. Do not interrupt the coding turn.
+  }
+
+  async #settleExternallyResolvedGitApproval(
+    projector: SlackThreadProjector,
+    event: Extract<AgentEvent, { type: "git_approval.resolved_externally" }>,
+  ): Promise<void> {
+    let settlementError: unknown;
+    if (event.systemRejectionRecorded !== true) {
+      try {
+        await recordSystemGitRejection(
+          this.#workspaceGitSystemRejectionRecorder,
+          event.plan,
+          "showtalk:external-app-server-resolution",
+        );
+      } catch (error) {
+        settlementError = error;
+      }
+    }
+    let projectionError: unknown;
+    try {
+      await projector.project(event);
+    } catch (error) {
+      projectionError = error;
+    }
+    if (settlementError !== undefined && projectionError !== undefined) {
+      throw new AggregateError(
+        [settlementError, projectionError],
+        "Externally resolved Git approval could not be fully settled",
+      );
+    }
+    if (settlementError !== undefined) throw settlementError;
+    // The exact rejection intent is durable. A cosmetic card update failure
+    // remains retryable through the retained route and must not abort Codex.
+  }
+
+  #requireTrustedChoiceContinuation(
+    body: unknown,
+    continuationId: string,
+  ): StructuredChoiceContinuation {
+    const continuation = this.#choiceContinuations.get(continuationId);
+    if (continuation === undefined) {
+      throw new Error("This structured choice continuation is unavailable or expired");
+    }
+    const allowedUsers = continuation.responderUserId === undefined
+      ? this.#approvers
+      : new Set([continuation.responderUserId]);
+    validateSlackActionSource(body, {
+      channelId: continuation.channelId,
+      rootThreadTs: continuation.rootThreadTs,
+      messageTs: continuation.messageTs,
+    }, allowedUsers);
+    return continuation;
+  }
+
+  async #continueStructuredChoice(
+    client: WebClient,
+    available: StructuredChoiceContinuation,
+    answer: string,
+    userId: string,
+  ): Promise<void> {
+    validateChoiceResponder(
+      userId,
+      available.responderUserId,
+      this.#approvers,
+    );
+    const continuation = this.#choiceContinuations.begin(
+      available.continuationId,
+    );
+    try {
+      const status = await this.#gateway.status(
+        continuation.channelId,
+        continuation.rootThreadTs,
+        continuation.messageTs,
+      );
+      if (status.sessionId !== continuation.sessionId) {
+        throw new Error("The persistent Koe session changed before this answer was sent");
+      }
+      const projector = new SlackThreadProjector(
+        client,
+        continuation.channelId,
+        continuation.rootThreadTs,
+        {
+          sourceUserId: userId,
+          presentation: this.#presentation(continuation.channelId),
+          gitApprovalDetailsStore: this.#gitApprovalDetails,
+          choiceContinuationStore: this.#choiceContinuations,
+        },
+      );
+      const results = this.#gateway.handleHumanMessage({
+        channelId: continuation.channelId,
+        rootThreadTs: continuation.rootThreadTs,
+        messageTs: continuation.messageTs,
+        slackUserId: userId,
+        text: structuredChoiceContinuationPrompt(continuation, answer),
+      })[Symbol.asyncIterator]();
+      await consumeContinuationIterator(
+        results,
+        async () => {
+          await client.chat.update({
+            channel: continuation.channelId,
+            ts: continuation.messageTs,
+            text: `回答を新しいターンとして受け付けました（<@${userId}>）。`,
+            blocks: [],
+          });
+        },
+        async (result) => {
+          projector.setSessionId(result.sessionId);
+          if (result.event.type === "git_approval.resolved_externally") {
+            await this.#settleExternallyResolvedGitApproval(projector, result.event);
+          } else {
+            try {
+              await projector.project(result.event);
+            } catch (error) {
+              if (result.event.type === "choice.requested") {
+                await this.#gateway.resolveSessionUserInput(result.sessionId, {
+                  requestId: result.event.requestId,
+                  cancelled: true,
+                });
+                throw new AggregateError(
+                  [error],
+                  "Continuation choice controls could not be displayed and were cancelled",
+                );
+              }
+              if (result.event.type === "user_input.requested") {
+                await this.#rejectUnprojectedGitApproval(
+                  client,
+                  result.sessionId,
+                  continuation.channelId,
+                  continuation.rootThreadTs,
+                  result.event.requestId,
+                  result.event.plan,
+                );
+              } else if (result.event.type === "approval.requested") {
+                await this.#gateway.resolveSessionApproval(result.sessionId, {
+                  requestId: result.event.requestId,
+                  decision: "cancel",
+                });
+              } else {
+                throw error;
+              }
+            }
+          }
+        },
+      );
+      await projector.complete();
+    } catch (error) {
+      await client.chat.update({
+        channel: continuation.channelId,
+        ts: continuation.messageTs,
+        text:
+          "この選択を新しいターンへ送信できませんでした。" +
+          "通常のSlackメッセージで回答し直してください。",
+        blocks: [],
+      }).catch(() => undefined);
+      throw error;
+    } finally {
+      // Once a new turn may have started, replay is unsafe even if its final
+      // Slack projection failed. The user can send a fresh ordinary message.
+      this.#choiceContinuations.consume(continuation.continuationId);
+    }
+  }
+
   #registerListeners(): void {
     this.#app.event("message", async ({ event, body, client, logger }) => {
       if (this.#durableEventLedger?.has(body.event_id) === true) return;
@@ -472,8 +735,9 @@ export class SlackFrontend {
             ...(typeof message.user === "string"
               ? { sourceUserId: message.user }
               : {}),
-            presentation: this.#presentation(message.channel),
-            gitApprovalDetailsStore: this.#gitApprovalDetails,
+              presentation: this.#presentation(message.channel),
+              gitApprovalDetailsStore: this.#gitApprovalDetails,
+              choiceContinuationStore: this.#choiceContinuations,
           },
         );
         let projectionStarted = false;
@@ -553,6 +817,13 @@ export class SlackFrontend {
               : {}),
           })) {
             projector.setSessionId(result.sessionId);
+            if (result.event.type === "git_approval.resolved_externally") {
+              await this.#settleExternallyResolvedGitApproval(
+                projector,
+                result.event,
+              );
+              continue;
+            }
             try {
               await projector.project(result.event);
             } catch (error) {
@@ -583,10 +854,14 @@ export class SlackFrontend {
               }
               if (result.event.type === "user_input.requested") {
                 try {
-                  await this.#gateway.resolveSessionUserInput(result.sessionId, {
-                    requestId: result.event.requestId,
-                    optionId: "reject",
-                  });
+                  await this.#rejectUnprojectedGitApproval(
+                    client,
+                    result.sessionId,
+                    message.channel,
+                    rootThreadTs,
+                    result.event.requestId,
+                    result.event.plan,
+                  );
                 } catch (resolutionError) {
                   // Leaving the App Server RPC unresolved would strand the
                   // turn. Escaping the stream lets Gateway cleanup interrupt it.
@@ -738,6 +1013,40 @@ export class SlackFrontend {
             action,
             this.#approvers,
           );
+          const continuation =
+            this.#choiceContinuations.getForOriginalRequest(routing.requestId);
+          if (continuation !== undefined) {
+            if (kind === "other") {
+              if (!continuation.question.allowsOther) {
+                throw new Error("This structured choice does not allow free text");
+              }
+              const triggerId = asString(bodyRecord?.trigger_id);
+              if (triggerId === undefined) {
+                throw new Error("Slack did not provide a modal trigger");
+              }
+              await client.views.open({
+                trigger_id: triggerId,
+                view: buildChoiceContinuationOtherModal(
+                  continuation.continuationId,
+                  continuation.question.header,
+                ),
+              });
+              return;
+            }
+            const option = continuation.question.options.find(
+              (candidate) => candidate.id === routing.optionId,
+            );
+            if (option === undefined) {
+              throw new Error("Structured choice continuation option is invalid");
+            }
+            await this.#continueStructuredChoice(
+              client,
+              continuation,
+              option.label,
+              source.userId,
+            );
+            return;
+          }
           if (kind === "other") {
             const triggerId = asString(bodyRecord?.trigger_id);
             if (triggerId === undefined) {
@@ -762,6 +1071,10 @@ export class SlackFrontend {
                 optionId: routing.optionId,
               },
             },
+          );
+          this.#choiceContinuations.forgetDisplayed(
+            routing.requestId,
+            routing.messageTs,
           );
           await client.chat.update({
             channel: source.channelId,
@@ -797,6 +1110,17 @@ export class SlackFrontend {
           routing = parsed.routing;
           userId = parsed.userId;
           validateChoiceResponder(userId, routing.responderUserId, this.#approvers);
+          const continuation =
+            this.#choiceContinuations.getForOriginalRequest(routing.requestId);
+          if (continuation !== undefined) {
+            await this.#continueStructuredChoice(
+              client,
+              continuation,
+              parsed.answer,
+              userId,
+            );
+            return;
+          }
           await this.#gateway.resolveUserInput(
             routing.channelId,
             routing.rootThreadTs,
@@ -807,6 +1131,10 @@ export class SlackFrontend {
                 text: parsed.answer,
               },
             },
+          );
+          this.#choiceContinuations.forgetDisplayed(
+            routing.requestId,
+            routing.messageTs,
           );
           await client.chat.update({
             channel: routing.channelId,
@@ -822,6 +1150,113 @@ export class SlackFrontend {
               user: userId,
               text: `自由入力を送信できませんでした: ${publicErrorMessage(error)}`,
               ...this.#presentation(routing.channelId),
+            }).catch((postError) => logger.error(postError));
+          }
+        } finally {
+          finishHandler();
+        }
+      },
+    );
+
+    this.#app.action(
+      new RegExp(`^${escapeRegExp(CHOICE_CONTINUATION_ACTION_PREFIX)}`),
+      async ({ ack, body, action, client, logger }) => {
+        await ack();
+        const finishHandler = this.#beginSlackHandler();
+        const bodyRecord = asRecord(body);
+        const userId = asString(asRecord(bodyRecord?.user)?.id);
+        const channelId = asString(asRecord(bodyRecord?.channel)?.id);
+        try {
+          const actionRecord = asRecord(action);
+          const parsedAction = parseChoiceContinuationActionId(
+            asString(actionRecord?.action_id) ?? "",
+          );
+          if (parsedAction === undefined) {
+            throw new Error("Unsupported structured choice continuation action");
+          }
+          const continuationId = parseChoiceContinuationId(actionRecord?.value);
+          const continuation = this.#requireTrustedChoiceContinuation(
+            body,
+            continuationId,
+          );
+          if (parsedAction.kind === "other") {
+            if (!continuation.question.allowsOther) {
+              throw new Error("This structured choice does not allow free text");
+            }
+            const triggerId = asString(bodyRecord?.trigger_id);
+            if (triggerId === undefined) {
+              throw new Error("Slack did not provide a modal trigger");
+            }
+            await client.views.open({
+              trigger_id: triggerId,
+              view: buildChoiceContinuationOtherModal(
+                continuationId,
+                continuation.question.header,
+              ),
+            });
+            return;
+          }
+          const option = continuation.question.options.find(
+            (candidate) => candidate.id === parsedAction.optionId,
+          );
+          if (option === undefined) {
+            throw new Error("Structured choice continuation option is invalid");
+          }
+          await this.#continueStructuredChoice(
+            client,
+            continuation,
+            option.label,
+            userId ?? "",
+          );
+        } catch (error) {
+          logger.error(error);
+          if (userId !== undefined && channelId !== undefined) {
+            await client.chat.postEphemeral({
+              channel: channelId,
+              user: userId,
+              text: `選択肢を新しいターンへ送信できませんでした: ${publicErrorMessage(error)}`,
+              ...this.#presentation(channelId),
+            }).catch((postError) => logger.error(postError));
+          }
+        } finally {
+          finishHandler();
+        }
+      },
+    );
+
+    this.#app.view(
+      CHOICE_CONTINUATION_VIEW_CALLBACK_ID,
+      async ({ ack, body, client, logger }) => {
+        await ack();
+        const finishHandler = this.#beginSlackHandler();
+        let userId: string | undefined;
+        let continuation: StructuredChoiceContinuation | undefined;
+        try {
+          const parsed = parseChoiceContinuationOtherSubmission(body);
+          userId = parsed.userId;
+          continuation = this.#choiceContinuations.get(parsed.continuationId);
+          if (continuation === undefined) {
+            throw new Error("This structured choice continuation is unavailable or expired");
+          }
+          validateChoiceResponder(
+            userId,
+            continuation.responderUserId,
+            this.#approvers,
+          );
+          await this.#continueStructuredChoice(
+            client,
+            continuation,
+            parsed.answer,
+            userId,
+          );
+        } catch (error) {
+          logger.error(error);
+          if (userId !== undefined && continuation !== undefined) {
+            await client.chat.postEphemeral({
+              channel: continuation.channelId,
+              user: userId,
+              text: `自由入力を新しいターンへ送信できませんでした: ${publicErrorMessage(error)}`,
+              ...this.#presentation(continuation.channelId),
             }).catch((postError) => logger.error(postError));
           }
         } finally {
@@ -919,7 +1354,11 @@ export class SlackFrontend {
               () => this.#gateway.resolveUserInput(
                 routing.channelId,
                 routing.rootThreadTs,
-                { requestId: routing.requestId, optionId: decision },
+                {
+                  requestId: routing.requestId,
+                  optionId: decision,
+                  plan: details.plan,
+                },
               ),
             );
             this.#gitApprovalDetails.forget(routing);
@@ -1017,6 +1456,7 @@ export class SlackFrontend {
               sourceUserId: source.userId,
               presentation: this.#presentation(routing.channelId),
               gitApprovalDetailsStore: this.#gitApprovalDetails,
+              choiceContinuationStore: this.#choiceContinuations,
             },
           );
           try {
@@ -1028,6 +1468,13 @@ export class SlackFrontend {
               slackUserId: source.userId,
             })) {
               projector.setSessionId(result.sessionId);
+              if (result.event.type === "git_approval.resolved_externally") {
+                await this.#settleExternallyResolvedGitApproval(
+                  projector,
+                  result.event,
+                );
+                continue;
+              }
               try {
                 await projector.project(result.event);
               } catch (error) {
@@ -1042,13 +1489,30 @@ export class SlackFrontend {
                   );
                 }
                 if (result.event.type === "user_input.requested") {
-                  await this.#gateway.resolveSessionUserInput(result.sessionId, {
-                    requestId: result.event.requestId,
-                    optionId: "reject",
-                  });
-                  throw new Error(
-                    "Fresh Git approval controls could not be displayed and were rejected safely",
+                  await this.#rejectUnprojectedGitApproval(
+                    client,
+                    result.sessionId,
+                    routing.channelId,
+                    routing.rootThreadTs,
+                    result.event.requestId,
+                    result.event.plan,
                   );
+                  await client.chat
+                    .postMessage({
+                      channel: routing.channelId,
+                      thread_ts: routing.rootThreadTs,
+                      text:
+                        ":warning: Fresh Git approval controls could not be displayed, " +
+                        "so this request was rejected safely. Ask this Koe to " +
+                        "re-prepare the operation in a new turn.",
+                      ...this.#presentation(routing.channelId),
+                    })
+                    .catch((projectionError) => logger.error(projectionError));
+                  // The private rejection intent is durable and the App Server
+                  // request has been answered. Keep consuming the turn so the
+                  // adapter is not interrupted merely because Slack rejected
+                  // the approval blocks.
+                  continue;
                 }
                 if (result.event.type === "approval.requested") {
                   await cancelUnprojectedNativeApproval(
@@ -1509,6 +1973,33 @@ export async function recordGitDecisionBeforeAppServerResume(
   await resume();
 }
 
+/** Records a non-human safety rejection before closing an invisible request. */
+export async function recordGitProjectionFailureBeforeAppServerResume(
+  recorder: WorkspaceGitSystemRejectionRecorder | undefined,
+  plan: WorkspaceGitApprovalPlan,
+  resume: () => Promise<void>,
+): Promise<void> {
+  await recordSystemGitRejection(
+    recorder,
+    plan,
+    "showtalk:slack-projection-failure",
+  );
+  await resume();
+}
+
+export async function recordSystemGitRejection(
+  recorder: WorkspaceGitSystemRejectionRecorder | undefined,
+  plan: WorkspaceGitApprovalPlan,
+  actor: WorkspaceGitSystemRejectionActor,
+): Promise<void> {
+  if (recorder === undefined) {
+    throw new Error(
+      "The durable workspace-git system rejection recorder is not configured",
+    );
+  }
+  await recorder.recordRejection(plan, actor);
+}
+
 export function parseTrustedGitApprovalRecoveryAction(
   body: unknown,
   action: unknown,
@@ -1584,6 +2075,64 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function publicErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unexpected gateway error";
+}
+
+function structuredChoiceContinuationPrompt(
+  continuation: StructuredChoiceContinuation,
+  answer: string,
+): string {
+  return [
+    "ShowTalk Taishi structured-choice continuation.",
+    "The original ordinary request_user_input RPC ended before Slack supplied a human answer.",
+    "Treat this as a normal authenticated human message in the same persistent conversation.",
+    "It is not workspace-git approval and does not authorize any old or unbound Git plan.",
+    ...(continuation.completedAnswers.length === 0
+      ? []
+      : [
+        "Earlier answers from the same structured request:",
+        ...continuation.completedAnswers.map((completed, index) =>
+          `${index + 1}. ${completed.prompt}\nHuman answer: ${completed.answers.join(", ")}`
+        ),
+      ]),
+    `Question: ${continuation.question.prompt}`,
+    `Slack answer: ${answer}`,
+    "Continue the original request using this answer. If a new protected operation needs approval, prepare and request a fresh exact approval normally.",
+  ].join("\n");
+}
+
+export async function consumeContinuationIterator<T>(
+  iterator: AsyncIterator<T>,
+  onAdmitted: () => Promise<void>,
+  onResult: (result: T) => Promise<void>,
+): Promise<void> {
+  let completed = false;
+  let iterationError: unknown;
+  try {
+    let next = await iterator.next();
+    await onAdmitted();
+    while (!next.done) {
+      await onResult(next.value);
+      next = await iterator.next();
+    }
+    completed = true;
+  } catch (error) {
+    iterationError = error;
+    throw error;
+  } finally {
+    if (!completed && iterator.return !== undefined) {
+      try {
+        await iterator.return();
+      } catch (cleanupError) {
+        if (iterationError !== undefined) {
+          throw new AggregateError(
+            [iterationError, cleanupError],
+            "Structured choice continuation failed and its turn could not be released",
+          );
+        }
+        throw cleanupError;
+      }
+    }
+  }
 }
 
 function asString(value: unknown): string | undefined {

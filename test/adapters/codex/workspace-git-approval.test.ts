@@ -45,6 +45,55 @@ function publicationNotification() {
   };
 }
 
+function repositorySettingsNotification() {
+  return {
+    threadId: "thr_1",
+    turnId: "turn_settings",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp_settings_1",
+      server: "workspace-git",
+      tool: "prepare_github_repository_settings",
+      status: "completed",
+      arguments: {
+        repo_id: "showtalk-taishi",
+        description: "SlackをAI coding agentsのフロントにするOSS",
+        topics: ["Slack", "ai-agents", "slack"],
+        dependabot_security_updates: true,
+      },
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "33333333-3333-4333-8333-333333333333",
+          approval_expires_at: "2026-08-26T20:00:00+09:00",
+          scope: {
+            repo_id: "showtalk-taishi",
+            before: {
+              description: "Old description",
+              topics: ["slack"],
+              dependabot_security_updates: "disabled",
+            },
+            desired: {
+              description: "SlackをAI coding agentsのフロントにするOSS",
+              topics: ["ai-agents", "slack"],
+              dependabot_security_updates: true,
+            },
+            resulting_state: {
+              description: "SlackをAI coding agentsのフロントにするOSS",
+              topics: ["ai-agents", "slack"],
+              dependabot_security_updates: "enabled",
+            },
+          },
+          approval_target: "repo_settings_showtalk-taishi",
+          plan_hash: "f".repeat(64),
+          execute_tool: "execute_approved_github_repository_settings",
+          external_write: false,
+        },
+      },
+    },
+  };
+}
+
 test("captures every public exact-plan field from a publication prepare result", () => {
   assert.deepEqual(captureWorkspaceGitPlan(publicationNotification()), {
     turnId: "turn_1",
@@ -65,6 +114,98 @@ test("captures every public exact-plan field from a publication prepare result",
       expiresAt: "2026-08-14T20:00:00+09:00",
     },
   });
+});
+
+test("captures and freezes an exact GitHub repository settings plan", () => {
+  assert.deepEqual(captureWorkspaceGitPlan(repositorySettingsNotification()), {
+    turnId: "turn_settings",
+    plan: {
+      operationId: "33333333-3333-4333-8333-333333333333",
+      planHash: "f".repeat(64),
+      approvalTarget: "repo_settings_showtalk-taishi",
+      operation: "github_repository_settings",
+      repoId: "showtalk-taishi",
+      mode: "repository_settings",
+      paths: [],
+      repositorySettingsBefore: {
+        description: "Old description",
+        topics: ["slack"],
+        dependabotSecurityUpdates: "disabled",
+      },
+      repositorySettingsDesired: {
+        description: "SlackをAI coding agentsのフロントにするOSS",
+        topics: ["ai-agents", "slack"],
+        dependabotSecurityUpdates: true,
+      },
+      repositorySettingsResultingState: {
+        description: "SlackをAI coding agentsのフロントにするOSS",
+        topics: ["ai-agents", "slack"],
+        dependabotSecurityUpdates: "enabled",
+      },
+      expiresAt: "2026-08-26T20:00:00+09:00",
+    },
+  });
+});
+
+test("rejects substituted GitHub repository settings boundaries", () => {
+  const wrongTarget = repositorySettingsNotification();
+  wrongTarget.item.result.structuredContent.approval_target =
+    "repo_settings_other-repo";
+  assert.throws(
+    () => captureWorkspaceGitPlan(wrongTarget),
+    /approval target does not match/u,
+  );
+
+  const wrongResult = repositorySettingsNotification();
+  wrongResult.item.result.structuredContent.scope.resulting_state.topics = [
+    "other-topic",
+  ];
+  assert.throws(
+    () => captureWorkspaceGitPlan(wrongResult),
+    /result does not match/u,
+  );
+
+  const substitutedInput = repositorySettingsNotification();
+  substitutedInput.item.arguments.description = "Different input";
+  assert.throws(
+    () => captureWorkspaceGitPlan(substitutedInput),
+    /description does not match/u,
+  );
+
+  const wrongExecuteTool = repositorySettingsNotification();
+  wrongExecuteTool.item.result.structuredContent.execute_tool =
+    "execute_approved_git_publication";
+  assert.throws(
+    () => captureWorkspaceGitPlan(wrongExecuteTool),
+    /invalid approval execution boundary/u,
+  );
+
+  const extraInput = repositorySettingsNotification();
+  Reflect.set(extraInput.item.arguments, "unexpected", true);
+  assert.throws(
+    () => captureWorkspaceGitPlan(extraInput),
+    /repository settings input is invalid/u,
+  );
+
+  const extraScope = repositorySettingsNotification();
+  Reflect.set(
+    extraScope.item.result.structuredContent.scope,
+    "unexpected",
+    true,
+  );
+  assert.throws(
+    () => captureWorkspaceGitPlan(extraScope),
+    /repository settings scope is invalid/u,
+  );
+
+  for (const ttlMinutes of [4, 61, 5.5]) {
+    const invalidTtl = repositorySettingsNotification();
+    Reflect.set(invalidTtl.item.arguments, "ttl_minutes", ttlMinutes);
+    assert.throws(
+      () => captureWorkspaceGitPlan(invalidTtl),
+      /repository settings TTL is invalid/u,
+    );
+  }
 });
 
 test("derives a missing publication approval target from exact prepare inputs", () => {
@@ -498,7 +639,7 @@ test("accepts only the fixed, non-secret approval choices", () => {
         id: "approval",
         header: "Approval",
         question: "Approve this exact plan?",
-        isOther: true,
+        isOther: false,
         isSecret: false,
         options: [
           { label: "承認して実行", description: "execute" },
@@ -510,6 +651,26 @@ test("accepts only the fixed, non-secret approval choices", () => {
     autoResolutionMs: null,
   };
   assert.equal(validateWorkspaceGitPlanQuestion(request).questionId, "approval");
+  const questionWithoutWireDefaults = {
+    ...request.questions[0],
+    isOther: undefined,
+    isSecret: undefined,
+  };
+  assert.equal(
+    validateWorkspaceGitPlanQuestion({
+      ...request,
+      questions: [questionWithoutWireDefaults],
+      autoResolutionMs: undefined,
+    }).autoResolutionMs,
+    undefined,
+  );
+  assert.equal(
+    validateWorkspaceGitPlanQuestion({ ...request, isBlocking: false }).questionId,
+    "approval",
+  );
+  assert.throws(() =>
+    validateWorkspaceGitPlanQuestion({ ...request, isBlocking: "yes" })
+  );
   assert.equal(
     validateWorkspaceGitPlanQuestion({ ...request, autoResolutionMs: 60_000 })
       .autoResolutionMs,
@@ -524,6 +685,19 @@ test("accepts only the fixed, non-secret approval choices", () => {
     validateWorkspaceGitPlanQuestion({
       ...request,
       questions: [{ ...request.questions[0], isSecret: true }],
+    }),
+  );
+  assert.equal(
+    validateWorkspaceGitPlanQuestion({
+      ...request,
+      questions: [{ ...request.questions[0], isOther: true }],
+    }).questionId,
+    "approval",
+  );
+  assert.throws(() =>
+    validateWorkspaceGitPlanQuestion({
+      ...request,
+      questions: [{ ...request.questions[0], isOther: "yes" }],
     }),
   );
   assert.throws(() =>

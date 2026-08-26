@@ -51,6 +51,33 @@ function executionItem(
   };
 }
 
+function repositorySettingsPlan(): WorkspaceGitApprovalPlan {
+  return {
+    operationId: "33333333-3333-4333-8333-333333333333",
+    planHash: "f".repeat(64),
+    approvalTarget: "repo_settings_showtalk-taishi",
+    operation: "github_repository_settings",
+    repoId: "showtalk-taishi",
+    mode: "repository_settings",
+    paths: [],
+    repositorySettingsBefore: {
+      description: "Old description",
+      topics: ["slack"],
+      dependabotSecurityUpdates: "disabled",
+    },
+    repositorySettingsDesired: {
+      description: "New description",
+      dependabotSecurityUpdates: true,
+    },
+    repositorySettingsResultingState: {
+      description: "New description",
+      topics: ["slack"],
+      dependabotSecurityUpdates: "enabled",
+    },
+    expiresAt: "2026-08-26T12:00:00.000Z",
+  };
+}
+
 test("binds exactly one plan and preserves conflicting plans as ambiguous", () => {
   const lifecycle = new WorkspaceGitApprovalLifecycle();
   const exact = plan();
@@ -69,6 +96,10 @@ test("binds exactly one plan and preserves conflicting plans as ambiguous", () =
   );
   assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
     kind: "ambiguous",
+  });
+  assert.equal(lifecycle.takeTurnPlans("session", "turn").length, 3);
+  assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
+    kind: "missing",
   });
 });
 
@@ -106,6 +137,107 @@ test("does not overwrite an active approved execution", () => {
   assert.equal(lifecycle.approvedPlan("session")?.operationId, plan().operationId);
 });
 
+test("allows a second approval only after the first exact execution succeeds", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  const first = plan();
+  const second = plan({
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  lifecycle.beginApprovedExecution("session", first);
+  assert.throws(
+    () => lifecycle.beginApprovedExecution("session", second),
+    /already active/u,
+  );
+
+  lifecycle.observeItem(
+    "session",
+    executionItem("execute-first", "completed", "applied"),
+  );
+  assert.equal(lifecycle.approvedPlan("session"), undefined);
+  lifecycle.beginApprovedExecution("session", second);
+  assert.equal(lifecycle.approvedPlan("session")?.operationId, second.operationId);
+
+  assert.equal(
+    lifecycle.observeItem(
+      "session",
+      {
+        ...executionItem("execute-first-replay", "completed", "applied"),
+      },
+    ).duplicateExecutionDetected,
+    true,
+  );
+});
+
+test("does not treat one success plus another unfinished execute as completed", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  const first = plan();
+  const second = plan({
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  lifecycle.beginApprovedExecution("session", first);
+  lifecycle.observeItem(
+    "session",
+    executionItem("execute-success", "completed", "applied"),
+  );
+  lifecycle.observeItem(
+    "session",
+    executionItem("execute-still-running", "inProgress"),
+  );
+
+  assert.equal(lifecycle.hasExecutionWatch("session"), true);
+  assert.equal(lifecycle.approvedPlan("session")?.operationId, first.operationId);
+  assert.equal(lifecycle.isCompletedOperation("session", first.operationId), false);
+  assert.throws(
+    () => lifecycle.beginApprovedExecution("session", second),
+    /already active/u,
+  );
+});
+
+test("retains completed operation identity for replay rejection and auditing", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  const first = plan();
+  const second = plan({
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  lifecycle.beginApprovedExecution("session", first);
+  lifecycle.observeItem(
+    "session",
+    executionItem("execute-first", "completed", "applied"),
+  );
+
+  assert.equal(lifecycle.hasExecutionWatch("session"), true);
+  assert.equal(lifecycle.isCompletedOperation("session", first.operationId), true);
+  lifecycle.beginApprovedExecution("session", second);
+  assert.equal(lifecycle.isCompletedOperation("session", first.operationId), true);
+  assert.equal(lifecycle.isCompletedOperation("session", second.operationId), false);
+});
+
+test("observes the exact GitHub repository settings execute tool", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  const exact = repositorySettingsPlan();
+  lifecycle.beginApprovedExecution("session", exact);
+  lifecycle.observeItem("session", {
+    type: "mcpToolCall",
+    id: "settings-execute-1",
+    server: "workspace_git",
+    tool: "execute_approved_github_repository_settings",
+    status: "completed",
+    arguments: { operation_id: exact.operationId },
+    result: {
+      structuredContent: {
+        operation_id: exact.operationId,
+        status: "succeeded",
+      },
+    },
+  });
+  assert.deepEqual(lifecycle.assessTurnCompletion("session", "idle", true), {
+    kind: "executed",
+  });
+});
+
 test("consumes only the exact inspected plan", () => {
   const lifecycle = new WorkspaceGitApprovalLifecycle();
   const exact = plan();
@@ -124,6 +256,30 @@ test("consumes only the exact inspected plan", () => {
   });
 });
 
+test("discards all stale plan candidates for one recoverable turn", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  lifecycle.rememberPlan("session", "turn", plan());
+  lifecycle.rememberPlan(
+    "session",
+    "turn",
+    plan({
+      operationId: "22222222-2222-4222-8222-222222222222",
+      planHash: "d".repeat(64),
+    }),
+  );
+  lifecycle.rememberPlan("session", "other-turn", plan());
+
+  assert.equal(lifecycle.discardTurnPlans("session", "turn"), 2);
+  assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
+    kind: "missing",
+  });
+  assert.deepEqual(lifecycle.inspectPlanBinding("session", "other-turn"), {
+    kind: "exact",
+    plan: plan(),
+  });
+  assert.equal(lifecycle.discardTurnPlans("session", "turn"), 0);
+});
+
 test("deduplicates recovery per turn and clears only the selected session", () => {
   const lifecycle = new WorkspaceGitApprovalLifecycle();
   assert.equal(lifecycle.markRecoveryRequired("session-a", "turn"), true);
@@ -132,6 +288,26 @@ test("deduplicates recovery per turn and clears only the selected session", () =
   lifecycle.clearTurnArtifacts("session-a");
   assert.equal(lifecycle.markRecoveryRequired("session-a", "turn"), true);
   assert.equal(lifecycle.markRecoveryRequired("session-b", "turn"), false);
+});
+
+test("blocks new plans after a malformed request until turn artifacts clear", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  assert.equal(lifecycle.markRequestInvalid("session", "turn"), true);
+  assert.equal(lifecycle.markRequestInvalid("session", "turn"), false);
+  assert.equal(lifecycle.isRequestInvalid("session", "turn"), true);
+
+  lifecycle.rememberPlan("session", "turn", plan());
+  assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
+    kind: "missing",
+  });
+
+  lifecycle.clearTurnArtifacts("session");
+  assert.equal(lifecycle.isRequestInvalid("session", "turn"), false);
+  lifecycle.rememberPlan("session", "turn", plan());
+  assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
+    kind: "exact",
+    plan: plan(),
+  });
 });
 
 test("requests one bounded continuation when approval produced no execute item", () => {

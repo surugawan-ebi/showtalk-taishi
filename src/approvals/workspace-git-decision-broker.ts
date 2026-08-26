@@ -2,8 +2,6 @@ import { execFile } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 
-import type { WorkspaceGitApprovalPlan } from "../core/index.js";
-
 const APPROVAL_CLI_ENV_VAR = "SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI";
 const STATE_ROOT_ENV_VAR = "WORKSPACE_GIT_STATE_ROOT";
 const MAX_CLI_OUTPUT_BYTES = 512 * 1_024;
@@ -11,9 +9,17 @@ const CLI_TIMEOUT_MS = 15_000;
 
 export type WorkspaceGitDecision = "approve" | "reject";
 
+export interface WorkspaceGitDecisionPlan {
+  readonly operationId: string;
+  readonly planHash: string;
+  readonly approvalTarget: string;
+  readonly repoId: string;
+  readonly expiresAt: string;
+}
+
 export interface WorkspaceGitDecisionInput {
   readonly decision: WorkspaceGitDecision;
-  readonly plan: WorkspaceGitApprovalPlan;
+  readonly plan: WorkspaceGitDecisionPlan;
   readonly actor: string;
 }
 
@@ -176,7 +182,7 @@ function parseApprovalStatus(value: unknown): WorkspaceGitApprovalStatus {
 
 function assertExactPlan(
   status: WorkspaceGitApprovalStatus,
-  plan: WorkspaceGitApprovalPlan,
+  plan: WorkspaceGitDecisionPlan,
 ): void {
   if (
     status.operationId !== plan.operationId ||

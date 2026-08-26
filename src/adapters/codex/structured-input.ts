@@ -15,6 +15,8 @@ const MAX_LABEL_LENGTH = 75;
 const MAX_DESCRIPTION_LENGTH = 1_000;
 const MIN_AUTO_RESOLUTION_MS = 60_000;
 const MAX_AUTO_RESOLUTION_MS = 240_000;
+const RESERVED_APPROVE_LABEL = "承認して実行";
+const RESERVED_REJECT_LABEL = "拒否保留";
 
 export interface ValidatedChoiceQuestion extends AgentChoiceQuestion {
   readonly appServerQuestionId: string;
@@ -49,14 +51,28 @@ export function looksLikeWorkspaceGitApproval(value: unknown): boolean {
     const label = asRecord(option)?.label;
     if (typeof label !== "string") return false;
     const normalized = normalizeApprovalLabel(label);
-    return normalized === "承認して実行" || normalized === "拒否保留";
+    return normalized === RESERVED_APPROVE_LABEL || normalized === RESERVED_REJECT_LABEL;
   });
+}
+
+/**
+ * The question ID is an authority-bearing Git signal. Reserved labels alone
+ * only keep a brief same-turn window open while an exact plan may arrive.
+ */
+export function hasWorkspaceGitApprovalQuestionId(value: unknown): boolean {
+  const params = asRecord(value);
+  const questions = params?.questions;
+  if (!Array.isArray(questions) || questions.length !== 1) return false;
+  return asRecord(questions[0])?.id === "git_approval";
 }
 
 export function validateOrdinaryChoiceRequest(
   value: unknown,
 ): ValidatedChoiceRequest {
   const params = requiredRecord(value, "structured input request");
+  if (typeof params.isBlocking !== "boolean") {
+    throw new Error("Structured input blocking mode is invalid");
+  }
   const threadId = boundedString(params.threadId, "thread ID", MAX_ID_LENGTH);
   const turnId = boundedString(params.turnId, "turn ID", MAX_ID_LENGTH);
   const itemId = boundedString(params.itemId, "item ID", MAX_ID_LENGTH);
@@ -81,10 +97,12 @@ export function validateOrdinaryChoiceRequest(
       throw new Error("Structured input question IDs must be unique");
     }
     appServerQuestionIds.add(appServerQuestionId);
-    if (question.isSecret !== false) {
+    const isSecret = question.isSecret ?? false;
+    const isOther = question.isOther ?? false;
+    if (isSecret !== false) {
       throw new Error("Secret structured input is not supported in Slack");
     }
-    if (typeof question.isOther !== "boolean") {
+    if (typeof isOther !== "boolean") {
       throw new Error("Structured input Other option is invalid");
     }
     if (
@@ -95,12 +113,13 @@ export function validateOrdinaryChoiceRequest(
       throw new Error("Ordinary structured input requires two or three fixed options");
     }
     const labels = new Set<string>();
-    const options = question.options.map((option, optionIndex) => {
-      const label = boundedString(option.label, "option label", MAX_LABEL_LENGTH);
-      const normalizedLabel = normalizeApprovalLabel(label);
-      if (normalizedLabel === "承認して実行" || normalizedLabel === "拒否保留") {
-        throw new Error("Git approval choices cannot be used as ordinary structured input");
-      }
+    const validatedOptions = question.options.map((option, optionIndex) => {
+      const appServerLabel = boundedString(
+        option.label,
+        "option label",
+        MAX_LABEL_LENGTH,
+      );
+      const label = appServerLabel;
       if (labels.has(label)) {
         throw new Error("Structured input option labels must be unique");
       }
@@ -114,7 +133,7 @@ export function validateOrdinaryChoiceRequest(
           MAX_DESCRIPTION_LENGTH,
           true,
         ),
-        appServerLabel: label,
+        appServerLabel,
       };
     });
     return {
@@ -122,13 +141,14 @@ export function validateOrdinaryChoiceRequest(
       appServerQuestionId,
       header: boundedString(question.header, "question header", MAX_HEADER_LENGTH),
       prompt: boundedString(question.question, "question prompt", MAX_PROMPT_LENGTH),
-      options: Object.freeze(options),
-      allowsOther: question.isOther,
+      options: Object.freeze(validatedOptions),
+      allowsOther: isOther,
     } satisfies ValidatedChoiceQuestion;
   });
 
   const autoResolutionMs = params.autoResolutionMs;
   if (
+    autoResolutionMs !== undefined &&
     autoResolutionMs !== null &&
     (typeof autoResolutionMs !== "number" ||
       !Number.isSafeInteger(autoResolutionMs) ||

@@ -54,9 +54,14 @@ export class WorkspaceGitApprovalLifecycle {
     Map<string, readonly WorkspaceGitApprovalPlan[]>
   >();
   readonly #recoveryTurnsBySession = new Map<string, Set<string>>();
+  readonly #invalidRequestTurnsBySession = new Map<string, Set<string>>();
   readonly #approvedExecutionsBySession = new Map<
     string,
     ApprovedExecutionWatch
+  >();
+  readonly #completedExecutionsBySession = new Map<
+    string,
+    Map<string, ApprovedExecutionWatch>
   >();
 
   rememberPlan(
@@ -64,25 +69,22 @@ export class WorkspaceGitApprovalLifecycle {
     turnId: string,
     plan: WorkspaceGitApprovalPlan,
   ): void {
+    if (this.isRequestInvalid(sessionId, turnId)) return;
     const turns = this.#plansBySession.get(sessionId) ??
       new Map<string, readonly WorkspaceGitApprovalPlan[]>();
     const current = turns.get(turnId) ?? [];
-    const duplicate = current.find(
-      (candidate) => candidate.operationId === plan.operationId,
+    const duplicate = current.find((candidate) =>
+      sameExactWorkspaceGitApprovalPlan(candidate, plan)
     );
     if (duplicate !== undefined) {
-      if (!sameExactPlan(duplicate, plan) && current.length < 2) {
-        turns.set(turnId, Object.freeze([...current, plan]));
-      }
       this.#plansBySession.set(sessionId, turns);
       return;
     }
-    // Two distinct plans are enough to make the binding ambiguous. Retaining
-    // more cannot restore authority and would only grow process-local state.
-    if (current.length < 2) {
-      turns.set(turnId, Object.freeze([...current, plan]));
-      this.#plansBySession.set(sessionId, turns);
-    }
+    // Every distinct private operation must remain available for fail-closed
+    // settlement. Two plans are enough to make human binding ambiguous, but
+    // dropping later plans would leave their private broker operations pending.
+    turns.set(turnId, Object.freeze([...current, plan]));
+    this.#plansBySession.set(sessionId, turns);
   }
 
   inspectPlanBinding(sessionId: string, turnId: string): WorkspaceGitPlanBinding {
@@ -101,12 +103,28 @@ export class WorkspaceGitApprovalLifecycle {
     const plans = turns?.get(turnId) ?? [];
     if (
       plans.length !== 1 ||
-      !sameExactPlan(plans[0]!, expectedPlan)
+      !sameExactWorkspaceGitApprovalPlan(plans[0]!, expectedPlan)
     ) {
       throw new Error("workspace-git plan binding changed before consumption");
     }
     turns!.delete(turnId);
     if (turns!.size === 0) this.#plansBySession.delete(sessionId);
+  }
+
+  discardTurnPlans(sessionId: string, turnId: string): number {
+    return this.takeTurnPlans(sessionId, turnId).length;
+  }
+
+  takeTurnPlans(
+    sessionId: string,
+    turnId: string,
+  ): readonly WorkspaceGitApprovalPlan[] {
+    const turns = this.#plansBySession.get(sessionId);
+    const plans = turns?.get(turnId) ?? [];
+    if (plans.length === 0) return Object.freeze([]);
+    turns!.delete(turnId);
+    if (turns!.size === 0) this.#plansBySession.delete(sessionId);
+    return plans;
   }
 
   markRecoveryRequired(sessionId: string, turnId: string): boolean {
@@ -117,12 +135,38 @@ export class WorkspaceGitApprovalLifecycle {
     return true;
   }
 
+  markRequestInvalid(sessionId: string, turnId: string): boolean {
+    const turns = this.#invalidRequestTurnsBySession.get(sessionId) ?? new Set();
+    if (turns.has(turnId)) return false;
+    turns.add(turnId);
+    this.#invalidRequestTurnsBySession.set(sessionId, turns);
+    return true;
+  }
+
+  isRequestInvalid(sessionId: string, turnId: string): boolean {
+    return this.#invalidRequestTurnsBySession.get(sessionId)?.has(turnId) === true;
+  }
+
   beginApprovedExecution(
     sessionId: string,
     plan: WorkspaceGitApprovalPlan,
   ): void {
-    if (this.#approvedExecutionsBySession.has(sessionId)) {
-      throw new Error("workspace-git approved execution is already active");
+    const current = this.#approvedExecutionsBySession.get(sessionId);
+    if (current !== undefined) {
+      if (!executionSucceeded(current)) {
+        throw new Error("workspace-git approved execution is already active");
+      }
+      const completed = this.#completedExecutionsBySession.get(sessionId) ??
+        new Map<string, ApprovedExecutionWatch>();
+      completed.set(current.plan.operationId, current);
+      this.#completedExecutionsBySession.set(sessionId, completed);
+      this.#approvedExecutionsBySession.delete(sessionId);
+    }
+    if (
+      this.#completedExecutionsBySession.get(sessionId)?.has(plan.operationId) ===
+        true
+    ) {
+      throw new Error("workspace-git approved execution has already completed");
     }
     this.#approvedExecutionsBySession.set(sessionId, {
       plan,
@@ -136,7 +180,27 @@ export class WorkspaceGitApprovalLifecycle {
   }
 
   approvedPlan(sessionId: string): WorkspaceGitApprovalPlan | undefined {
-    return this.#approvedExecutionsBySession.get(sessionId)?.plan;
+    const watch = this.#approvedExecutionsBySession.get(sessionId);
+    return watch === undefined || executionSucceeded(watch)
+      ? undefined
+      : watch.plan;
+  }
+
+  hasExecutionWatch(sessionId: string): boolean {
+    return this.#approvedExecutionsBySession.has(sessionId) ||
+      (this.#completedExecutionsBySession.get(sessionId)?.size ?? 0) > 0;
+  }
+
+  isCompletedOperation(sessionId: string, operationId: string): boolean {
+    const active = this.#approvedExecutionsBySession.get(sessionId);
+    if (
+      active?.plan.operationId === operationId &&
+      executionSucceeded(active)
+    ) {
+      return true;
+    }
+    return this.#completedExecutionsBySession.get(sessionId)?.has(operationId) ===
+      true;
   }
 
   clearApprovedExecution(
@@ -146,7 +210,8 @@ export class WorkspaceGitApprovalLifecycle {
     const watch = this.#approvedExecutionsBySession.get(sessionId);
     if (
       watch === undefined ||
-      (expectedPlan !== undefined && !sameExactPlan(watch.plan, expectedPlan))
+      (expectedPlan !== undefined &&
+        !sameExactWorkspaceGitApprovalPlan(watch.plan, expectedPlan))
     ) {
       return false;
     }
@@ -159,16 +224,21 @@ export class WorkspaceGitApprovalLifecycle {
     item: Record<string, unknown>,
   ): WorkspaceGitExecutionObservation {
     const watch = this.#approvedExecutionsBySession.get(sessionId);
-    if (watch === undefined) return { duplicateExecutionDetected: false };
-    return observeApprovedItem(watch, item);
+    let duplicateExecutionDetected = watch === undefined
+      ? false
+      : observeApprovedItem(watch, item).duplicateExecutionDetected;
+    for (const completed of this.#completedExecutionsBySession.get(sessionId)?.values() ?? []) {
+      duplicateExecutionDetected ||=
+        observeApprovedItem(completed, item).duplicateExecutionDetected;
+    }
+    return { duplicateExecutionDetected };
   }
 
   observeTurnSnapshot(
     sessionId: string,
     turn: Record<string, unknown> | undefined,
   ): WorkspaceGitExecutionObservation {
-    const watch = this.#approvedExecutionsBySession.get(sessionId);
-    if (watch === undefined || !hasFullTurnItems(turn)) {
+    if (!hasFullTurnItems(turn)) {
       return { duplicateExecutionDetected: false };
     }
     const items = turn?.items;
@@ -177,7 +247,7 @@ export class WorkspaceGitApprovalLifecycle {
     for (const candidate of items) {
       const item = asRecord(candidate);
       if (item === undefined) continue;
-      const observation = observeApprovedItem(watch, item);
+      const observation = this.observeItem(sessionId, item);
       duplicateExecutionDetected ||= observation.duplicateExecutionDetected;
     }
     return { duplicateExecutionDetected };
@@ -230,17 +300,21 @@ export class WorkspaceGitApprovalLifecycle {
   clearTurnArtifacts(sessionId: string): void {
     this.#plansBySession.delete(sessionId);
     this.#recoveryTurnsBySession.delete(sessionId);
+    this.#invalidRequestTurnsBySession.delete(sessionId);
   }
 
   clearSession(sessionId: string): void {
     this.clearTurnArtifacts(sessionId);
     this.clearApprovedExecution(sessionId);
+    this.#completedExecutionsBySession.delete(sessionId);
   }
 
   clearAll(): void {
     this.#plansBySession.clear();
     this.#recoveryTurnsBySession.clear();
+    this.#invalidRequestTurnsBySession.clear();
     this.#approvedExecutionsBySession.clear();
+    this.#completedExecutionsBySession.clear();
   }
 }
 
@@ -305,10 +379,7 @@ function isExactWorkspaceGitExecution(
   if (
     item.type !== "mcpToolCall" ||
     !isWorkspaceGitServer(item.server) ||
-    item.tool !==
-      (plan.operation === "git_publication"
-        ? "execute_approved_git_publication"
-        : "execute_approved_pull_request_operation")
+    item.tool !== exactExecutionTool(plan)
   ) {
     return false;
   }
@@ -354,11 +425,11 @@ function exactWorkspaceGitOperationStatus(
     : undefined;
 }
 
-function sameExactPlan(
+export function sameExactWorkspaceGitApprovalPlan(
   left: WorkspaceGitApprovalPlan,
   right: WorkspaceGitApprovalPlan,
 ): boolean {
-  return left.operationId === right.operationId &&
+  const commonMatches = left.operationId === right.operationId &&
     left.planHash === right.planHash &&
     left.approvalTarget === right.approvalTarget &&
     left.operation === right.operation &&
@@ -379,6 +450,79 @@ function sameExactPlan(
     left.baseBranch === right.baseBranch &&
     left.mergeMethod === right.mergeMethod &&
     left.expiresAt === right.expiresAt;
+  if (!commonMatches) return false;
+  if (
+    left.operation === "github_repository_settings" ||
+    right.operation === "github_repository_settings"
+  ) {
+    return left.operation === "github_repository_settings" &&
+      right.operation === "github_repository_settings" &&
+      sameRepositorySettingsState(
+        left.repositorySettingsBefore,
+        right.repositorySettingsBefore,
+      ) &&
+      sameRepositorySettingsDesired(
+        left.repositorySettingsDesired,
+        right.repositorySettingsDesired,
+      ) &&
+      sameRepositorySettingsState(
+        left.repositorySettingsResultingState,
+        right.repositorySettingsResultingState,
+      );
+  }
+  return true;
+}
+
+function exactExecutionTool(plan: WorkspaceGitApprovalPlan): string {
+  switch (plan.operation) {
+    case "git_publication":
+      return "execute_approved_git_publication";
+    case "pull_request_ready":
+    case "pull_request_merge":
+      return "execute_approved_pull_request_operation";
+    case "github_repository_settings":
+      return "execute_approved_github_repository_settings";
+  }
+}
+
+function executionSucceeded(watch: ApprovedExecutionWatch): boolean {
+  return watch.executeCompletedItemIds.size > 0 &&
+    watch.executeFailedItemIds.size === 0 &&
+    [...watch.executeStartedItemIds].every((itemId) =>
+      watch.executeCompletedItemIds.has(itemId)
+    );
+}
+
+function sameRepositorySettingsState(
+  left: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsBefore"],
+  right: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsBefore"],
+): boolean {
+  return left.description === right.description &&
+    sameStrings(left.topics, right.topics) &&
+    left.dependabotSecurityUpdates === right.dependabotSecurityUpdates;
+}
+
+function sameRepositorySettingsDesired(
+  left: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsDesired"],
+  right: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsDesired"],
+): boolean {
+  return left.description === right.description &&
+    (left.topics === undefined
+      ? right.topics === undefined
+      : right.topics !== undefined && sameStrings(left.topics, right.topics)) &&
+    left.dependabotSecurityUpdates === right.dependabotSecurityUpdates &&
+    Object.hasOwn(left, "description") === Object.hasOwn(right, "description") &&
+    Object.hasOwn(left, "topics") === Object.hasOwn(right, "topics") &&
+    Object.hasOwn(left, "dependabotSecurityUpdates") ===
+      Object.hasOwn(right, "dependabotSecurityUpdates");
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {

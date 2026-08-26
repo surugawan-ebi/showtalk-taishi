@@ -4,6 +4,7 @@ import {
   CoreError,
   type DelegationResultMessage,
   type GatewayAgentEvent,
+  type WorkspaceGitApprovalPlan,
 } from "../core/index.js";
 import {
   presentationForChannel,
@@ -12,16 +13,24 @@ import {
 import { SlackThreadProjector } from "./projector.js";
 import { formatAgentTextForSlack } from "./text-format.js";
 import type { WorkspaceGitApprovalDetailsStore } from "./user-input-blocks.js";
+import type { StructuredChoiceContinuationStore } from "./choice-continuation.js";
 
 const MAX_FALLBACK_RESULT_TEXT = 3_000;
 
-export interface UserInputProjectionFailure {
-  readonly kind: "git_approval" | "choice" | "approval";
+export type UserInputProjectionFailure = {
+  readonly kind: "git_approval";
+  readonly plan: WorkspaceGitApprovalPlan;
   readonly sessionId: string;
   readonly channelId: string;
   readonly rootThreadTs: string;
   readonly requestId: string;
-}
+} | {
+  readonly kind: "choice" | "approval";
+  readonly sessionId: string;
+  readonly channelId: string;
+  readonly rootThreadTs: string;
+  readonly requestId: string;
+};
 
 /**
  * Projects a source-Koe continuation and preserves the target's actual result
@@ -37,6 +46,12 @@ export async function projectDelegationContinuation(
     failure: UserInputProjectionFailure,
   ) => Promise<void>,
   gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore,
+  onExternalGitResolution?: (
+    event: Extract<GatewayAgentEvent["event"], {
+      type: "git_approval.resolved_externally";
+    }>,
+  ) => Promise<void>,
+  choiceContinuationStore?: StructuredChoiceContinuationStore,
 ): Promise<void> {
   const sourceUserId =
     request.sourceSlackUserId ?? defaultNotificationUserId;
@@ -56,6 +71,9 @@ export async function projectDelegationContinuation(
       ...(gitApprovalDetailsStore === undefined
         ? {}
         : { gitApprovalDetailsStore }),
+      ...(choiceContinuationStore === undefined
+        ? {}
+        : { choiceContinuationStore }),
     },
   );
   let turnError: unknown;
@@ -63,6 +81,31 @@ export async function projectDelegationContinuation(
   try {
     for await (const result of events) {
       projector.setSessionId(result.sessionId);
+      if (result.event.type === "git_approval.resolved_externally") {
+        let settlementError: unknown;
+        try {
+          await onExternalGitResolution?.(result.event);
+        } catch (error) {
+          settlementError = error;
+        }
+        let terminalProjectionError: unknown;
+        try {
+          await projector.project(result.event);
+        } catch (error) {
+          terminalProjectionError = error;
+        }
+        if (settlementError !== undefined && terminalProjectionError !== undefined) {
+          projectionError ??= new AggregateError(
+            [settlementError, terminalProjectionError],
+            "Externally resolved Git approval could not be fully settled",
+          );
+        } else if (settlementError !== undefined) {
+          projectionError ??= settlementError;
+        }
+        // Once the reject intent is durable, terminal Slack projection is
+        // cosmetic and must not abort the delayed Codex continuation.
+        continue;
+      }
       try {
         await projector.project(result.event);
       } catch (error) {
@@ -72,18 +115,27 @@ export async function projectDelegationContinuation(
             result.event.type === "approval.requested") &&
           onUserInputProjectionFailure !== undefined
         ) {
-          await onUserInputProjectionFailure({
-            kind:
-              result.event.type === "user_input.requested"
-                ? "git_approval"
-                : result.event.type === "approval.requested"
-                  ? "approval"
-                  : "choice",
+          const common = {
             sessionId: result.sessionId,
             channelId: result.conversation.channelId,
             rootThreadTs: result.conversation.rootThreadTs,
             requestId: result.event.requestId,
-          });
+          };
+          if (result.event.type === "user_input.requested") {
+            await onUserInputProjectionFailure({
+              kind: "git_approval",
+              plan: result.event.plan,
+              ...common,
+            });
+          } else {
+            await onUserInputProjectionFailure({
+              kind:
+                result.event.type === "approval.requested"
+                  ? "approval"
+                  : "choice",
+              ...common,
+            });
+          }
         }
         // Match ordinary Slack turns: a cosmetic stream update must not cancel
         // the underlying source Koe continuation. A structured request is
