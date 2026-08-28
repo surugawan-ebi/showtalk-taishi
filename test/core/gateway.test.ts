@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AdapterSessionUnavailableError,
   CoreError,
   Gateway,
   InMemoryAgentRegistry,
@@ -70,6 +71,18 @@ class GatewayAdapter implements AgentAdapter {
   }
   async status(): Promise<AgentStatus> {
     return "idle";
+  }
+}
+
+class MissingSessionAdapter extends GatewayAdapter {
+  readonly missingSessionIds = new Set<string>();
+
+  override async resumeSession(request: ResumeSessionRequest): Promise<AdapterSession> {
+    this.resumed += 1;
+    if (this.missingSessionIds.has(request.adapterSessionId)) {
+      throw new AdapterSessionUnavailableError(request.adapterSessionId);
+    }
+    return { id: request.adapterSessionId };
   }
 }
 
@@ -239,6 +252,148 @@ test("isolates and resumes one backend session per Slack root for a thread-scope
   assert.equal(restoredAdapter.created, 0);
   assert.equal(restoredAdapter.resumed, 1);
   assert.equal(restoredAdapter.sent[0]?.session.id, "backend-thread-1");
+});
+
+test("falls back from a missing declared thread to Slack-thread mode", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({
+    id: "legacy",
+    adapter: "fake",
+    channelId: "C-LEGACY",
+    configuredAdapterSessionId: "declared-thread",
+  });
+  registry.addSession({
+    id: "session-declared",
+    agentId: "legacy",
+    adapter: "fake",
+    adapterSession: { id: "declared-thread" },
+    status: "idle",
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+  });
+  registry.setPrimarySession("legacy", "session-declared");
+  const adapter = new MissingSessionAdapter();
+  adapter.missingSessionIds.add("declared-thread");
+  let nextId = 0;
+  const gateway = new Gateway(registry, [adapter], {
+    idFactory: () => `session-${++nextId}`,
+  });
+
+  await collect(gateway.handleHumanMessage({
+    channelId: "C-LEGACY",
+    rootThreadTs: "100.1",
+    text: "Recover this conversation",
+  }));
+  await collect(gateway.handleHumanMessage({
+    channelId: "C-LEGACY",
+    rootThreadTs: "200.1",
+    text: "Start another thread",
+  }));
+
+  assert.equal(adapter.resumed, 1);
+  assert.equal(adapter.created, 2);
+  assert.equal(adapter.sent[0]?.session.id, "backend-thread-1");
+  assert.equal(adapter.sent[1]?.session.id, "backend-thread-2");
+  assert.equal(registry.requireAgent("legacy").conversationScope, "slack_thread");
+  assert.equal(registry.getPrimarySession("legacy")?.id, "session-declared");
+  assert.notEqual(
+    registry.getConversation("C-LEGACY", "100.1")?.sessionId,
+    registry.getConversation("C-LEGACY", "200.1")?.sessionId,
+  );
+
+  const restoredRegistry = new InMemoryAgentRegistry(registry.snapshot());
+  const restoredAdapter = new MissingSessionAdapter();
+  restoredAdapter.missingSessionIds.add("declared-thread");
+  const restoredGateway = new Gateway(restoredRegistry, [restoredAdapter]);
+  await collect(restoredGateway.handleHumanMessage({
+    channelId: "C-LEGACY",
+    rootThreadTs: "100.1",
+    text: "Continue after restart",
+  }));
+  assert.equal(restoredAdapter.resumed, 1);
+  assert.equal(restoredAdapter.created, 0);
+  assert.equal(restoredAdapter.sent[0]?.session.id, "backend-thread-1");
+});
+
+test("does not recreate a missing Codex thread for a project Slack root", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({
+    id: "project",
+    adapter: "fake",
+    channelId: "C-PROJECT",
+    conversationScope: "slack_thread",
+  });
+  const adapter = new MissingSessionAdapter();
+  const gateway = new Gateway(registry, [adapter], { idFactory: () => "session-1" });
+  await collect(gateway.handleHumanMessage({
+    channelId: "C-PROJECT",
+    rootThreadTs: "100.1",
+    text: "Create project thread",
+  }));
+
+  const restoredRegistry = new InMemoryAgentRegistry(registry.snapshot());
+  const restoredAdapter = new MissingSessionAdapter();
+  restoredAdapter.missingSessionIds.add("backend-thread-1");
+  const restoredGateway = new Gateway(restoredRegistry, [restoredAdapter]);
+
+  await assert.rejects(
+    () => collect(restoredGateway.handleHumanMessage({
+      channelId: "C-PROJECT",
+      rootThreadTs: "100.1",
+      text: "Resume deleted project thread",
+    })),
+    (error) => error instanceof AdapterSessionUnavailableError,
+  );
+  assert.equal(restoredAdapter.created, 0);
+  assert.equal(restoredAdapter.resumed, 1);
+  assert.equal(
+    restoredRegistry.getConversation("C-PROJECT", "100.1")?.sessionId,
+    "session-1",
+  );
+});
+
+test("does not recreate a deleted thread created by the legacy fallback", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({
+    id: "legacy",
+    adapter: "fake",
+    channelId: "C-LEGACY-FALLBACK",
+    configuredAdapterSessionId: "declared-thread",
+  });
+  registry.addSession({
+    id: "session-declared",
+    agentId: "legacy",
+    adapter: "fake",
+    adapterSession: { id: "declared-thread" },
+    status: "idle",
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+  });
+  registry.setPrimarySession("legacy", "session-declared");
+  const adapter = new MissingSessionAdapter();
+  adapter.missingSessionIds.add("declared-thread");
+  const gateway = new Gateway(registry, [adapter], { idFactory: () => "session-1" });
+  await collect(gateway.handleHumanMessage({
+    channelId: "C-LEGACY-FALLBACK",
+    rootThreadTs: "100.1",
+    text: "Recover this legacy thread",
+  }));
+
+  const restoredRegistry = new InMemoryAgentRegistry(registry.snapshot());
+  const restoredAdapter = new MissingSessionAdapter();
+  restoredAdapter.missingSessionIds.add("backend-thread-1");
+  const restoredGateway = new Gateway(restoredRegistry, [restoredAdapter]);
+
+  await assert.rejects(
+    () => collect(restoredGateway.handleHumanMessage({
+      channelId: "C-LEGACY-FALLBACK",
+      rootThreadTs: "100.1",
+      text: "Do not replace this deleted thread",
+    })),
+    (error) => error instanceof AdapterSessionUnavailableError,
+  );
+  assert.equal(restoredAdapter.created, 0);
+  assert.equal(restoredAdapter.resumed, 1);
 });
 
 test("delivers a late Koe result only to its exact thread-scoped source session", async () => {

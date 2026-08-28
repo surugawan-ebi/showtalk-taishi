@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { access, constants, stat } from "node:fs/promises";
 
-import { CoreError } from "../../core/errors.js";
+import {
+  AgentWorkspaceUnavailableError,
+  AdapterSessionUnavailableError,
+  CoreError,
+} from "../../core/errors.js";
 import type {
   AdapterSession,
   AgentAdapter,
@@ -385,6 +390,7 @@ export class CodexAdapter implements AgentAdapter {
 
   async createSession(request: CreateSessionRequest): Promise<AdapterSession> {
     const workspacePath = getWorkspacePath(request);
+    await validateWorkspace(request.agent.id, workspacePath);
     const thread = await this.#client.startThread({
       ...(this.#options.model === undefined ? {} : { model: this.#options.model }),
       ...(workspacePath === undefined ? {} : { cwd: workspacePath }),
@@ -414,8 +420,19 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async resumeSession(request: ResumeSessionRequest): Promise<AdapterSession> {
+    await validateWorkspace(request.agent.id, getWorkspacePath(request));
     const params = this.#buildResumeParams(request.agent, request.adapterSessionId);
-    const thread = await this.#resumeThreadWithCompatibility(params);
+    let thread: CodexThread;
+    try {
+      thread = await this.#resumeThreadWithCompatibility(params);
+    } catch (error) {
+      if (isMissingCodexThreadError(error)) {
+        throw new AdapterSessionUnavailableError(request.adapterSessionId, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
     this.#statuses.set(thread.id, "idle");
     this.#loadedSessions.add(thread.id);
     this.#resumeParamsBySession.set(thread.id, params);
@@ -2428,6 +2445,10 @@ function isPaginatedThreadsUnsupported(error: unknown): boolean {
   );
 }
 
+function isMissingCodexThreadError(error: unknown): boolean {
+  return error instanceof CodexRpcError && /\bthread not loaded\b/iu.test(error.message);
+}
+
 function codexDeveloperInstructions(role: string | undefined): string {
   const configuredRole = role?.trim();
   return [
@@ -2579,6 +2600,22 @@ function getWorkspacePath(
 ): string | undefined {
   const value = request.agent.metadata?.workspacePath;
   return typeof value === "string" ? value : undefined;
+}
+
+async function validateWorkspace(
+  agentId: string,
+  workspacePath: string | undefined,
+): Promise<void> {
+  if (workspacePath === undefined) return;
+  try {
+    const info = await stat(workspacePath);
+    if (!info.isDirectory()) throw new Error("not a directory");
+    await access(workspacePath, constants.R_OK | constants.W_OK);
+  } catch (error) {
+    throw new AgentWorkspaceUnavailableError(agentId, workspacePath, {
+      cause: error,
+    });
+  }
 }
 
 function belongsToThread(params: unknown, threadId: string): boolean {

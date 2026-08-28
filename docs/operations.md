@@ -41,13 +41,35 @@ plan before requesting approval again.
 
 Selecting `承認して実行` first records the exact decision through the
 model-inaccessible workspace-git private broker, then resumes the original
-Codex request. Configure the LaunchAgent `.env` with the absolute built CLI
-path and the same private state root used by workspace-git:
+Codex request. Configure the LaunchAgent `.env` with the absolute built private
+module path and the same private state root used by workspace-git:
 
 ```dotenv
-SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI=/absolute/path/to/local-mcp/servers/workspace-git/dist/src/cli/approval-cli.js
+SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE=/absolute/path/to/local-mcp/servers/workspace-git/dist/src/approval/private-approval-broker.js
 WORKSPACE_GIT_STATE_ROOT=/absolute/private/state/workspace-git
 ```
+
+Older installations that still set `SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI` are
+migrated by deriving the sibling private-module path; the CLI itself is never
+executed. Update the variable at the next convenient configuration change.
+
+Each human decision also carries a delivery ID derived from the exact Slack
+channel, root thread, Block message, request, approver, decision, operation,
+and plan hash. Retrying the same authenticated callback is idempotent, while a
+different message or request cannot replay a recorded approval. workspace-git
+recomputes the persisted plan hash while holding its state lock before it
+accepts the decision.
+
+Every prepare result also includes a bounded `approval_scope` and opaque
+`approval_authority_id`. The latter identifies the active private state without
+revealing its path or key. A Gateway connected to another state root, a replaced
+state, or an old card therefore fails before it can authorize a different plan.
+The private approval worker bounds each request and returns only safe error codes;
+local paths and state details do not cross into Slack logs. If the initial reply
+times out, it queries the same exact delivery through the private module. A
+confirmed durable decision continues normally. An inconclusive result keeps the
+App Server request and Slack card pending so pressing the same bound button can
+reconcile idempotently; it is not rewritten as a rejection.
 
 The resumed turn must still use workspace-git's status and execute boundaries;
 ShowTalk does not directly perform the Git write from a Slack callback.

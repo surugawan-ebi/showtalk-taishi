@@ -16,7 +16,11 @@ import type {
   PermissionApprovalPresentation,
   PermissionApprovalSettlement,
 } from "../permissions/approval-coordinator.js";
-import type { WorkspaceGitDecisionBroker } from "../approvals/workspace-git-decision-broker.js";
+import {
+  createWorkspaceGitDecisionDeliveryId,
+  isWorkspaceGitDecisionBrokerError,
+  type WorkspaceGitDecisionBroker,
+} from "../approvals/workspace-git-decision-broker.js";
 import type {
   WorkspaceGitSystemRejectionActor,
   WorkspaceGitSystemRejectionRecorder,
@@ -475,6 +479,52 @@ export class SlackFrontend {
       text: "このGit承認は利用できません。承認画面を再作成してください。",
       blocks: buildUnavailableWorkspaceGitApprovalBlocks(),
     });
+  }
+
+  async #closeFailedPrivateGitDecision(
+    client: WebClient,
+    details: WorkspaceGitApprovalDetails,
+    failure: unknown,
+  ): Promise<void> {
+    // A failed human decision write must not leave Codex blocked indefinitely.
+    // Persist a fail-closed rejection intent first, then answer the single-use
+    // App Server request as reject and replace the stale approval buttons with
+    // a fresh-plan recovery action carrying no old Git authority.
+    await closeFailedPrivateGitDecisionBeforeRecovery(
+      this.#workspaceGitSystemRejectionRecorder,
+      details.plan,
+      () => this.#gateway.resolveUserInput(
+        details.routing.channelId,
+        details.routing.rootThreadTs,
+        {
+          requestId: details.routing.requestId,
+          optionId: "reject",
+          plan: details.plan,
+        },
+      ),
+      async () => {
+        this.#gitApprovalDetails.forget(details.routing);
+        const reason = publicErrorMessage(failure);
+        const message =
+          `Git承認をprivate stateへ記録できなかったため、この計画は安全に拒否されました。${reason}` +
+          " 最新状態から承認画面を再作成してください。";
+        const blocks = buildGitApprovalRecoveryBlocks(message, {
+          version: 1,
+          channelId: details.routing.channelId,
+          rootThreadTs: details.routing.rootThreadTs,
+          messageTs: details.routing.messageTs,
+        });
+        await client.chat.update({
+          channel: details.routing.channelId,
+          ts: details.routing.messageTs,
+          text: message,
+          blocks:
+            details.sourceUserMention === undefined
+              ? blocks
+              : [gitApprovalMentionBlock(details.sourceUserMention), ...blocks],
+        });
+      },
+    );
   }
 
   async #rejectUnprojectedGitApproval(
@@ -1346,21 +1396,43 @@ export class SlackFrontend {
             if (await this.#terminalizeExpiredGitApprovalCard(client, details)) {
               return;
             }
-            await recordGitDecisionBeforeAppServerResume(
-              this.#workspaceGitDecisionBroker,
-              details.plan,
-              decision,
-              source.userId,
-              () => this.#gateway.resolveUserInput(
-                routing.channelId,
-                routing.rootThreadTs,
-                {
+            try {
+              await recordGitDecisionBeforeAppServerResume(
+                this.#workspaceGitDecisionBroker,
+                details.plan,
+                decision,
+                createWorkspaceGitDecisionDeliveryId({
+                  channelId: routing.channelId,
+                  rootThreadTs: routing.rootThreadTs,
+                  messageTs: routing.messageTs,
                   requestId: routing.requestId,
-                  optionId: decision,
-                  plan: details.plan,
-                },
-              ),
-            );
+                  userId: source.userId,
+                  decision,
+                  operationId: details.plan.operationId,
+                  planHash: details.plan.planHash,
+                }),
+                () => this.#gateway.resolveUserInput(
+                  routing.channelId,
+                  routing.rootThreadTs,
+                  {
+                    requestId: routing.requestId,
+                    optionId: decision,
+                    plan: details.plan,
+                  },
+                ),
+              );
+            } catch (error) {
+              logger.error(error);
+              if (!canSafelyRejectAfterPrivateGitDecisionFailure(error)) {
+                // A timeout or transport failure can race with a durable
+                // approval that completed after the local wait ended. Keep
+                // the App Server request and original Slack controls pending;
+                // retrying the same bound button reconciles by delivery ID.
+                throw error;
+              }
+              await this.#closeFailedPrivateGitDecision(client, details, error);
+              return;
+            }
             this.#gitApprovalDetails.forget(routing);
             try {
               await client.chat.update({
@@ -1959,7 +2031,7 @@ export async function recordGitDecisionBeforeAppServerResume(
   broker: WorkspaceGitDecisionBroker | undefined,
   plan: WorkspaceGitApprovalPlan,
   decision: "approve" | "reject",
-  slackUserId: string,
+  deliveryId: string,
   resume: () => Promise<void>,
 ): Promise<void> {
   if (broker === undefined) {
@@ -1968,9 +2040,28 @@ export async function recordGitDecisionBeforeAppServerResume(
   await broker.recordDecision({
     decision,
     plan,
-    actor: `slack-user:${slackUserId}`,
+    actor: "chat-user-via-showtalk",
+    deliveryId,
   });
   await resume();
+}
+
+export function canSafelyRejectAfterPrivateGitDecisionFailure(
+  error: unknown,
+): boolean {
+  if (!isWorkspaceGitDecisionBrokerError(error)) return false;
+  switch (error.code) {
+    case "invalid_decision":
+    case "operation_not_found":
+    case "plan_mismatch":
+    case "expired":
+      return true;
+    case "decision_replay":
+    case "status_conflict":
+    case "decision_outcome_unknown":
+    case "state_write_failed":
+      return false;
+  }
 }
 
 /** Records a non-human safety rejection before closing an invisible request. */
@@ -1998,6 +2089,25 @@ export async function recordSystemGitRejection(
     );
   }
   await recorder.recordRejection(plan, actor);
+}
+
+/**
+ * Converts a failed private human-decision write into one durable fail-closed
+ * rejection before the single-use App Server request and Slack card are closed.
+ */
+export async function closeFailedPrivateGitDecisionBeforeRecovery(
+  recorder: WorkspaceGitSystemRejectionRecorder | undefined,
+  plan: WorkspaceGitApprovalPlan,
+  closeAppServerRequest: () => Promise<void>,
+  projectRecovery: () => Promise<void>,
+): Promise<void> {
+  await recordSystemGitRejection(
+    recorder,
+    plan,
+    "showtalk:private-decision-failure",
+  );
+  await closeAppServerRequest();
+  await projectRecovery();
 }
 
 export function parseTrustedGitApprovalRecoveryAction(

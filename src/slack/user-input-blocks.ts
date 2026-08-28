@@ -364,7 +364,12 @@ function planFields(
     field("Branch", plan.branch),
     field("Mode", plan.mode),
     field("HEAD", plan.expectedHead ?? "unborn"),
-    field("Worktree", plan.worktreeId ?? "該当なし（PR操作）"),
+    field(
+      "Worktree",
+      plan.operation === "existing_pull_request_update"
+        ? plan.temporaryWorkspaceId
+        : plan.worktreeId ?? "該当なし（PR操作）",
+    ),
     ...(plan.expectedSnapshotId === undefined
       ? []
       : [field("Snapshot", plan.expectedSnapshotId)]),
@@ -383,6 +388,10 @@ function planFields(
     ...(plan.mergeMethod === undefined
       ? []
       : [field("Merge method", plan.mergeMethod)]),
+    ...(plan.operation === "pull_request_ready" ||
+        plan.operation === "pull_request_merge"
+      ? [field("Head owner", plan.headRepositoryOwner)]
+      : []),
   ];
   if (fields.length > 10) {
     throw new Error("The Git plan has too many summary fields for Slack Block Kit");
@@ -514,6 +523,10 @@ function exactPlanTexts(
     ...(plan.pullRequestBaseBranch === undefined
       ? []
       : [["Draft PR base", plan.pullRequestBaseBranch] as const]),
+    ...(plan.operation === "pull_request_ready" ||
+        plan.operation === "pull_request_merge"
+      ? [["Pull Request title", plan.targetPullRequestTitle] as const]
+      : []),
   ];
 }
 
@@ -558,6 +571,8 @@ function operationLabel(operation: WorkspaceGitApprovalPlan["operation"]): strin
       return "Pull RequestをReady化";
     case "pull_request_merge":
       return "Pull Requestをmerge";
+    case "existing_pull_request_update":
+      return "既存Pull Requestを更新";
     case "github_repository_settings":
       return "GitHub Repository設定を変更";
   }

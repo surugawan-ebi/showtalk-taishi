@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { AgentAdapter } from "./adapter.js";
 import type { AgentInputAttachment, SendMessageRequest } from "./adapter.js";
-import { CoreError } from "./errors.js";
+import { AdapterSessionUnavailableError, CoreError } from "./errors.js";
 import { InMemoryAgentRegistry } from "./registry.js";
 import type {
   ActiveTurnContext,
@@ -72,6 +72,7 @@ export class Gateway {
   readonly #idFactory: () => string;
   readonly #onStateChanged: () => Promise<void>;
   readonly #activeDelegationResultIds = new Set<string>();
+  readonly #slackThreadFallbackAgentIds = new Set<string>();
 
   constructor(
     registry: InMemoryAgentRegistry,
@@ -447,7 +448,7 @@ export class Gateway {
   ): Promise<{ conversation: ConversationBinding; session: AgentSessionRecord }> {
     const agent = this.#registry.requireAgentByChannel(channelId);
     const current = this.#registry.getConversation(channelId, rootThreadTs);
-    if (conversationScope(agent) === "slack_thread") {
+    if (this.#usesSlackThreadScope(agent)) {
       let session: AgentSessionRecord;
       if (current === undefined) {
         session = await this.#createSession(agent, adapter, channelId);
@@ -468,10 +469,25 @@ export class Gateway {
           `Conversation session ${session.id} does not use adapter ${adapter.kind}`,
         );
       }
-      return {
-        conversation: current,
-        session: await this.#activateSession(session, adapter),
-      };
+      try {
+        return {
+          conversation: current,
+          session: await this.#activateSession(session, adapter),
+        };
+      } catch (error) {
+        if (
+          agent.configuredAdapterSessionId === undefined ||
+          session.adapterSession.id !== agent.configuredAdapterSessionId ||
+          !(error instanceof AdapterSessionUnavailableError)
+        ) {
+          throw error;
+        }
+        return this.#replaceMissingConfiguredThread(
+          agent,
+          adapter,
+          current,
+        );
+      }
     }
 
     let session = this.#registry.getPrimarySession(agent.id);
@@ -511,7 +527,38 @@ export class Gateway {
     }
 
     if (stateChanged) await this.#onStateChanged();
-    return { conversation, session: await this.#activateSession(session, adapter) };
+    try {
+      return {
+        conversation,
+        session: await this.#activateSession(session, adapter),
+      };
+    } catch (error) {
+      if (
+        agent.configuredAdapterSessionId === undefined ||
+        session.adapterSession.id !== agent.configuredAdapterSessionId ||
+        !(error instanceof AdapterSessionUnavailableError)
+      ) {
+        throw error;
+      }
+      return this.#replaceMissingConfiguredThread(agent, adapter, conversation);
+    }
+  }
+
+  async #replaceMissingConfiguredThread(
+    agent: AgentDefinition,
+    adapter: AgentAdapter,
+    staleConversation: ConversationBinding,
+  ): Promise<{ conversation: ConversationBinding; session: AgentSessionRecord }> {
+    const session = await this.#createSession(agent, adapter, staleConversation.channelId);
+    this.#registry.setConversationScope(agent.id, "slack_thread");
+    this.#slackThreadFallbackAgentIds.add(agent.id);
+    const conversation = {
+      ...staleConversation,
+      sessionId: session.id,
+    };
+    this.#registry.replaceConversation(conversation);
+    await this.#onStateChanged();
+    return { conversation, session };
   }
 
   async #createSession(
@@ -583,13 +630,20 @@ export class Gateway {
     channelId: string,
     rootThreadTs: string,
   ): AgentSessionRecord | undefined {
-    if (conversationScope(agent) === "channel") {
+    if (!this.#usesSlackThreadScope(agent)) {
       return this.#registry.getPrimarySession(agent.id);
     }
     const binding = this.#registry.getConversation(channelId, rootThreadTs);
     return binding === undefined
       ? undefined
       : this.#registry.requireSession(binding.sessionId);
+  }
+
+  #usesSlackThreadScope(agent: AgentDefinition): boolean {
+    return (
+      conversationScope(agent) === "slack_thread" ||
+      this.#slackThreadFallbackAgentIds.has(agent.id)
+    );
   }
 
   #requireAdapter(kind: string): AgentAdapter {

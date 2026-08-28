@@ -186,6 +186,16 @@ export class InMemoryAgentRegistry {
     return [...this.#agents.values()];
   }
 
+  setConversationScope(
+    agentId: AgentId,
+    conversationScope: NonNullable<AgentDefinition["conversationScope"]>,
+  ): AgentDefinition {
+    const current = this.requireAgent(agentId);
+    const updated = { ...current, conversationScope };
+    this.#agents.set(agentId, updated);
+    return updated;
+  }
+
   hasHandledDelegationResult(delegationId: string): boolean {
     return this.#handledDelegationResults.has(delegationId);
   }

@@ -29,6 +29,8 @@ export interface AgentDefinition {
   readonly channelId: SlackChannelId;
   /** Selects whether Slack roots share one backend thread or own one each. */
   readonly conversationScope?: ConversationScope;
+  /** Operator-declared backend session used by the legacy channel binding. */
+  readonly configuredAdapterSessionId?: string;
   /** Trusted operator-defined persona applied only to turns started by ShowTalk. */
   readonly slackPersona?: string;
   readonly role?: string;
@@ -114,6 +116,14 @@ interface WorkspaceGitApprovalPlanBase {
   readonly planHash: string;
   /** Exact private approval target emitted by workspace-git prepare_*. */
   readonly approvalTarget: string;
+  /** Opaque identity of the private workspace-git approval state. */
+  readonly approvalAuthorityId?: string;
+  /**
+   * Exact, bounded approval projection emitted by workspace-git itself.
+   * ShowTalk validates this against the human-facing plan, then passes the
+   * unchanged value to the model-inaccessible private broker.
+   */
+  readonly approvalScope?: Readonly<Record<string, unknown>>;
   readonly repoId: string;
   readonly expiresAt: string;
 }
@@ -183,8 +193,50 @@ interface WorkspaceGitPullRequestApprovalPlan extends WorkspaceGitApprovalPlanBa
   readonly pullRequestBaseBranch?: never;
   readonly pullRequestNumber?: number;
   readonly pullRequestUrl?: string;
+  readonly targetPullRequestTitle: string;
   readonly baseBranch?: string;
+  readonly basePolicy: "catalog_publication_branch" | "same_repo_stacked_pr";
+  readonly baseSha?: string;
+  readonly autoMergeEnabled: boolean;
+  readonly headRepositoryOwner: string;
+  readonly expectedIsDraft: boolean;
+  readonly parentPullRequestNumber?: number;
+  readonly parentPullRequestUrl?: string;
+  readonly parentHeadRefName?: string;
+  readonly parentHeadSha?: string;
+  readonly parentHeadRepositoryOwner?: string;
+  readonly parentState?: "OPEN";
+  readonly parentIsDraft?: boolean;
+  readonly parentAutoMergeEnabled?: boolean;
   readonly mergeMethod?: "merge" | "squash" | "rebase";
+}
+
+interface WorkspaceGitExistingPullRequestUpdateApprovalPlan
+  extends WorkspaceGitApprovalPlanBase {
+  readonly operation: "existing_pull_request_update";
+  readonly mode: "existing_pull_request_update";
+  readonly branch: string;
+  readonly paths: readonly string[];
+  readonly expectedHead: string;
+  readonly expectedSnapshotId: string;
+  readonly worktreeId?: never;
+  readonly temporaryWorkspaceId: string;
+  readonly commitMessage: string;
+  readonly pushTarget: string;
+  readonly pullRequestTitle?: never;
+  readonly pullRequestBody?: never;
+  readonly pullRequestBaseBranch?: never;
+  readonly pullRequestNumber: number;
+  readonly pullRequestUrl: string;
+  readonly baseBranch: string;
+  readonly mergeMethod?: never;
+  readonly expectedPullRequestHead: string;
+  readonly expectedRemoteHead: string;
+  readonly expectedTree: string;
+  readonly cloneIdentity: string;
+  readonly configuredRootIdentity: string;
+  readonly relativePath: string;
+  readonly pushRef: string;
 }
 
 export type WorkspaceGitDependabotSecurityUpdateState =
@@ -233,6 +285,7 @@ export type WorkspaceGitApprovalPlan =
   | WorkspaceGitInitialPushApprovalPlan
   | WorkspaceGitEstablishedPublicationApprovalPlan
   | WorkspaceGitPullRequestApprovalPlan
+  | WorkspaceGitExistingPullRequestUpdateApprovalPlan
   | WorkspaceGitRepositorySettingsApprovalPlan;
 
 export interface AgentGitApprovalInputResponse {
@@ -409,11 +462,13 @@ export interface PendingWorkspaceGitSystemRejection {
   readonly operationId: string;
   readonly planHash: string;
   readonly approvalTarget: string;
+  readonly approvalAuthorityId?: string;
   readonly repoId: string;
   readonly expiresAt: string;
   readonly actor:
     | "showtalk:slack-projection-failure"
-    | "showtalk:external-app-server-resolution";
+    | "showtalk:external-app-server-resolution"
+    | "showtalk:private-decision-failure";
 }
 
 /** Versioned now so state.json can evolve without leaking Map-specific storage. */

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  canSafelyRejectAfterPrivateGitDecisionFailure,
   cancelUnprojectedNativeApproval,
+  closeFailedPrivateGitDecisionBeforeRecovery,
   consumeContinuationIterator,
   parseHumanSlackMessage,
   parseTrustedApprovalAction,
@@ -18,12 +20,14 @@ import {
   recordGitProjectionFailureBeforeAppServerResume,
   recordSystemGitRejection,
 } from "../../src/slack/frontend.js";
+import { WorkspaceGitDecisionBrokerError } from "../../src/approvals/workspace-git-decision-broker.js";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
 const exactGitPlan = {
   operationId: "11111111-1111-4111-8111-111111111111",
   planHash: "a".repeat(64),
   approvalTarget: "primary",
+  approvalAuthorityId: "e".repeat(64),
   operation: "git_publication",
   repoId: "showtalk-taishi",
   mode: "commit_only",
@@ -98,13 +102,14 @@ test("records the exact private Git decision before resuming App Server", async 
       recordDecision: async (input) => {
         order.push("broker");
         assert.equal(input.plan, exactGitPlan);
-        assert.equal(input.actor, "slack-user:U0123456789");
-        assert.equal(input.decision, "approve");
+      assert.equal(input.actor, "chat-user-via-showtalk");
+      assert.equal(input.decision, "approve");
+      assert.equal(input.deliveryId, "d".repeat(64));
       },
     },
     exactGitPlan,
     "approve",
-    "U0123456789",
+    "d".repeat(64),
     async () => {
       order.push("app-server");
     },
@@ -121,7 +126,7 @@ test("does not resume App Server when the private Git decision fails", async () 
       },
       exactGitPlan,
       "approve",
-      "U0123456789",
+      "d".repeat(64),
       async () => {
         resumed = true;
       },
@@ -129,6 +134,87 @@ test("does not resume App Server when the private Git decision fails", async () 
     /private mismatch/u,
   );
   assert.equal(resumed, false);
+});
+
+test("durably rejects a failed private decision before closing App Server and replacing Slack controls", async () => {
+  const order: string[] = [];
+  await closeFailedPrivateGitDecisionBeforeRecovery(
+    {
+      recordRejection: async (plan, actor) => {
+        order.push("durable-rejection");
+        assert.equal(plan, exactGitPlan);
+        assert.equal(actor, "showtalk:private-decision-failure");
+      },
+    },
+    exactGitPlan,
+    async () => {
+      order.push("app-server-reject");
+    },
+    async () => {
+      order.push("slack-recovery");
+    },
+  );
+  assert.deepEqual(order, [
+    "durable-rejection",
+    "app-server-reject",
+    "slack-recovery",
+  ]);
+});
+
+test("keeps App Server and Slack controls pending when durable failure rejection cannot be recorded", async () => {
+  const order: string[] = [];
+  await assert.rejects(
+    closeFailedPrivateGitDecisionBeforeRecovery(
+      {
+        recordRejection: async () => {
+          order.push("durable-rejection");
+          throw new Error("private store unavailable");
+        },
+      },
+      exactGitPlan,
+      async () => {
+        order.push("app-server-reject");
+      },
+      async () => {
+        order.push("slack-recovery");
+      },
+    ),
+    /private store unavailable/u,
+  );
+  assert.deepEqual(order, ["durable-rejection"]);
+});
+
+test("keeps uncertain or conflicting private decisions pending for exact-delivery reconciliation", () => {
+  for (const code of [
+    "decision_outcome_unknown",
+    "state_write_failed",
+    "decision_replay",
+    "status_conflict",
+  ] as const) {
+    assert.equal(
+      canSafelyRejectAfterPrivateGitDecisionFailure(
+        new WorkspaceGitDecisionBrokerError(code),
+      ),
+      false,
+    );
+  }
+  for (const code of [
+    "invalid_decision",
+    "operation_not_found",
+    "plan_mismatch",
+    "expired",
+  ] as const) {
+    assert.equal(
+      canSafelyRejectAfterPrivateGitDecisionFailure(
+        new WorkspaceGitDecisionBrokerError(code),
+      ),
+      true,
+    );
+  }
+  assert.equal(
+    canSafelyRejectAfterPrivateGitDecisionFailure(new Error("transport failed")),
+    false,
+  );
 });
 
 test("records a system Git rejection before closing an unprojected App Server request", async () => {

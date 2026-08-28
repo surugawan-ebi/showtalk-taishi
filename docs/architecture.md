@@ -179,6 +179,11 @@ rejected status is then returned to the same App Server JSON-RPC ID.
 workspace-git, not Slack or model prose, remains responsible for private
 approval state and execution-time revalidation.
 
+The private transport also owns timeout reconciliation. It re-reads the same
+decision delivery after a bounded wait; confirmed late commits are accepted,
+while an inconclusive read leaves the App Server RPC and Slack controls pending.
+ShowTalk never converts a possibly committed approval into a synthetic rejection.
+
 The same lifecycle is the single owner of plan-binding ambiguity, per-turn
 recovery projection deduplication, the one permitted post-approval
 continuation, and exact execute/status observations. It reports execution,
@@ -199,9 +204,11 @@ also applied before classification so a transport-ordering race cannot
 downgrade a malformed same-turn Git approval into an ordinary choice.
 
 The Gateway therefore owns the approval-record phase while the resumed Codex
-turn owns only status revalidation and the exact execute call. The private
-broker invokes an operator-configured local workspace-git approval CLI without
-a shell and does not expose that command or its state root as an Agent tool.
+turn owns only status revalidation and the exact execute call. An isolated
+Worker loads the operator-configured model-inaccessible workspace-git private
+broker module. The bridge carries the exact prepared scope plus an opaque
+private-state authority ID; it does not invoke an approval CLI or expose the
+module, key, command, or state root as an Agent tool.
 
 Each Koe may also define a Slack presentation (`display_name` plus either an
 HTTPS `icon_url` or an `icon_emoji`). Runtime builds a presentation map keyed
@@ -309,13 +316,18 @@ On restart, volatile active statuses are persisted as `interrupted`.
 #### Offline canonical binding
 
 A channel-scoped Koe may declare `adapter_session_id` in configuration. On
-startup, Taishi validates the declared backend session, selects it as canonical,
-preserves any older session records, and repoints that Koe's remembered Slack
-reply locations. For the Codex adapter this value is the Codex Thread ID. This
-declarative path allows a supervised service restart to apply a binding without
-editing the state file while a Slack turn owns its exclusive lock. If Slack
-startup fails after the selection is staged, Taishi restores the state snapshot
-from before that startup attempt.
+startup, Taishi selects the declaration as canonical without requiring the
+backend thread or workspace to be reachable, preserves any older session
+records, and repoints that Koe's remembered Slack reply locations. For the
+Codex adapter this value is the Codex Thread ID. This declarative path allows a
+supervised service restart to apply a binding without editing the state file
+while a Slack turn owns its exclusive lock. If the declared Codex thread is
+missing when the first Slack message arrives, Taishi creates a new thread,
+switches the Koe to `slack_thread`, and persists that fallback. If a mapped
+thread in `slack_thread` mode is missing, Taishi reports an error and does not
+recreate it. A missing configured workspace is reported on first use rather
+than preventing Gateway startup. `taishi doctor` still performs the explicit
+backend-thread and workspace checks.
 
 The schema rejects `adapter_session_id` when `conversation_scope` is
 `slack_thread`: separate Slack roots have separate backend threads, so there is
