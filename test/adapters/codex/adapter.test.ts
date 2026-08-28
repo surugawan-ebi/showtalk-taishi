@@ -6,6 +6,10 @@ import type {
   AgentEvent,
   WorkspaceGitApprovalPlan,
 } from "../../../src/core/index.js";
+import {
+  AdapterSessionUnavailableError,
+  AgentWorkspaceUnavailableError,
+} from "../../../src/core/index.js";
 import type { ServerRequestEvent } from "../../../src/adapters/codex/app-server-client.js";
 import { CodexRpcError } from "../../../src/adapters/codex/protocol.js";
 import type {
@@ -50,6 +54,7 @@ class FakeAppServer implements CodexAppServer {
   listTurnsFailures = 0;
   rejectExcludeTurnsAsUnsupported = false;
   readonly unsupportedExcludeTurnsThreadIds = new Set<string>();
+  readonly missingThreadIds = new Set<string>();
   rejectResumeWithoutExcludeTurns = false;
   rejectTurnPaginationAsUnsupported = false;
   readonly turnStatuses = new Map<string, CodexTurn["status"]>();
@@ -76,6 +81,9 @@ class FakeAppServer implements CodexAppServer {
 
   async resumeThread(params: ThreadResumeParams): Promise<CodexThread> {
     this.threadResumes.push(params);
+    if (this.missingThreadIds.has(params.threadId)) {
+      throw new CodexRpcError(`thread not loaded: ${params.threadId}`, -32000);
+    }
     if (
       params.excludeTurns === true &&
       (this.rejectExcludeTurnsAsUnsupported ||
@@ -371,6 +379,7 @@ function notifyPublicationPlan(
           status: "awaiting_human_approval",
           operation_id:
             overrides.operationId ?? "11111111-1111-4111-8111-111111111111",
+          approval_authority_id: "e".repeat(64),
           approval_expires_at:
             overrides.expiresAt ?? new Date(Date.now() + 60_000).toISOString(),
           scope: {
@@ -379,6 +388,23 @@ function notifyPublicationPlan(
             mode: "commit_push_and_open_draft_pr",
             branch: "agent/slack-git-approval",
             paths: ["src/core/gateway.ts", "README.md"],
+          },
+          approval_scope: {
+            kind: "git_publication",
+            repo_id: "showtalk-taishi",
+            mode: "commit_push_and_open_draft_pr",
+            branch: "agent/slack-git-approval",
+            worktree_id: "primary",
+            expected_head: "b".repeat(40),
+            expected_snapshot_id: "c".repeat(64),
+            paths: ["src/core/gateway.ts", "README.md"],
+            commit_message: "Add Slack Git approval buttons",
+            pr: {
+              title: "Add Slack Git approval buttons",
+              body:
+                "Render an exact pending plan and accept only fixed Block Kit actions.",
+            },
+            pr_base_branch: "main",
           },
           plan_hash: overrides.planHash ?? "a".repeat(64),
           execute_tool: "execute_approved_git_publication",
@@ -418,6 +444,7 @@ function notifyRepositorySettingsPlan(server: FakeAppServer): void {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "33333333-3333-4333-8333-333333333333",
+          approval_authority_id: "e".repeat(64),
           approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
           scope: {
             repo_id: "showtalk-taishi",
@@ -435,6 +462,20 @@ function notifyRepositorySettingsPlan(server: FakeAppServer): void {
               description: "SlackをAI coding agentsのフロントにするOSS",
               topics: ["ai-agents", "slack"],
               dependabot_security_updates: "enabled",
+            },
+          },
+          approval_scope: {
+            kind: "repository_settings",
+            repo_id: "showtalk-taishi",
+            before: {
+              description: "Old description",
+              topics: ["slack"],
+              dependabot_security_updates: "disabled",
+            },
+            desired: {
+              description: "SlackをAI coding agentsのフロントにするOSS",
+              topics: ["ai-agents", "slack"],
+              dependabot_security_updates: true,
             },
           },
           approval_target: "repo_settings_showtalk-taishi",
@@ -612,12 +653,23 @@ function notifyInitialPushPlan(server: FakeAppServer): void {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "33333333-3333-4333-8333-333333333333",
+          approval_authority_id: "e".repeat(64),
           approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
           scope: {
             repo_id: "empty-example-repo",
             worktree_id: "primary",
             mode: "initial_push_existing",
             branch: "main",
+            paths: [],
+          },
+          approval_scope: {
+            kind: "git_publication",
+            repo_id: "empty-example-repo",
+            mode: "initial_push_existing",
+            branch: "main",
+            worktree_id: "primary",
+            expected_head: "b".repeat(40),
+            expected_snapshot_id: "c".repeat(64),
             paths: [],
           },
           plan_hash: "d".repeat(64),
@@ -640,11 +692,11 @@ test("creates a Codex thread with workspace and role instructions", async () => 
       channelId: "C123",
       role: "Implement carefully.",
       slackPersona: "Answer as a blunt staff engineer.",
-      metadata: { workspacePath: "/workspace" },
+      metadata: { workspacePath: "/tmp" },
     },
   });
   assert.equal(session.id, "thr_1");
-  assert.equal(server.threadStarts[0]?.cwd, "/workspace");
+  assert.equal(server.threadStarts[0]?.cwd, "/tmp");
   assert.equal(server.threadStarts[0]?.serviceName, "showtalk_taishi");
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -698,6 +750,48 @@ test("creates a Codex thread with workspace and role instructions", async () => 
     server.threadStarts[0]?.developerInstructions ?? "",
     /blunt staff engineer/u,
   );
+});
+
+test("normalizes a deleted Codex thread as an unavailable adapter session", async () => {
+  const server = new FakeAppServer();
+  server.missingThreadIds.add("thr_deleted");
+  const adapter = new CodexAdapter(server);
+
+  await assert.rejects(
+    () => adapter.resumeSession({
+      adapterSessionId: "thr_deleted",
+      agent: {
+        id: "implementer",
+        adapter: "codex",
+        channelId: "C123",
+      },
+    }),
+    (error) =>
+      error instanceof AdapterSessionUnavailableError &&
+      error.adapterSessionId === "thr_deleted",
+  );
+});
+
+test("reports a missing project workspace before creating a Codex thread", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+
+  await assert.rejects(
+    () => adapter.createSession({
+      reason: "slack_conversation",
+      agent: {
+        id: "implementer",
+        adapter: "codex",
+        channelId: "C123",
+        metadata: { workspacePath: "/dev/null" },
+      },
+    }),
+    (error) =>
+      error instanceof AgentWorkspaceUnavailableError &&
+      error.agentId === "implementer" &&
+      error.workspacePath === "/dev/null",
+  );
+  assert.equal(server.threadStarts.length, 0);
 });
 
 test("applies a Slack persona only as per-turn application context", async () => {
@@ -1173,7 +1267,7 @@ test("releases and resumes the same Codex thread between turns", async () => {
     id: "implementer",
     adapter: "codex",
     channelId: "C123",
-    metadata: { workspacePath: "/workspace" },
+    metadata: { workspacePath: "/tmp" },
   } as const;
   const session = await adapter.createSession({
     reason: "slack_conversation",
@@ -1203,7 +1297,7 @@ test("releases and resumes the same Codex thread between turns", async () => {
   assert.deepEqual(server.unsubscribeCalls, [session.id, session.id]);
   assert.equal(server.threadResumes.length, 1);
   assert.equal(server.threadResumes[0]?.threadId, session.id);
-  assert.equal(server.threadResumes[0]?.cwd, "/workspace");
+  assert.equal(server.threadResumes[0]?.cwd, "/tmp");
 });
 
 test("ignores stale completion and approval requests from another turn", async () => {

@@ -4,7 +4,10 @@ import { dirname, join, resolve } from "node:path";
 
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
-import { createWorkspaceGitDecisionBrokerFromEnvironment } from "./approvals/workspace-git-decision-broker.js";
+import {
+  createWorkspaceGitDecisionBrokerFromEnvironment,
+  type WorkspaceGitDecisionBroker,
+} from "./approvals/workspace-git-decision-broker.js";
 import { WorkspaceGitSystemRejectionCoordinator } from "./approvals/workspace-git-system-rejection-coordinator.js";
 import {
   CodexModelCatalog,
@@ -196,13 +199,6 @@ async function createLockedRuntime(
       });
       clients.push(client);
       modelCatalogsByAgent.set(agentId, new CodexModelCatalog(client));
-      if (agentConfig.adapter_session_id !== undefined) {
-        await validateConfiguredAdapterSession(
-          client,
-          agentId,
-          agentConfig.adapter_session_id,
-        );
-      }
       const configuredModel = agentConfig.model ?? adapterConfig.model;
       const configuredReasoningEffort =
         agentConfig.reasoning_effort ?? adapterConfig.reasoning_effort;
@@ -396,6 +392,9 @@ async function createLockedRuntime(
           ...(workspaceGitSystemRejections === undefined
             ? {}
             : { workspaceGitSystemRejections }),
+          ...(workspaceGitDecisionBroker === undefined
+            ? {}
+            : { workspaceGitDecisionBroker }),
         });
         return stopPromise;
       },
@@ -411,6 +410,9 @@ async function createLockedRuntime(
       if (result.status === "rejected") errors.push(result.reason);
     }
     await workspaceGitSystemRejections?.close().catch((closeError: unknown) =>
+      errors.push(closeError)
+    );
+    await workspaceGitDecisionBroker?.close?.().catch((closeError: unknown) =>
       errors.push(closeError)
     );
     await permissionApprovals.close();
@@ -488,6 +490,7 @@ async function shutdownRuntime(input: {
   readonly clients: readonly CodexAppServerClient[];
   readonly stateStore: FileStateStore;
   readonly workspaceGitSystemRejections?: WorkspaceGitSystemRejectionCoordinator;
+  readonly workspaceGitDecisionBroker?: WorkspaceGitDecisionBroker;
 }): Promise<void> {
   const errors: unknown[] = [];
   input.mcpService.beginShutdown();
@@ -500,6 +503,9 @@ async function shutdownRuntime(input: {
   }
   await input.workspaceGitSystemRejections
     ?.close()
+    .catch((error: unknown) => errors.push(error));
+  await input.workspaceGitDecisionBroker
+    ?.close?.()
     .catch((error: unknown) => errors.push(error));
   await input.permissionApprovals.close().catch((error: unknown) => errors.push(error));
 
@@ -614,7 +620,7 @@ export function createRegistry(
   now: () => Date = () => new Date(),
   idFactory: () => string = randomUUID,
 ): InMemoryAgentRegistry {
-  const configuredAgents = Object.entries(config.agents).map(
+  const configuredAgentsFromConfig = Object.entries(config.agents).map(
     ([id, agent]): AgentDefinition => ({
       id,
       ...(agent.slack.call_name === undefined
@@ -623,6 +629,9 @@ export function createRegistry(
       adapter: agent.adapter,
       channelId: agent.slack.channel_id,
       conversationScope: agent.slack.conversation_scope,
+      ...(agent.adapter_session_id === undefined
+        ? {}
+        : { configuredAdapterSessionId: agent.adapter_session_id }),
       ...(agent.slack.persona === undefined
         ? {}
         : { slackPersona: agent.slack.persona }),
@@ -630,10 +639,21 @@ export function createRegistry(
       metadata: { workspacePath: agent.workspace.path },
     }),
   );
-  const configuredById = new Map(configuredAgents.map((agent) => [agent.id, agent]));
   const persistedById = new Map(
     state.core.agents.map((agent) => [agent.id, agent]),
   );
+  const configuredAgents = configuredAgentsFromConfig.map((agent) => {
+    const configured = config.agents[agent.id];
+    const persisted = persistedById.get(agent.id);
+    const persistedFallback =
+      configured?.adapter_session_id !== undefined &&
+      persisted?.configuredAdapterSessionId === configured.adapter_session_id &&
+      persisted?.conversationScope === "slack_thread";
+    return persistedFallback
+      ? { ...agent, conversationScope: "slack_thread" as const }
+      : agent;
+  });
+  const configuredById = new Map(configuredAgents.map((agent) => [agent.id, agent]));
 
   for (const persisted of state.core.agents) {
     const configured = configuredById.get(persisted.id);
@@ -888,14 +908,17 @@ function normalizeSessionAfterRestart(
 
 export async function validateRuntimePrerequisites(
   config: TaishiConfig,
+  options: { readonly checkWorkspaces?: boolean } = {},
 ): Promise<readonly string[]> {
   const checks: string[] = [];
-  for (const [name, agent] of Object.entries(config.agents)) {
-    const workspace = resolve(agent.workspace.path);
-    const info = await stat(workspace);
-    if (!info.isDirectory()) throw new Error(`Koe ${name} workspace is not a directory`);
-    await access(workspace, constants.R_OK | constants.W_OK);
-    checks.push(`agent:${name}:workspace`);
+  if (options.checkWorkspaces ?? true) {
+    for (const [name, agent] of Object.entries(config.agents)) {
+      const workspace = resolve(agent.workspace.path);
+      const info = await stat(workspace);
+      if (!info.isDirectory()) throw new Error(`Koe ${name} workspace is not a directory`);
+      await access(workspace, constants.R_OK | constants.W_OK);
+      checks.push(`agent:${name}:workspace`);
+    }
   }
   await access(await nearestExistingDirectory(dirname(resolve(config.gateway.state_file))), constants.W_OK);
   checks.push("gateway:state-directory");

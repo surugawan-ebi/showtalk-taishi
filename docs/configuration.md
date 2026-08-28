@@ -98,8 +98,17 @@ agents:
 ```
 
 For the Codex adapter, `adapter_session_id` is the Codex Thread ID. It is
-invalid with `conversation_scope: slack_thread`, which has no single canonical
-thread.
+normally used with `conversation_scope: channel`; it remains a legacy
+channel-wide declaration and is invalid with `conversation_scope: slack_thread`,
+which has no single canonical thread.
+
+If the declared Codex thread has been deleted, the first message does not stop
+the Gateway. Taishi creates a new Codex thread for that Slack root and keeps
+the Koe in `slack_thread` mode from then on. Existing Slack-root mappings in
+that mode are strict: if a mapped Codex thread has been deleted, Taishi posts
+an error and does not silently create a replacement. A missing configured
+workspace is also reported when that Koe is first used; it does not prevent
+Gateway startup.
 
 With Taishi stopped, the equivalent offline operation is:
 

@@ -161,10 +161,14 @@ Changing a presentation changes only future Slack message rendering and cannot
 replace the Koe's canonical Codex thread or session binding.
 
 `adapter_session_id` is an operator-controlled canonical-session declaration.
-At startup it is validated by the configured adapter before Slack begins
-receiving messages. It can repoint existing Slack reply locations for that Koe,
-but old session records and backend history are retained. Session IDs received
-from Slack messages or model output are never used as configuration.
+Gateway startup records the declaration without requiring the backend thread or
+workspace to be reachable; `taishi doctor` performs the explicit validation.
+If the declared Codex thread is missing on first use, Taishi falls back to
+per-Slack-root threads and persists that mode. A missing thread already mapped
+to a Slack root is a hard resume error and is never silently replaced. A
+missing configured workspace is likewise reported when that Koe is used.
+Session IDs received from Slack messages or model output are never used as
+configuration.
 
 Inbound attachment handling never gives the Slack bot token or a private Slack
 URL to a Koe. Taishi re-fetches each file by ID, permits only HTTPS downloads
@@ -204,7 +208,8 @@ matching prepare completion notification, Taishi keeps the RPC pending for at
 most two seconds and binds it only when that same thread and turn plan arrives.
 A timeout, turn completion, or different-turn plan is rejected. Taishi copies
 only bounded public fields: full operation
-ID/hash, repository, branch, mode/action, exact repo-relative paths, expected
+ID/hash, an opaque private-state authority ID, repository, branch, mode/action,
+exact repo-relative paths, expected
 HEAD/snapshot, opaque worktree ID, commit message, push target, Draft PR
 title/body/base, PR metadata, merge method, and authoritative expiry. Control
 characters and bidirectional overrides are escaped visibly. Draft PR plans
@@ -224,9 +229,12 @@ binding lives only while the originating App Server RPC is live, including its
 bounded same-turn binding grace period.
 
 The Slack choice is first recorded through a model-inaccessible local
-workspace-git decision broker. The broker re-reads private status and requires
-the exact operation ID, full plan hash, approval target, repository, and expiry
-captured from the bound prepare result. For publication responses from older
+workspace-git decision broker. The prepare response supplies the exact bounded
+approval scope and an opaque authority ID derived one-way from the active
+private state. Taishi validates that scope against the human-facing plan and
+forwards it unchanged. Under the private store lock, workspace-git requires the
+authority ID, operation ID, full plan hash, approval target, repository, expiry,
+and complete scope to match the durable operation. For publication responses from older
 workspace-git versions that omit a top-level `approval_target`, Taishi derives
 that target only from the already validated `worktree_id` or
 `temporary_workspace_id`; an explicit target must match that same scope. Only
@@ -255,12 +263,28 @@ partial, failed, outcome-uncertain, or expired operations are terminal and are
 not replayed.
 
 The private broker is opt-in and fail-closed. It is enabled only when the
-Gateway process has an absolute `SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI` path and
-the same absolute `WORKSPACE_GIT_STATE_ROOT` used by workspace-git. The broker
-launches the owner-controlled CLI without a shell and passes only that state
-root plus `PATH`; Slack, MCP, admin, and other parent-process credentials are
-not inherited. If it is unavailable or any exact field differs, the App Server
-request is not resumed and no Git write is authorized.
+Gateway process has an absolute `SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE` path
+and the same absolute `WORKSPACE_GIT_STATE_ROOT` used by workspace-git. Gateway
+loads that owner-controlled module once in a dedicated Worker whose environment
+contains only the private state root; Slack, MCP, admin, and other
+parent-process credentials are not inherited. Human decisions carry the full
+exact public plan scope and opaque authority ID. workspace-git compares them and atomically transitions
+the private state under one lock. Under that same lock it recomputes the hash of
+the persisted plan and requires it to equal both the stored and submitted full
+plan hash. A delivery ID binds the decision to the exact Slack message,
+structured request, approver, choice, operation, and plan: the same callback is
+idempotent, but a different delivery cannot replay it after a restart. The
+module is not an MCP tool, and no approval CLI is invoked. Worker replies expose
+only bounded error classifications and each write has a timeout. On timeout the
+Worker re-inspects the same authority, operation, scope, and delivery ID. A
+confirmed late write resumes the bound App Server request; a pending or unreadable
+result remains outcome-unknown, leaves both the request and Slack controls pending,
+and can be reconciled idempotently by the same button. It is never converted into
+a contradictory rejection. Permanent stale, missing, mismatched, or expired plans
+can be rejected safely and replaced with a fresh-plan recovery card. Permanent
+rejection intents are not retried forever; transient or outcome-unknown intents
+remain bounded and fail closed. No Git write is authorized from an uncertain
+transport result.
 
 Ordinary structured questions are classified only after the bounded
 same-turn Git-plan race window. They use a separate Slack action namespace and

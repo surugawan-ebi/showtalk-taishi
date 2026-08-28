@@ -280,16 +280,26 @@ function isPendingWorkspaceGitSystemRejection(value: unknown): boolean {
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (
-    keys.join("\u0000") !==
-    [
+  const oldKeys = [
       "actor",
       "approvalTarget",
       "expiresAt",
       "operationId",
       "planHash",
       "repoId",
-    ].sort().join("\u0000")
+    ].sort().join("\u0000");
+  const currentKeys = [
+    "actor",
+    "approvalAuthorityId",
+    "approvalTarget",
+    "expiresAt",
+    "operationId",
+    "planHash",
+    "repoId",
+  ].sort().join("\u0000");
+  if (
+    keys.join("\u0000") !== oldKeys &&
+    keys.join("\u0000") !== currentKeys
   ) {
     return false;
   }
@@ -298,11 +308,15 @@ function isPendingWorkspaceGitSystemRejection(value: unknown): boolean {
     typeof record.planHash === "string" &&
     /^[0-9a-f]{64}$/u.test(record.planHash) &&
     boundedStateString(record.approvalTarget, 256) &&
+    (record.approvalAuthorityId === undefined ||
+      (typeof record.approvalAuthorityId === "string" &&
+        /^[0-9a-f]{64}$/u.test(record.approvalAuthorityId))) &&
     boundedStateString(record.repoId, 128) &&
     boundedStateString(record.expiresAt, 64) &&
     Number.isFinite(Date.parse(record.expiresAt as string)) &&
     (record.actor === "showtalk:slack-projection-failure" ||
-      record.actor === "showtalk:external-app-server-resolution")
+      record.actor === "showtalk:external-app-server-resolution" ||
+      record.actor === "showtalk:private-decision-failure")
   );
 }
 

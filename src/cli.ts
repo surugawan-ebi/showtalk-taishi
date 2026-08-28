@@ -207,7 +207,7 @@ function printServiceStatus(status: MacOSLaunchAgentStatus): void {
 
 async function startGatewayWorker(path: string): Promise<number> {
   const config = await loadConfig(path);
-  await validateRuntimePrerequisites(config);
+  await validateRuntimePrerequisites(config, { checkWorkspaces: false });
   let requestRestart: (() => void) | undefined;
   const restartRequested = new Promise<void>((resolve) => {
     requestRestart = resolve;

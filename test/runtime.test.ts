@@ -8,6 +8,7 @@ import {
   configuredKoeRole,
   startFrontendWithStateRollback,
   validateConfiguredAdapterSession,
+  validateRuntimePrerequisites,
 } from "../src/runtime.js";
 import { taishiConfigSchema, type TaishiConfig } from "../src/config/schema.js";
 import type { RuntimeState } from "../src/state/file-state-store.js";
@@ -189,6 +190,43 @@ test("validates that a declared backend session is persistent and exact", async 
     ),
     /cannot bind an ephemeral configured adapter session/,
   );
+});
+
+test("can skip workspace checks for Gateway startup while doctor keeps them", async () => {
+  const config = taishiConfigSchema.parse({
+    version: 1,
+    gateway: { state_file: "/tmp/taishi-missing-workspace-test.json" },
+    slack: {
+      socket_mode: true,
+      app_token: "xapp-test",
+      bot_token: "xoxb-test",
+      approver_user_ids: ["U1"],
+    },
+    adapters: {
+      codex: {
+        type: "codex-app-server",
+        command: "codex",
+        transport: "stdio",
+      },
+    },
+    agents: {
+      project: {
+        adapter: "codex",
+        workspace: { path: "/dev/null" },
+        slack: { channel_id: "C1" },
+        role: "Project",
+      },
+    },
+    permissions: { defaults: {}, agents: {} },
+  });
+
+  await assert.rejects(
+    validateRuntimePrerequisites(config),
+    /Koe project workspace is not a directory/u,
+  );
+  const checks = await validateRuntimePrerequisites(config, { checkWorkspaces: false });
+  assert.ok(checks.includes("gateway:state-directory"));
+  assert.ok(!checks.includes("agent:project:workspace"));
 });
 
 test("restores the previous runtime state when Slack startup fails", async () => {
@@ -482,6 +520,32 @@ test("uses a declared adapter session as the canonical restart binding", () => {
   assert.equal(
     registry.getConversation("C1", "100.1")?.sessionId,
     "session-declared",
+  );
+
+  const fallbackRegistry = createRegistry(config, {
+    ...state,
+    core: {
+      ...state.core,
+      agents: [
+        {
+          id: "implementer",
+          adapter: "codex",
+          channelId: "C1",
+          conversationScope: "slack_thread",
+          configuredAdapterSessionId: "thread-declared",
+        },
+      ],
+      primarySessions: [],
+    },
+  });
+  assert.equal(
+    fallbackRegistry.requireAgent("implementer").conversationScope,
+    "slack_thread",
+  );
+  assert.equal(fallbackRegistry.getPrimarySession("implementer"), undefined);
+  assert.equal(
+    fallbackRegistry.getConversation("C1", "100.1")?.sessionId,
+    "session-old",
   );
 });
 

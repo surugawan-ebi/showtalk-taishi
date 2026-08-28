@@ -36,3 +36,27 @@ export class CoreError extends Error {
     this.code = code;
   }
 }
+
+/** The adapter's durable backend session no longer exists and cannot be resumed. */
+export class AdapterSessionUnavailableError extends Error {
+  readonly adapterSessionId: string;
+
+  constructor(adapterSessionId: string, options?: ErrorOptions) {
+    super(`Adapter session ${adapterSessionId} is unavailable`, options);
+    this.name = "AdapterSessionUnavailableError";
+    this.adapterSessionId = adapterSessionId;
+  }
+}
+
+/** The operator-configured project workspace is missing or inaccessible. */
+export class AgentWorkspaceUnavailableError extends Error {
+  readonly agentId: string;
+  readonly workspacePath: string;
+
+  constructor(agentId: string, workspacePath: string, options?: ErrorOptions) {
+    super(`Koe ${agentId} workspace is unavailable: ${workspacePath}`, options);
+    this.name = "AgentWorkspaceUnavailableError";
+    this.agentId = agentId;
+    this.workspacePath = workspacePath;
+  }
+}

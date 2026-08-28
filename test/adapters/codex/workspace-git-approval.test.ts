@@ -28,6 +28,7 @@ function publicationNotification() {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "11111111-1111-4111-8111-111111111111",
+          approval_authority_id: "e".repeat(64),
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
             repo_id: "showtalk-taishi",
@@ -35,6 +36,17 @@ function publicationNotification() {
             mode: "commit_and_push",
             branch: "agent/approval-ui",
             paths: ["src/slack/frontend.ts"],
+          },
+          approval_scope: {
+            kind: "git_publication",
+            repo_id: "showtalk-taishi",
+            mode: "commit_and_push",
+            branch: "agent/approval-ui",
+            worktree_id: "primary",
+            expected_head: "b".repeat(40),
+            expected_snapshot_id: "c".repeat(64),
+            paths: ["src/slack/frontend.ts"],
+            commit_message: "Add approval UI",
           },
           plan_hash: "a".repeat(64),
           execute_tool: "execute_approved_git_publication",
@@ -65,6 +77,7 @@ function repositorySettingsNotification() {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "33333333-3333-4333-8333-333333333333",
+          approval_authority_id: "e".repeat(64),
           approval_expires_at: "2026-08-26T20:00:00+09:00",
           scope: {
             repo_id: "showtalk-taishi",
@@ -84,9 +97,97 @@ function repositorySettingsNotification() {
               dependabot_security_updates: "enabled",
             },
           },
+          approval_scope: {
+            kind: "repository_settings",
+            repo_id: "showtalk-taishi",
+            before: {
+              description: "Old description",
+              topics: ["slack"],
+              dependabot_security_updates: "disabled",
+            },
+            desired: {
+              description: "SlackをAI coding agentsのフロントにするOSS",
+              topics: ["ai-agents", "slack"],
+              dependabot_security_updates: true,
+            },
+          },
           approval_target: "repo_settings_showtalk-taishi",
           plan_hash: "f".repeat(64),
           execute_tool: "execute_approved_github_repository_settings",
+          external_write: false,
+        },
+      },
+    },
+  };
+}
+
+function existingPullRequestUpdateNotification() {
+  return {
+    threadId: "thr_1",
+    turnId: "turn_existing_pr",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp_existing_pr",
+      server: "workspace-git",
+      tool: "prepare_existing_pull_request_update",
+      status: "completed",
+      arguments: {
+        repo_id: "showtalk-taishi",
+        pull_request_number: 18,
+        temporary_workspace_id: `tmp_${"1".repeat(64)}`,
+        expected_head_sha: "a".repeat(40),
+        expected_snapshot_id: "b".repeat(64),
+        paths: ["src/slack/frontend.ts"],
+        commit_message: "Fix approval handoff",
+      },
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "44444444-4444-4444-8444-444444444444",
+          approval_authority_id: "e".repeat(64),
+          approval_target: "existing_pr_update_18",
+          approval_expires_at: "2026-08-28T20:00:00+09:00",
+          scope: {
+            repo_id: "showtalk-taishi",
+            temporary_workspace_id: `tmp_${"1".repeat(64)}`,
+            pull_request_number: 18,
+            pull_request_url: "https://github.com/example/showtalk/pull/18",
+            head_ref_name: "codex/approval-fix",
+            base_ref_name: "main",
+            expected_pull_request_head_sha: "a".repeat(40),
+            expected_remote_head_sha: "a".repeat(40),
+            expected_local_head_sha: "c".repeat(40),
+            expected_snapshot_id: "b".repeat(64),
+            expected_tree: "d".repeat(40),
+            clone_identity: "e".repeat(64),
+            configured_root_identity: "f".repeat(64),
+            relative_path: "existing-pr/showtalk-18",
+            paths: ["src/slack/frontend.ts"],
+            commit_message: "Fix approval handoff",
+            push_ref: "refs/heads/codex/approval-fix",
+          },
+          approval_scope: {
+            kind: "existing_pull_request_update",
+            repo_id: "showtalk-taishi",
+            temporary_workspace_id: `tmp_${"1".repeat(64)}`,
+            pull_request_number: 18,
+            pull_request_url: "https://github.com/example/showtalk/pull/18",
+            head_ref_name: "codex/approval-fix",
+            base_ref_name: "main",
+            expected_pull_request_head_sha: "a".repeat(40),
+            expected_remote_head_sha: "a".repeat(40),
+            expected_local_head_sha: "c".repeat(40),
+            expected_snapshot_id: "b".repeat(64),
+            expected_tree: "d".repeat(40),
+            clone_identity: "e".repeat(64),
+            configured_root_identity: "f".repeat(64),
+            relative_path: "existing-pr/showtalk-18",
+            paths: ["src/slack/frontend.ts"],
+            commit_message: "Fix approval handoff",
+            push_ref: "refs/heads/codex/approval-fix",
+          },
+          plan_hash: "9".repeat(64),
+          execute_tool: "execute_approved_existing_pull_request_update",
           external_write: false,
         },
       },
@@ -101,6 +202,9 @@ test("captures every public exact-plan field from a publication prepare result",
       operationId: "11111111-1111-4111-8111-111111111111",
       planHash: "a".repeat(64),
       approvalTarget: "primary",
+      approvalAuthorityId: "e".repeat(64),
+      approvalScope:
+        publicationNotification().item.result.structuredContent.approval_scope,
       operation: "git_publication",
       repoId: "showtalk-taishi",
       mode: "commit_and_push",
@@ -123,6 +227,9 @@ test("captures and freezes an exact GitHub repository settings plan", () => {
       operationId: "33333333-3333-4333-8333-333333333333",
       planHash: "f".repeat(64),
       approvalTarget: "repo_settings_showtalk-taishi",
+      approvalAuthorityId: "e".repeat(64),
+      approvalScope:
+        repositorySettingsNotification().item.result.structuredContent.approval_scope,
       operation: "github_repository_settings",
       repoId: "showtalk-taishi",
       mode: "repository_settings",
@@ -145,6 +252,52 @@ test("captures and freezes an exact GitHub repository settings plan", () => {
       expiresAt: "2026-08-26T20:00:00+09:00",
     },
   });
+});
+
+test("captures an exact existing Pull Request update plan", () => {
+  const capture = captureWorkspaceGitPlan(
+    existingPullRequestUpdateNotification(),
+  );
+  assert.deepEqual(capture, {
+    turnId: "turn_existing_pr",
+    plan: {
+      operationId: "44444444-4444-4444-8444-444444444444",
+      planHash: "9".repeat(64),
+      approvalTarget: "existing_pr_update_18",
+      approvalAuthorityId: "e".repeat(64),
+      approvalScope:
+        existingPullRequestUpdateNotification().item.result.structuredContent
+          .approval_scope,
+      operation: "existing_pull_request_update",
+      repoId: "showtalk-taishi",
+      mode: "existing_pull_request_update",
+      branch: "codex/approval-fix",
+      paths: ["src/slack/frontend.ts"],
+      expectedHead: "c".repeat(40),
+      expectedSnapshotId: "b".repeat(64),
+      temporaryWorkspaceId: `tmp_${"1".repeat(64)}`,
+      commitMessage: "Fix approval handoff",
+      pushTarget: "origin/codex/approval-fix",
+      pullRequestNumber: 18,
+      pullRequestUrl: "https://github.com/example/showtalk/pull/18",
+      baseBranch: "main",
+      expectedPullRequestHead: "a".repeat(40),
+      expectedRemoteHead: "a".repeat(40),
+      expectedTree: "d".repeat(40),
+      cloneIdentity: "e".repeat(64),
+      configuredRootIdentity: "f".repeat(64),
+      relativePath: "existing-pr/showtalk-18",
+      pushRef: "refs/heads/codex/approval-fix",
+      expiresAt: "2026-08-28T20:00:00+09:00",
+    },
+  });
+
+  const substituted = existingPullRequestUpdateNotification();
+  substituted.item.result.structuredContent.scope.paths = ["README.md"];
+  assert.throws(
+    () => captureWorkspaceGitPlan(substituted),
+    /paths do not match input/u,
+  );
 });
 
 test("rejects substituted GitHub repository settings boundaries", () => {
@@ -219,6 +372,8 @@ test("derives a missing publication approval target from exact prepare inputs", 
   const linked = publicationNotification();
   linked.item.arguments.worktree_id = `wt_${"d".repeat(64)}`;
   linked.item.result.structuredContent.scope.worktree_id = `wt_${"d".repeat(64)}`;
+  linked.item.result.structuredContent.approval_scope.worktree_id =
+    `wt_${"d".repeat(64)}`;
   assert.equal(
     captureWorkspaceGitPlan(linked)?.plan.approvalTarget,
     `wt_${"d".repeat(64)}`,
@@ -288,6 +443,15 @@ test("captures both narrowly scoped initial publication modes", () => {
   existing.item.result.structuredContent.scope.mode = "initial_push_existing";
   existing.item.result.structuredContent.scope.branch = "main";
   existing.item.result.structuredContent.scope.paths = [];
+  Object.assign(existing.item.result.structuredContent.approval_scope, {
+    mode: "initial_push_existing",
+    branch: "main",
+    paths: [],
+  });
+  Reflect.deleteProperty(
+    existing.item.result.structuredContent.approval_scope,
+    "commit_message",
+  );
   const existingCapture = captureWorkspaceGitPlan(existing);
   assert.equal(existingCapture?.plan.mode, "initial_push_existing");
   assert.equal(existingCapture?.plan.expectedHead, "b".repeat(40));
@@ -300,6 +464,11 @@ test("captures both narrowly scoped initial publication modes", () => {
   Reflect.set(unborn.item.arguments, "paths", ["src/slack/frontend.ts"]);
   unborn.item.result.structuredContent.scope.mode = "initial_commit_and_push";
   unborn.item.result.structuredContent.scope.branch = "main";
+  Object.assign(unborn.item.result.structuredContent.approval_scope, {
+    mode: "initial_commit_and_push",
+    branch: "main",
+    expected_head: null,
+  });
   const unbornCapture = captureWorkspaceGitPlan(unborn);
   assert.equal(unbornCapture?.plan.mode, "initial_commit_and_push");
   assert.equal(unbornCapture?.plan.expectedHead, null);
@@ -448,6 +617,7 @@ test("captures Ready and merge plans with the exact PR HEAD", () => {
           structuredContent: {
             status: "awaiting_human_approval",
             operation_id: "22222222-2222-4222-8222-222222222222",
+            approval_authority_id: "e".repeat(64),
             approval_target: "pr_42",
             approval_expires_at: "2026-08-14T20:00:00+09:00",
             scope: {
@@ -455,9 +625,30 @@ test("captures Ready and merge plans with the exact PR HEAD", () => {
               action,
               pull_request_number: 42,
               pull_request_url: "https://github.com/example-org/example-repo/pull/42",
+              title: "Approval UI",
               base_ref_name: "main",
+              base_policy: "catalog_publication_branch",
               head_ref_name: "agent/approval-ui",
+              head_repository_owner: "example-org",
               expected_head_sha: "d".repeat(40),
+              expected_is_draft: action === "mark_ready_for_review",
+              auto_merge_enabled: false,
+              ...(mergeMethod === undefined ? {} : { merge_method: mergeMethod }),
+            },
+            approval_scope: {
+              kind: "pull_request",
+              repo_id: "showtalk-taishi",
+              action,
+              pull_request_number: 42,
+              pull_request_url: "https://github.com/example-org/example-repo/pull/42",
+              title: "Approval UI",
+              base_ref_name: "main",
+              base_policy: "catalog_publication_branch",
+              head_ref_name: "agent/approval-ui",
+              head_repository_owner: "example-org",
+              expected_head_sha: "d".repeat(40),
+              expected_is_draft: action === "mark_ready_for_review",
+              auto_merge_enabled: false,
               ...(mergeMethod === undefined ? {} : { merge_method: mergeMethod }),
             },
             plan_hash: "e".repeat(64),
@@ -484,6 +675,11 @@ test("captures every Draft PR field and requires an explicit base branch", () =>
   });
   draft.item.result.structuredContent.scope.mode =
     "commit_push_and_open_draft_pr";
+  Object.assign(draft.item.result.structuredContent.approval_scope, {
+    mode: "commit_push_and_open_draft_pr",
+    pr: { title: "Approval UI", body: "Exact review body" },
+    pr_base_branch: "main",
+  });
   const capture = captureWorkspaceGitPlan(draft);
   assert.equal(capture?.plan.pullRequestTitle, "Approval UI");
   assert.equal(capture?.plan.pullRequestBody, "Exact review body");
@@ -563,6 +759,7 @@ test("rejects an unsupported merge method", () => {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "22222222-2222-4222-8222-222222222222",
+          approval_authority_id: "e".repeat(64),
           approval_target: "pr_42",
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
@@ -571,9 +768,31 @@ test("rejects an unsupported merge method", () => {
             pull_request_number: 42,
             pull_request_url:
               "https://github.com/example-org/example-repo/pull/42",
+            title: "Approval UI",
             base_ref_name: "main",
+            base_policy: "catalog_publication_branch",
             head_ref_name: "agent/approval-ui",
+            head_repository_owner: "example-org",
             expected_head_sha: "d".repeat(40),
+            expected_is_draft: false,
+            auto_merge_enabled: false,
+            merge_method: "octopus",
+          },
+          approval_scope: {
+            kind: "pull_request",
+            repo_id: "showtalk-taishi",
+            action: "merge",
+            pull_request_number: 42,
+            pull_request_url:
+              "https://github.com/example-org/example-repo/pull/42",
+            title: "Approval UI",
+            base_ref_name: "main",
+            base_policy: "catalog_publication_branch",
+            head_ref_name: "agent/approval-ui",
+            head_repository_owner: "example-org",
+            expected_head_sha: "d".repeat(40),
+            expected_is_draft: false,
+            auto_merge_enabled: false,
             merge_method: "octopus",
           },
           plan_hash: "e".repeat(64),
@@ -605,6 +824,7 @@ test("rejects a Pull Request approval target that does not match its number", ()
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "22222222-2222-4222-8222-222222222222",
+          approval_authority_id: "e".repeat(64),
           approval_target: "pr_99",
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
@@ -612,9 +832,30 @@ test("rejects a Pull Request approval target that does not match its number", ()
             action: "mark_ready_for_review",
             pull_request_number: 42,
             pull_request_url: "https://github.com/example-org/example-repo/pull/42",
+            title: "Approval UI",
             base_ref_name: "main",
+            base_policy: "catalog_publication_branch",
             head_ref_name: "agent/approval-ui",
+            head_repository_owner: "example-org",
             expected_head_sha: "d".repeat(40),
+            expected_is_draft: true,
+            auto_merge_enabled: false,
+          },
+          approval_scope: {
+            kind: "pull_request",
+            repo_id: "showtalk-taishi",
+            action: "mark_ready_for_review",
+            pull_request_number: 42,
+            pull_request_url:
+              "https://github.com/example-org/example-repo/pull/42",
+            title: "Approval UI",
+            base_ref_name: "main",
+            base_policy: "catalog_publication_branch",
+            head_ref_name: "agent/approval-ui",
+            head_repository_owner: "example-org",
+            expected_head_sha: "d".repeat(40),
+            expected_is_draft: true,
+            auto_merge_enabled: false,
           },
           plan_hash: "e".repeat(64),
           execute_tool: "execute_approved_pull_request_operation",
@@ -626,6 +867,33 @@ test("rejects a Pull Request approval target that does not match its number", ()
   assert.throws(
     () => captureWorkspaceGitPlan(notification),
     /approval target does not match its Pull Request/u,
+  );
+});
+
+test("fails closed before Slack projection when the private approval scope is missing or substituted", () => {
+  const missingAuthority = publicationNotification();
+  Reflect.deleteProperty(
+    missingAuthority.item.result.structuredContent,
+    "approval_authority_id",
+  );
+  assert.throws(
+    () => captureWorkspaceGitPlan(missingAuthority),
+    /approval authority ID is invalid/u,
+  );
+
+  const missing = publicationNotification();
+  Reflect.deleteProperty(missing.item.result.structuredContent, "approval_scope");
+  assert.throws(
+    () => captureWorkspaceGitPlan(missing),
+    /approval scope is invalid/u,
+  );
+
+  const substituted = publicationNotification();
+  substituted.item.result.structuredContent.approval_scope.branch =
+    "agent/substituted";
+  assert.throws(
+    () => captureWorkspaceGitPlan(substituted),
+    /approval scope does not match the human-facing plan/u,
   );
 });
 

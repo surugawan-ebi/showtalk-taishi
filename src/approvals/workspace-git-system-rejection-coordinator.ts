@@ -3,6 +3,7 @@ import type {
   WorkspaceGitDecisionBroker,
   WorkspaceGitDecisionPlan,
 } from "./workspace-git-decision-broker.js";
+import { isWorkspaceGitDecisionBrokerError } from "./workspace-git-decision-broker.js";
 
 const MAX_PENDING_REJECTIONS = 1_024;
 const RETRY_DELAYS_MS = [1_000, 5_000, 30_000] as const;
@@ -31,6 +32,10 @@ interface CoordinatorOptions {
   ) => void;
 }
 
+interface RejectionAttemptOutcome {
+  readonly conflictingError?: unknown;
+}
+
 /**
  * Durably writes a fail-closed intent before releasing an invisible App Server
  * approval request. Transient broker failures are retried across turns and
@@ -47,7 +52,7 @@ export class WorkspaceGitSystemRejectionCoordinator
   readonly #records = new Map<string, PendingWorkspaceGitSystemRejection>();
   readonly #cancelRetry = new Map<string, () => void>();
   readonly #attempts = new Map<string, number>();
-  readonly #running = new Map<string, Promise<void>>();
+  readonly #running = new Map<string, Promise<RejectionAttemptOutcome>>();
   #mutationQueue: Promise<void> = Promise.resolve();
   #closed = false;
 
@@ -99,7 +104,7 @@ export class WorkspaceGitSystemRejectionCoordinator
 
     // Once the intent is durable, a transient private-broker failure must not
     // strand or abort the Codex turn. The queued record owns subsequent retry.
-    await this.#attempt(key);
+    await this.#attempt(key, true);
   }
 
   listPending(): readonly PendingWorkspaceGitSystemRejection[] {
@@ -114,22 +119,32 @@ export class WorkspaceGitSystemRejectionCoordinator
     await this.#mutationQueue;
   }
 
-  async #attempt(key: string): Promise<void> {
-    const active = this.#running.get(key);
-    if (active !== undefined) return active;
-    const promise = this.#runAttempt(key).finally(() => {
-      this.#running.delete(key);
-    });
-    this.#running.set(key, promise);
-    return promise;
+  async #attempt(
+    key: string,
+    surfaceConflictingFailure = false,
+  ): Promise<void> {
+    let active = this.#running.get(key);
+    if (active === undefined) {
+      active = this.#runAttempt(key).finally(() => {
+        this.#running.delete(key);
+      });
+      this.#running.set(key, active);
+    }
+    const outcome = await active;
+    if (
+      surfaceConflictingFailure &&
+      outcome.conflictingError !== undefined
+    ) {
+      throw outcome.conflictingError;
+    }
   }
 
-  async #runAttempt(key: string): Promise<void> {
+  async #runAttempt(key: string): Promise<RejectionAttemptOutcome> {
     const record = this.#records.get(key);
-    if (record === undefined || this.#closed) return;
+    if (record === undefined || this.#closed) return {};
     if (Date.parse(record.expiresAt) <= this.#now()) {
       await this.#remove(key);
-      return;
+      return {};
     }
     try {
       await this.#broker.recordDecision({
@@ -139,10 +154,21 @@ export class WorkspaceGitSystemRejectionCoordinator
       });
     } catch (error) {
       this.#onRetryError?.(error, record);
+      if (isPermanentDecisionFailure(error)) {
+        // The exact private operation can no longer transition, so keeping
+        // the intent would create an endless retry loop. A conflicting status
+        // can mean another path already approved the operation; surface it to
+        // the synchronous caller so App Server remains pending.
+        await this.#remove(key);
+        return isConflictingDecisionFailure(error)
+          ? { conflictingError: error }
+          : {};
+      }
       this.#scheduleNext(key, record);
-      return;
+      return {};
     }
     await this.#remove(key);
+    return {};
   }
 
   async #remove(key: string): Promise<void> {
@@ -212,6 +238,21 @@ export class WorkspaceGitSystemRejectionCoordinator
   }
 }
 
+function isPermanentDecisionFailure(error: unknown): boolean {
+  return isWorkspaceGitDecisionBrokerError(error) &&
+    error.code !== "state_write_failed" &&
+    error.code !== "decision_outcome_unknown";
+}
+
+function isConflictingDecisionFailure(error: unknown): boolean {
+  return isWorkspaceGitDecisionBrokerError(error) &&
+    (
+      error.code === "invalid_decision" ||
+      error.code === "decision_replay" ||
+      error.code === "status_conflict"
+    );
+}
+
 function rejectionRecord(
   plan: WorkspaceGitDecisionPlan,
   actor: WorkspaceGitSystemRejectionActor,
@@ -230,6 +271,9 @@ function rejectionRecord(
     operationId: plan.operationId,
     planHash: plan.planHash,
     approvalTarget: plan.approvalTarget,
+    ...(plan.approvalAuthorityId === undefined
+      ? {}
+      : { approvalAuthorityId: plan.approvalAuthorityId }),
     repoId: plan.repoId,
     expiresAt: plan.expiresAt,
     actor,
@@ -265,6 +309,7 @@ function sameRejection(
     left.operationId === right.operationId &&
     left.planHash === right.planHash &&
     left.approvalTarget === right.approvalTarget &&
+    left.approvalAuthorityId === right.approvalAuthorityId &&
     left.repoId === right.repoId &&
     left.expiresAt === right.expiresAt
   );

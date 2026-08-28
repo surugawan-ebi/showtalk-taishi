@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { PendingWorkspaceGitSystemRejection } from "../../src/core/index.js";
 import { WorkspaceGitSystemRejectionCoordinator } from "../../src/approvals/workspace-git-system-rejection-coordinator.js";
+import { WorkspaceGitDecisionBrokerError } from "../../src/approvals/workspace-git-decision-broker.js";
 
 const plan = {
   operationId: "11111111-1111-4111-8111-111111111111",
@@ -48,6 +49,113 @@ test("persists a system rejection before tolerating a transient broker failure",
   assert.equal(brokerCalls, 2);
   assert.deepEqual(coordinator.listPending(), []);
   assert.deepEqual(persisted.at(-1), []);
+  await coordinator.close();
+});
+
+test("removes a permanently invalid rejection instead of retrying forever", async () => {
+  const scheduled: Array<() => void> = [];
+  const persisted: PendingWorkspaceGitSystemRejection[][] = [];
+  let brokerCalls = 0;
+  const coordinator = new WorkspaceGitSystemRejectionCoordinator({
+    broker: {
+      recordDecision: async () => {
+        brokerCalls += 1;
+        throw new WorkspaceGitDecisionBrokerError("operation_not_found");
+      },
+    },
+    persist: async (records) => {
+      persisted.push(structuredClone([...records]));
+    },
+    schedule: (task) => {
+      scheduled.push(task);
+      return () => undefined;
+    },
+  });
+
+  await coordinator.recordRejection(
+    plan,
+    "showtalk:private-decision-failure",
+  );
+  assert.equal(brokerCalls, 1);
+  assert.deepEqual(coordinator.listPending(), []);
+  assert.deepEqual(persisted.at(-1), []);
+  assert.deepEqual(scheduled, []);
+  await coordinator.close();
+});
+
+test("surfaces a conflicting approved state before App Server can be rejected", async () => {
+  const persisted: PendingWorkspaceGitSystemRejection[][] = [];
+  const coordinator = new WorkspaceGitSystemRejectionCoordinator({
+    broker: {
+      recordDecision: async () => {
+        throw new WorkspaceGitDecisionBrokerError("status_conflict");
+      },
+    },
+    persist: async (records) => {
+      persisted.push(structuredClone([...records]));
+    },
+  });
+
+  await assert.rejects(
+    coordinator.recordRejection(
+      plan,
+      "showtalk:private-decision-failure",
+    ),
+    (error: unknown) =>
+      error instanceof WorkspaceGitDecisionBrokerError &&
+      error.code === "status_conflict",
+  );
+  assert.deepEqual(coordinator.listPending(), []);
+  assert.deepEqual(persisted.at(-1), []);
+  await coordinator.close();
+});
+
+test("surfaces a conflict to a synchronous caller joining a background retry", async () => {
+  const scheduled: Array<() => void> = [];
+  let brokerCalls = 0;
+  let releaseConflict: (() => void) | undefined;
+  const conflictBlocked = new Promise<void>((resolve) => {
+    releaseConflict = resolve;
+  });
+  const coordinator = new WorkspaceGitSystemRejectionCoordinator({
+    broker: {
+      recordDecision: async () => {
+        brokerCalls += 1;
+        if (brokerCalls === 1) throw new Error("temporary broker failure");
+        await conflictBlocked;
+        throw new WorkspaceGitDecisionBrokerError("status_conflict");
+      },
+    },
+    persist: async () => undefined,
+    schedule: (task) => {
+      scheduled.push(task);
+      return () => {
+        const index = scheduled.indexOf(task);
+        if (index >= 0) scheduled.splice(index, 1);
+      };
+    },
+  });
+
+  await coordinator.recordRejection(
+    plan,
+    "showtalk:slack-projection-failure",
+  );
+  scheduled.shift()?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(brokerCalls, 2);
+
+  const joined = coordinator.recordRejection(
+    plan,
+    "showtalk:private-decision-failure",
+  );
+  releaseConflict?.();
+  await assert.rejects(
+    joined,
+    (error: unknown) =>
+      error instanceof WorkspaceGitDecisionBrokerError &&
+      error.code === "status_conflict",
+  );
+  assert.deepEqual(coordinator.listPending(), []);
   await coordinator.close();
 });
 

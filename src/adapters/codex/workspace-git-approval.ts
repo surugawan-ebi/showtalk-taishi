@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type {
   WorkspaceGitApprovalPlan,
   WorkspaceGitDependabotSecurityUpdateState,
@@ -24,6 +26,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const SHA256 = /^[0-9a-f]{64}$/u;
 const GIT_SHA = /^[0-9a-f]{40}$/u;
 const SNAPSHOT = /^[0-9a-f]{64}$/u;
+const TEMPORARY_WORKSPACE_ID = /^tmp_[0-9a-f]{64}$/u;
 const MAX_PATHS = 100;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_TOTAL_PATH_LENGTH = 30_000;
@@ -49,6 +52,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
     !WORKSPACE_GIT_SERVERS.has(item.server) ||
     (item.tool !== "prepare_git_publication" &&
       item.tool !== "prepare_pull_request_operation" &&
+      item.tool !== "prepare_existing_pull_request_update" &&
       item.tool !== "prepare_github_repository_settings")
   ) {
     return undefined;
@@ -70,6 +74,8 @@ export function normalizeWorkspaceGitPrepareCompletion(
     ? "execute_approved_git_publication"
     : item.tool === "prepare_pull_request_operation"
       ? "execute_approved_pull_request_operation"
+      : item.tool === "prepare_existing_pull_request_update"
+        ? "execute_approved_existing_pull_request_update"
       : "execute_approved_github_repository_settings";
   if (output.execute_tool !== expectedExecuteTool || output.external_write !== false) {
     throw new Error("workspace-git returned an invalid approval execution boundary");
@@ -81,6 +87,18 @@ export function normalizeWorkspaceGitPrepareCompletion(
     throw new Error("workspace-git returned an invalid pending plan identity");
   }
   const scope = requiredRecord(output.scope, "scope");
+  const approvalScope = requiredRecord(
+    output.approval_scope,
+    "approval scope",
+  );
+  const approvalAuthorityId = boundedString(
+    output.approval_authority_id,
+    64,
+    "approval authority ID",
+  );
+  if (!SHA256.test(approvalAuthorityId)) {
+    throw new Error("workspace-git returned an invalid approval authority ID");
+  }
   const argumentsRecord = requiredRecord(
     startedItem?.arguments ?? item.arguments,
     "arguments",
@@ -88,6 +106,202 @@ export function normalizeWorkspaceGitPrepareCompletion(
   const repoId = boundedString(scope.repo_id, 128, "repository ID");
   if (repoId !== boundedString(argumentsRecord.repo_id, 128, "repository input")) {
     throw new Error("workspace-git pending plan repository does not match its input");
+  }
+
+  if (item.tool === "prepare_existing_pull_request_update") {
+    if (!hasOnlyKeys(argumentsRecord, [
+      "repo_id",
+      "pull_request_number",
+      "temporary_workspace_id",
+      "expected_head_sha",
+      "expected_snapshot_id",
+      "paths",
+      "commit_message",
+      "ttl_minutes",
+    ])) {
+      throw new Error("workspace-git existing Pull Request update input is invalid");
+    }
+    if (
+      Object.hasOwn(argumentsRecord, "ttl_minutes") &&
+      (!Number.isSafeInteger(argumentsRecord.ttl_minutes) ||
+        (argumentsRecord.ttl_minutes as number) < 5 ||
+        (argumentsRecord.ttl_minutes as number) > 60)
+    ) {
+      throw new Error("workspace-git existing Pull Request update TTL is invalid");
+    }
+    if (!hasExactKeys(scope, [
+      "repo_id",
+      "temporary_workspace_id",
+      "pull_request_number",
+      "pull_request_url",
+      "head_ref_name",
+      "base_ref_name",
+      "expected_pull_request_head_sha",
+      "expected_remote_head_sha",
+      "expected_local_head_sha",
+      "expected_snapshot_id",
+      "expected_tree",
+      "clone_identity",
+      "configured_root_identity",
+      "relative_path",
+      "paths",
+      "commit_message",
+      "push_ref",
+    ])) {
+      throw new Error("workspace-git existing Pull Request update scope is invalid");
+    }
+    const temporaryWorkspaceId = boundedString(
+      scope.temporary_workspace_id,
+      256,
+      "temporary workspace ID",
+    );
+    const inputTemporaryWorkspaceId = boundedString(
+      argumentsRecord.temporary_workspace_id,
+      256,
+      "temporary workspace input",
+    );
+    if (
+      !TEMPORARY_WORKSPACE_ID.test(temporaryWorkspaceId) ||
+      temporaryWorkspaceId !== inputTemporaryWorkspaceId
+    ) {
+      throw new Error("workspace-git temporary workspace does not match its input");
+    }
+    const pullRequestNumber = positiveInteger(
+      scope.pull_request_number,
+      "Pull Request number",
+    );
+    if (
+      pullRequestNumber !== positiveInteger(
+        argumentsRecord.pull_request_number,
+        "Pull Request input number",
+      )
+    ) {
+      throw new Error("workspace-git Pull Request number does not match its input");
+    }
+    const approvalTarget = boundedString(
+      output.approval_target,
+      256,
+      "approval target",
+    );
+    if (approvalTarget !== `existing_pr_update_${pullRequestNumber}`) {
+      throw new Error(
+        "workspace-git approval target does not match its existing Pull Request",
+      );
+    }
+    const expectedPullRequestHead = boundedString(
+      scope.expected_pull_request_head_sha,
+      40,
+      "expected Pull Request HEAD",
+    );
+    const expectedRemoteHead = boundedString(
+      scope.expected_remote_head_sha,
+      40,
+      "expected remote HEAD",
+    );
+    const expectedHead = boundedString(
+      scope.expected_local_head_sha,
+      40,
+      "expected local HEAD",
+    );
+    const expectedSnapshotId = boundedString(
+      scope.expected_snapshot_id,
+      64,
+      "expected snapshot",
+    );
+    const expectedTree = boundedString(
+      scope.expected_tree,
+      40,
+      "expected tree",
+    );
+    if (
+      !GIT_SHA.test(expectedPullRequestHead) ||
+      !GIT_SHA.test(expectedRemoteHead) ||
+      !GIT_SHA.test(expectedHead) ||
+      !SNAPSHOT.test(expectedSnapshotId) ||
+      !GIT_SHA.test(expectedTree) ||
+      expectedPullRequestHead !== boundedString(
+        argumentsRecord.expected_head_sha,
+        40,
+        "expected HEAD input",
+      ) ||
+      expectedSnapshotId !== boundedString(
+        argumentsRecord.expected_snapshot_id,
+        64,
+        "expected snapshot input",
+      )
+    ) {
+      throw new Error("workspace-git existing Pull Request heads do not match input");
+    }
+    const paths = validatedPaths(scope.paths);
+    const inputPaths = validatedPaths(argumentsRecord.paths);
+    if (paths.length < 1 || !sameStrings(paths, inputPaths)) {
+      throw new Error("workspace-git existing Pull Request paths do not match input");
+    }
+    const commitMessage = boundedTrimmedString(
+      scope.commit_message,
+      500,
+      "commit message",
+    );
+    if (
+      commitMessage !== boundedTrimmedString(
+        argumentsRecord.commit_message,
+        500,
+        "commit message input",
+      )
+    ) {
+      throw new Error("workspace-git commit message does not match input");
+    }
+    const branch = boundedString(scope.head_ref_name, 256, "head branch");
+    const pushRef = boundedString(scope.push_ref, 512, "push ref");
+    if (pushRef !== `refs/heads/${branch}`) {
+      throw new Error("workspace-git existing Pull Request push ref is invalid");
+    }
+    const cloneIdentity = boundedString(
+      scope.clone_identity,
+      64,
+      "clone identity",
+    );
+    const configuredRootIdentity = boundedString(
+      scope.configured_root_identity,
+      64,
+      "configured root identity",
+    );
+    if (!SHA256.test(cloneIdentity) || !SHA256.test(configuredRootIdentity)) {
+      throw new Error("workspace-git existing Pull Request identity is invalid");
+    }
+    const relativePath = validatedPaths([
+      boundedString(scope.relative_path, 1_024, "relative path"),
+    ])[0]!;
+    return {
+      turnId,
+      plan: bindApprovalScope({
+        operationId,
+        planHash,
+        approvalTarget,
+        approvalAuthorityId,
+        operation: "existing_pull_request_update",
+        repoId,
+        mode: "existing_pull_request_update",
+        branch,
+        paths,
+        expectedHead,
+        expectedSnapshotId,
+        temporaryWorkspaceId,
+        commitMessage,
+        pushTarget: `origin/${branch}`,
+        pullRequestNumber,
+        pullRequestUrl: boundedHttpsUrl(scope.pull_request_url),
+        baseBranch: boundedString(scope.base_ref_name, 256, "base branch"),
+        expectedPullRequestHead,
+        expectedRemoteHead,
+        expectedTree,
+        cloneIdentity,
+        configuredRootIdentity,
+        relativePath,
+        pushRef,
+        expiresAt,
+      }, approvalScope),
+    };
   }
 
   if (item.tool === "prepare_github_repository_settings") {
@@ -146,10 +360,11 @@ export function normalizeWorkspaceGitPrepareCompletion(
     }
     return {
       turnId,
-      plan: freezePlan({
+      plan: bindApprovalScope({
         operationId,
         planHash,
         approvalTarget,
+        approvalAuthorityId,
         operation: "github_repository_settings",
         repoId,
         mode: "repository_settings",
@@ -158,7 +373,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
         repositorySettingsDesired: desired,
         repositorySettingsResultingState: resultingState,
         expiresAt,
-      }),
+      }, approvalScope),
     };
   }
 
@@ -295,6 +510,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       operationId,
       planHash,
       approvalTarget,
+      approvalAuthorityId,
       operation: "git_publication" as const,
       repoId,
       expectedSnapshotId,
@@ -306,7 +522,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       }
       return {
         turnId,
-        plan: freezePlan({
+        plan: bindApprovalScope({
           ...commonPlan,
           mode,
           branch: "main",
@@ -315,7 +531,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
           worktreeId: "primary",
           commitMessage,
           pushTarget: "origin/main",
-        }),
+        }, approvalScope),
       };
     }
     if (mode === "initial_push_existing") {
@@ -324,7 +540,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       }
       return {
         turnId,
-        plan: freezePlan({
+        plan: bindApprovalScope({
           ...commonPlan,
           mode,
           branch: "main",
@@ -332,7 +548,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
           expectedHead,
           worktreeId: "primary",
           pushTarget: "origin/main",
-        }),
+        }, approvalScope),
       };
     }
     if (expectedHead === null) {
@@ -340,7 +556,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
     }
     return {
       turnId,
-      plan: freezePlan({
+      plan: bindApprovalScope({
         ...commonPlan,
         mode,
         branch,
@@ -354,11 +570,37 @@ export function normalizeWorkspaceGitPrepareCompletion(
         ...(pullRequestBaseBranch === undefined
           ? {}
           : { pullRequestBaseBranch }),
-      }),
+      }, approvalScope),
     };
   }
 
   const action = boundedString(scope.action, 64, "Pull Request action");
+  if (!hasOnlyKeys(scope, [
+    "repo_id",
+    "action",
+    "pull_request_number",
+    "pull_request_url",
+    "title",
+    "base_ref_name",
+    "base_policy",
+    "base_sha",
+    "head_ref_name",
+    "head_repository_owner",
+    "expected_head_sha",
+    "expected_is_draft",
+    "auto_merge_enabled",
+    "parent_pull_request_number",
+    "parent_pull_request_url",
+    "parent_head_ref_name",
+    "parent_head_sha",
+    "parent_head_repository_owner",
+    "parent_state",
+    "parent_is_draft",
+    "parent_auto_merge_enabled",
+    "merge_method",
+  ])) {
+    throw new Error("workspace-git Pull Request scope is invalid");
+  }
   const pullRequestNumber = positiveInteger(
     scope.pull_request_number,
     "Pull Request number",
@@ -372,14 +614,96 @@ export function normalizeWorkspaceGitPrepareCompletion(
     throw new Error("workspace-git approval target does not match its Pull Request");
   }
   const expectedHead = boundedString(scope.expected_head_sha, 40, "expected HEAD");
+  const targetPullRequestTitle = boundedTrimmedString(
+    scope.title,
+    500,
+    "Pull Request title",
+  );
   const branch = boundedString(scope.head_ref_name, 256, "head branch");
+  const headRepositoryOwner = boundedString(
+    scope.head_repository_owner,
+    256,
+    "head repository owner",
+  );
   const baseBranch = boundedString(scope.base_ref_name, 256, "base branch");
+  const basePolicy = boundedString(scope.base_policy, 64, "base policy");
+  if (
+    basePolicy !== "catalog_publication_branch" &&
+    basePolicy !== "same_repo_stacked_pr"
+  ) {
+    throw new Error("workspace-git Pull Request base policy is invalid");
+  }
+  const baseSha = optionalBoundedString(scope.base_sha, 40);
+  if (baseSha !== undefined && !GIT_SHA.test(baseSha)) {
+    throw new Error("workspace-git Pull Request base SHA is invalid");
+  }
+  if (
+    typeof scope.auto_merge_enabled !== "boolean" ||
+    typeof scope.expected_is_draft !== "boolean"
+  ) {
+    throw new Error("workspace-git Pull Request auto-merge state is invalid");
+  }
+  const parentPullRequestNumber = scope.parent_pull_request_number === undefined
+    ? undefined
+    : positiveInteger(scope.parent_pull_request_number, "parent Pull Request number");
+  const parentFields = [
+    scope.parent_pull_request_url,
+    scope.parent_head_ref_name,
+    scope.parent_head_sha,
+    scope.parent_head_repository_owner,
+    scope.parent_state,
+    scope.parent_is_draft,
+    scope.parent_auto_merge_enabled,
+  ];
+  if (
+    parentPullRequestNumber === undefined
+      ? parentFields.some((value) => value !== undefined)
+      : parentFields.some((value) => value === undefined)
+  ) {
+    throw new Error("workspace-git parent Pull Request scope is incomplete");
+  }
+  const parent = parentPullRequestNumber === undefined
+    ? undefined
+    : {
+        parentPullRequestNumber,
+        parentPullRequestUrl: boundedHttpsUrl(scope.parent_pull_request_url),
+        parentHeadRefName: boundedString(
+          scope.parent_head_ref_name,
+          256,
+          "parent head branch",
+        ),
+        parentHeadSha: boundedString(
+          scope.parent_head_sha,
+          40,
+          "parent head SHA",
+        ),
+        parentHeadRepositoryOwner: boundedString(
+          scope.parent_head_repository_owner,
+          256,
+          "parent repository owner",
+        ),
+        parentState: scope.parent_state as "OPEN",
+        parentIsDraft: scope.parent_is_draft as boolean,
+        parentAutoMergeEnabled: scope.parent_auto_merge_enabled as boolean,
+      };
+  if (
+    parent !== undefined &&
+    (!GIT_SHA.test(parent.parentHeadSha) ||
+      parent.parentState !== "OPEN" ||
+      typeof parent.parentIsDraft !== "boolean" ||
+      typeof parent.parentAutoMergeEnabled !== "boolean")
+  ) {
+    throw new Error("workspace-git parent Pull Request scope is invalid");
+  }
   const pullRequestUrl = boundedHttpsUrl(scope.pull_request_url);
   if (
     (action !== "mark_ready_for_review" && action !== "merge") ||
     action !== argumentsRecord.action ||
     pullRequestNumber !== argumentsRecord.pull_request_number ||
-    !GIT_SHA.test(expectedHead)
+    !GIT_SHA.test(expectedHead) ||
+    (action === "mark_ready_for_review"
+      ? scope.expected_is_draft !== true
+      : scope.expected_is_draft !== false)
   ) {
     throw new Error("workspace-git returned an invalid Pull Request scope");
   }
@@ -396,10 +720,11 @@ export function normalizeWorkspaceGitPrepareCompletion(
   }
   return {
     turnId,
-    plan: freezePlan({
+    plan: bindApprovalScope({
       operationId,
       planHash,
       approvalTarget,
+      approvalAuthorityId,
       operation:
         action === "merge" ? "pull_request_merge" : "pull_request_ready",
       repoId,
@@ -409,12 +734,19 @@ export function normalizeWorkspaceGitPrepareCompletion(
       expectedHead,
       pullRequestNumber,
       pullRequestUrl,
+      targetPullRequestTitle,
       baseBranch,
+      basePolicy,
+      ...(baseSha === undefined ? {} : { baseSha }),
+      autoMergeEnabled: scope.auto_merge_enabled,
+      headRepositoryOwner,
+      expectedIsDraft: scope.expected_is_draft,
+      ...(parent === undefined ? {} : parent),
       ...(action === "merge"
         ? { mergeMethod: mergeMethod as "merge" | "squash" | "rebase" }
         : {}),
       expiresAt,
-    }),
+    }, approvalScope),
   };
 }
 
@@ -453,6 +785,166 @@ function validatedPaths(value: unknown): readonly string[] {
     throw new Error("workspace-git publication paths exceed the Slack review limit");
   }
   return Object.freeze(paths);
+}
+
+type UnboundWorkspaceGitApprovalPlan = WorkspaceGitApprovalPlan extends infer Plan
+  ? Plan extends WorkspaceGitApprovalPlan
+    ? Omit<Plan, "approvalScope">
+    : never
+  : never;
+
+function bindApprovalScope(
+  plan: UnboundWorkspaceGitApprovalPlan,
+  receivedScope: Record<string, unknown>,
+): WorkspaceGitApprovalPlan {
+  const expectedScope = approvalScopeForPlan(plan);
+  if (!isDeepStrictEqual(receivedScope, expectedScope)) {
+    throw new Error(
+      "workspace-git approval scope does not match the human-facing plan",
+    );
+  }
+  return freezePlan({
+    ...plan,
+    approvalScope: freezeApprovalScope(structuredClone(receivedScope)),
+  } as WorkspaceGitApprovalPlan);
+}
+
+function approvalScopeForPlan(
+  plan: UnboundWorkspaceGitApprovalPlan,
+): Record<string, unknown> {
+  switch (plan.operation) {
+    case "git_publication":
+      return {
+        kind: "git_publication",
+        repo_id: plan.repoId,
+        mode: plan.mode,
+        branch: plan.branch,
+        worktree_id: plan.worktreeId,
+        expected_head: plan.expectedHead,
+        expected_snapshot_id: plan.expectedSnapshotId,
+        paths: [...plan.paths],
+        ...(plan.commitMessage === undefined
+          ? {}
+          : { commit_message: plan.commitMessage }),
+        ...(plan.pullRequestTitle === undefined ||
+            plan.pullRequestBody === undefined
+          ? {}
+          : {
+              pr: {
+                title: plan.pullRequestTitle,
+                body: plan.pullRequestBody,
+              },
+            }),
+        ...(plan.pullRequestBaseBranch === undefined
+          ? {}
+          : { pr_base_branch: plan.pullRequestBaseBranch }),
+      };
+    case "pull_request_ready":
+    case "pull_request_merge":
+      return {
+        kind: "pull_request",
+        repo_id: plan.repoId,
+        action: plan.mode,
+        pull_request_number: plan.pullRequestNumber,
+        pull_request_url: plan.pullRequestUrl,
+        title: plan.targetPullRequestTitle,
+        base_ref_name: plan.baseBranch,
+        base_policy: plan.basePolicy,
+        ...(plan.baseSha === undefined ? {} : { base_sha: plan.baseSha }),
+        head_ref_name: plan.branch,
+        head_repository_owner: plan.headRepositoryOwner,
+        expected_head_sha: plan.expectedHead,
+        expected_is_draft: plan.expectedIsDraft,
+        auto_merge_enabled: plan.autoMergeEnabled,
+        ...(plan.parentPullRequestNumber === undefined
+          ? {}
+          : {
+              parent_pull_request_number: plan.parentPullRequestNumber,
+              parent_pull_request_url: plan.parentPullRequestUrl,
+              parent_head_ref_name: plan.parentHeadRefName,
+              parent_head_sha: plan.parentHeadSha,
+              parent_head_repository_owner: plan.parentHeadRepositoryOwner,
+              parent_state: plan.parentState,
+              parent_is_draft: plan.parentIsDraft,
+              parent_auto_merge_enabled: plan.parentAutoMergeEnabled,
+            }),
+        ...(plan.mergeMethod === undefined
+          ? {}
+          : { merge_method: plan.mergeMethod }),
+      };
+    case "existing_pull_request_update":
+      return {
+        kind: "existing_pull_request_update",
+        repo_id: plan.repoId,
+        temporary_workspace_id: plan.temporaryWorkspaceId,
+        pull_request_number: plan.pullRequestNumber,
+        pull_request_url: plan.pullRequestUrl,
+        head_ref_name: plan.branch,
+        base_ref_name: plan.baseBranch,
+        expected_pull_request_head_sha: plan.expectedPullRequestHead,
+        expected_remote_head_sha: plan.expectedRemoteHead,
+        expected_local_head_sha: plan.expectedHead,
+        expected_snapshot_id: plan.expectedSnapshotId,
+        expected_tree: plan.expectedTree,
+        clone_identity: plan.cloneIdentity,
+        configured_root_identity: plan.configuredRootIdentity,
+        relative_path: plan.relativePath,
+        paths: [...plan.paths],
+        commit_message: plan.commitMessage,
+        push_ref: plan.pushRef,
+      };
+    case "github_repository_settings":
+      return {
+        kind: "repository_settings",
+        repo_id: plan.repoId,
+        before: approvalSettingsState(plan.repositorySettingsBefore),
+        desired: approvalSettingsDesired(plan.repositorySettingsDesired),
+      };
+  }
+}
+
+function approvalSettingsState(
+  value: WorkspaceGitRepositorySettingsState,
+): Record<string, unknown> {
+  return {
+    description: value.description,
+    topics: [...value.topics],
+    dependabot_security_updates: value.dependabotSecurityUpdates,
+  };
+}
+
+function approvalSettingsDesired(
+  value: WorkspaceGitRepositorySettingsDesired,
+): Record<string, unknown> {
+  return {
+    ...(Object.hasOwn(value, "description")
+      ? { description: value.description }
+      : {}),
+    ...(Object.hasOwn(value, "topics")
+      ? { topics: [...(value.topics ?? [])] }
+      : {}),
+    ...(Object.hasOwn(value, "dependabotSecurityUpdates")
+      ? { dependabot_security_updates: value.dependabotSecurityUpdates }
+      : {}),
+  };
+}
+
+function freezeApprovalScope(
+  value: Record<string, unknown>,
+): Readonly<Record<string, unknown>> {
+  for (const entry of Object.values(value)) {
+    if (Array.isArray(entry)) {
+      for (const item of entry) {
+        if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+          freezeApprovalScope(item as Record<string, unknown>);
+        }
+      }
+      Object.freeze(entry);
+    } else if (entry !== null && typeof entry === "object") {
+      freezeApprovalScope(entry as Record<string, unknown>);
+    }
+  }
+  return Object.freeze(value);
 }
 
 function freezePlan<T extends WorkspaceGitApprovalPlan>(plan: T): T {

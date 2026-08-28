@@ -153,8 +153,9 @@ this preview; install from a source checkout rather than `npm install -g`.
   Gateway. They do not revoke capabilities independently granted to the coding
   agent, so keep the backend sandbox and approval policy restrictive. Exact Git
   approvals are bound to one operation, plan, Slack message, approver, and live
-  turn, but the `0.0.1` flow still trusts the resumed Codex turn to record the
-  Slack decision in workspace-git's private approval state.
+  turn. Before Codex resumes, the Gateway records the bound Slack decision
+  through workspace-git's model-inaccessible private broker; the resumed turn
+  can execute only after the exact operation is re-read as approved.
 
 Read the full [security model](docs/security.md) before connecting real
 repositories or enabling Koe-to-Koe consultations. Report vulnerabilities

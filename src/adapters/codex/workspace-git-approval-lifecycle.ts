@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { WorkspaceGitApprovalPlan } from "../../core/index.js";
 
 const TERMINAL_OPERATION_STATUSES = new Set([
@@ -429,8 +431,18 @@ export function sameExactWorkspaceGitApprovalPlan(
   left: WorkspaceGitApprovalPlan,
   right: WorkspaceGitApprovalPlan,
 ): boolean {
+  if (
+    left.operation === "existing_pull_request_update" ||
+    right.operation === "existing_pull_request_update"
+  ) {
+    return left.operation === "existing_pull_request_update" &&
+      right.operation === "existing_pull_request_update" &&
+      sameExistingPullRequestUpdatePlan(left, right);
+  }
   const commonMatches = left.operationId === right.operationId &&
     left.planHash === right.planHash &&
+    left.approvalAuthorityId === right.approvalAuthorityId &&
+    isDeepStrictEqual(left.approvalScope, right.approvalScope) &&
     left.approvalTarget === right.approvalTarget &&
     left.operation === right.operation &&
     left.repoId === right.repoId &&
@@ -451,6 +463,31 @@ export function sameExactWorkspaceGitApprovalPlan(
     left.mergeMethod === right.mergeMethod &&
     left.expiresAt === right.expiresAt;
   if (!commonMatches) return false;
+  if (
+    left.operation === "pull_request_ready" ||
+    left.operation === "pull_request_merge" ||
+    right.operation === "pull_request_ready" ||
+    right.operation === "pull_request_merge"
+  ) {
+    return (left.operation === "pull_request_ready" ||
+        left.operation === "pull_request_merge") &&
+      (right.operation === "pull_request_ready" ||
+        right.operation === "pull_request_merge") &&
+      left.targetPullRequestTitle === right.targetPullRequestTitle &&
+      left.basePolicy === right.basePolicy &&
+      left.baseSha === right.baseSha &&
+      left.autoMergeEnabled === right.autoMergeEnabled &&
+      left.headRepositoryOwner === right.headRepositoryOwner &&
+      left.expectedIsDraft === right.expectedIsDraft &&
+      left.parentPullRequestNumber === right.parentPullRequestNumber &&
+      left.parentPullRequestUrl === right.parentPullRequestUrl &&
+      left.parentHeadRefName === right.parentHeadRefName &&
+      left.parentHeadSha === right.parentHeadSha &&
+      left.parentHeadRepositoryOwner === right.parentHeadRepositoryOwner &&
+      left.parentState === right.parentState &&
+      left.parentIsDraft === right.parentIsDraft &&
+      left.parentAutoMergeEnabled === right.parentAutoMergeEnabled;
+  }
   if (
     left.operation === "github_repository_settings" ||
     right.operation === "github_repository_settings"
@@ -473,6 +510,41 @@ export function sameExactWorkspaceGitApprovalPlan(
   return true;
 }
 
+function sameExistingPullRequestUpdatePlan(
+  left: Extract<WorkspaceGitApprovalPlan, {
+    operation: "existing_pull_request_update";
+  }>,
+  right: Extract<WorkspaceGitApprovalPlan, {
+    operation: "existing_pull_request_update";
+  }>,
+): boolean {
+  return left.operationId === right.operationId &&
+    left.planHash === right.planHash &&
+    left.approvalAuthorityId === right.approvalAuthorityId &&
+    isDeepStrictEqual(left.approvalScope, right.approvalScope) &&
+    left.approvalTarget === right.approvalTarget &&
+    left.repoId === right.repoId &&
+    left.mode === right.mode &&
+    left.branch === right.branch &&
+    sameStrings(left.paths, right.paths) &&
+    left.expectedHead === right.expectedHead &&
+    left.expectedSnapshotId === right.expectedSnapshotId &&
+    left.temporaryWorkspaceId === right.temporaryWorkspaceId &&
+    left.commitMessage === right.commitMessage &&
+    left.pushTarget === right.pushTarget &&
+    left.pullRequestNumber === right.pullRequestNumber &&
+    left.pullRequestUrl === right.pullRequestUrl &&
+    left.baseBranch === right.baseBranch &&
+    left.expectedPullRequestHead === right.expectedPullRequestHead &&
+    left.expectedRemoteHead === right.expectedRemoteHead &&
+    left.expectedTree === right.expectedTree &&
+    left.cloneIdentity === right.cloneIdentity &&
+    left.configuredRootIdentity === right.configuredRootIdentity &&
+    left.relativePath === right.relativePath &&
+    left.pushRef === right.pushRef &&
+    left.expiresAt === right.expiresAt;
+}
+
 function exactExecutionTool(plan: WorkspaceGitApprovalPlan): string {
   switch (plan.operation) {
     case "git_publication":
@@ -480,6 +552,8 @@ function exactExecutionTool(plan: WorkspaceGitApprovalPlan): string {
     case "pull_request_ready":
     case "pull_request_merge":
       return "execute_approved_pull_request_operation";
+    case "existing_pull_request_update":
+      return "execute_approved_existing_pull_request_update";
     case "github_repository_settings":
       return "execute_approved_github_repository_settings";
   }
