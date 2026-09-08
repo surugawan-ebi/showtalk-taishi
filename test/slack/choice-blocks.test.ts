@@ -70,6 +70,54 @@ test("renders ordinary choices with opaque message-bound action payloads", () =>
   assert.doesNotMatch(first.value, /砂漠盆地|中央が低い/u);
 });
 
+test("renders external-action confirmation as explicitly non-Git", () => {
+  const externalRouting = {
+    ...routing,
+    purpose: "external_action_confirmation" as const,
+  };
+  const blocks = buildChoiceBlocks(
+    {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "外部設定",
+      prompt: "main保護を設定しますか？",
+      options: [
+        {
+          id: "option_1",
+          label: "外部操作を承認（Git承認ではありません）",
+          description: "設定する",
+        },
+        {
+          id: "option_2",
+          label: "外部操作を拒否・保留",
+          description: "設定しない",
+        },
+      ],
+      allowsOther: false,
+    },
+    routing,
+  );
+  const encoded = JSON.stringify(blocks);
+  assert.match(encoded, /workspace-gitのGit承認ではありません/u);
+  assert.match(encoded, /Git承認状態を変更しません/u);
+  assert.doesNotMatch(encoded, /taishi\.git_plan/u);
+  const actions = (blocks[1] as { elements: Array<{ value: string }> }).elements;
+  assert.deepEqual(parseChoiceActionValue(actions[0]!.value), {
+    ...externalRouting,
+    optionId: "option_1",
+  });
+});
+
+test("rejects a forged structured-choice purpose", () => {
+  assert.throws(() =>
+    parseChoiceActionValue(JSON.stringify({
+      ...routing,
+      purpose: "git_approval",
+      optionId: "option_1",
+    })),
+  );
+});
+
 test("accepts a choice only from its bound Slack user and message", () => {
   const action = {
     action_id: "taishi.choice.select.option_2",

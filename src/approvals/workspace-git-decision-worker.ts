@@ -6,21 +6,30 @@ interface WorkerConfiguration {
   readonly stateRoot: string;
 }
 
-interface PrivateBroker {
-  recordDecision(input: unknown): Promise<{
-    readonly status: string;
+interface ManualBroker {
+  readonly contract_version: 1;
+  recordHumanDecision(input: unknown): Promise<{
+    readonly version: 1;
+    readonly status: "approved" | "rejected";
     readonly disposition: "transitioned" | "already_recorded_same_delivery";
-  }>;
-  inspectDecision(input: unknown): Promise<{
-    readonly status: string;
-    readonly disposition: "recorded" | "pending";
   }>;
 }
 
-interface PrivateBrokerModule {
-  createPrivateWorkspaceGitApprovalBroker(options: {
+interface ManualComposition {
+  readonly contract_version: 1;
+  readonly human_decision_broker_factory: {
+    readonly contract_version: 1;
+    create(): ManualBroker | Promise<ManualBroker>;
+  };
+  close(): Promise<void>;
+}
+
+interface ManualModule {
+  createWorkspaceGitManualCompositionFromStateRoot(input: {
     readonly stateRoot: string;
-  }): Promise<PrivateBroker>;
+  }):
+    | ManualComposition
+    | Promise<ManualComposition>;
 }
 
 const SAFE_ERROR_CODES = new Set([
@@ -33,47 +42,41 @@ const SAFE_ERROR_CODES = new Set([
 ]);
 
 const port = parentPort;
-if (port === null) throw new Error("Private approval worker has no parent port");
+if (port === null) throw new Error("Manual decision worker has no parent port");
 const configuration = workerData as WorkerConfiguration;
 const loaded = await import(pathToFileURL(configuration.modulePath).href) as
-  Partial<PrivateBrokerModule>;
-if (typeof loaded.createPrivateWorkspaceGitApprovalBroker !== "function") {
-  throw new Error("Private approval module has no supported broker factory");
+  Partial<ManualModule>;
+if (typeof loaded.createWorkspaceGitManualCompositionFromStateRoot !== "function") {
+  throw new Error("Manual workspace-git module has no supported composition factory");
 }
-const broker = await loaded.createPrivateWorkspaceGitApprovalBroker({
+const composition = await loaded.createWorkspaceGitManualCompositionFromStateRoot({
   stateRoot: configuration.stateRoot,
 });
-if (
-  broker === null ||
-  typeof broker.recordDecision !== "function" ||
-  typeof broker.inspectDecision !== "function"
-) {
-  throw new Error("Private approval module returned an invalid broker");
+assertManualComposition(composition);
+const broker = await composition.human_decision_broker_factory.create();
+if (broker?.contract_version !== 1 || typeof broker.recordHumanDecision !== "function") {
+  throw new Error("Manual workspace-git module returned an invalid broker");
 }
+
 port.postMessage({ type: "ready" });
 port.on("message", (message: unknown) => {
   const record = asRecord(message);
   if (
-    (record?.type !== "decision" && record?.type !== "inspect") ||
+    record?.type !== "manual_human_decision_v1" ||
     !Number.isSafeInteger(record.requestId)
   ) return;
   const requestId = record.requestId as number;
-  const operation = record.type === "decision"
-    ? broker.recordDecision(record.input)
-    : broker.inspectDecision(record.input);
-  void operation.then(
+  void broker.recordHumanDecision(record.input).then(
     (result) => {
       port.postMessage({
         type: "result",
         requestId,
-        ok: true,
+        ok: result.version === 1,
         status: result.status,
         disposition: result.disposition,
       });
     },
     (error: unknown) => {
-      // Never copy local paths, operation IDs, or state details across the
-      // worker boundary. Only a bounded, non-secret classification crosses.
       port.postMessage({
         type: "result",
         requestId,
@@ -83,6 +86,21 @@ port.on("message", (message: unknown) => {
     },
   );
 });
+
+function assertManualComposition(value: unknown): asserts value is ManualComposition {
+  const record = asRecord(value);
+  const factory = asRecord(record?.human_decision_broker_factory);
+  if (
+    record?.contract_version !== 1 ||
+    Object.keys(record).sort().join(",") !==
+      "close,contract_version,human_decision_broker_factory" ||
+    factory?.contract_version !== 1 ||
+    typeof factory.create !== "function" ||
+    typeof record.close !== "function"
+  ) {
+    throw new Error("Manual workspace-git composition is invalid");
+  }
+}
 
 function safeErrorCode(error: unknown): string {
   const code = asRecord(error)?.code;

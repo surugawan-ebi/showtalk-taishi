@@ -28,7 +28,10 @@ export function validateSlackActionSource(
   const apiAppId = requiredString(record.api_app_id);
   const message = requiredRecord(record.message);
   const messageTs = requiredString(message.ts);
-  const rootThreadTs = requiredString(message.thread_ts);
+  const rootThreadTs =
+    message.thread_ts === undefined
+      ? messageTs
+      : requiredString(message.thread_ts);
   const container = requiredRecord(record.container);
 
   if (record.type !== "block_actions") {

@@ -20,11 +20,16 @@ function displayed(expiresAt: number) {
     completedAnswers: [],
     question: {
       id: "question_1",
-      header: "公開設定",
-      prompt: "main保護を設定しますか？",
+      purpose: "ordinary",
+      header: "公開方針",
+      prompt: "どの方針で進めますか？",
       options: [
-        { id: "option_1", label: "承認して実行", description: "設定する" },
-        { id: "option_2", label: "拒否・保留", description: "設定しない" },
+        {
+          id: "option_1",
+          label: "設定案を作る",
+          description: "変更は実行しない",
+        },
+        { id: "option_2", label: "保留する", description: "今回は進めない" },
       ],
       allowsOther: false,
     },
@@ -77,7 +82,7 @@ test("renders continuation actions without exposing the original RPC request", (
   assert.ok(continuation);
   const rendered = JSON.stringify(buildChoiceContinuationBlocks(continuation));
   assert.match(rendered, /taishi\.choice_continue\.select\.option_1/u);
-  assert.match(rendered, /承認して実行/u);
+  assert.match(rendered, /設定案を作る/u);
   assert.doesNotMatch(rendered, /codex-choice:/u);
   assert.deepEqual(
     parseChoiceContinuationActionId("taishi.choice_continue.select.option_2"),
@@ -87,6 +92,34 @@ test("renders continuation actions without exposing the original RPC request", (
     parseChoiceContinuationId(continuation.continuationId),
     continuation.continuationId,
   );
+});
+
+test("never creates a continuation for an externally resolved external approval", () => {
+  const store = new StructuredChoiceContinuationStore(() => 1_000);
+  const display = {
+    ...displayed(60_000),
+    question: {
+      ...displayed(60_000).question,
+      purpose: "external_action_confirmation" as const,
+      header: "外部操作の最終確認",
+      prompt: "対象を変更しますか？",
+      options: [
+        {
+          id: "option_1",
+          label: "外部操作を承認（Git承認ではありません）",
+          description: "実行する",
+        },
+        {
+          id: "option_2",
+          label: "外部操作を拒否・保留",
+          description: "実行しない",
+        },
+      ],
+    },
+  } as const;
+  store.rememberDisplayed(display);
+  assert.equal(store.resolveExternally(display.requestId), undefined);
+  assert.equal(store.getForOriginalRequest(display.requestId), undefined);
 });
 
 test("retains earlier answers from one multi-question request", () => {

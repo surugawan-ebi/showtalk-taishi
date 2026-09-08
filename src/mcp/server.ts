@@ -279,9 +279,28 @@ export class AuthenticatedMcpHttpServer {
       return;
     }
 
+    const deferredEffects: Array<() => void> = [];
+    let responseCompletionKind: "finish" | "close" | undefined;
+    const responseCompletion = waitForResponseCompletion(response);
+    const completeResponse = (kind: "finish" | "close") => {
+      if (responseCompletionKind !== undefined) return;
+      responseCompletionKind = kind;
+      for (const effect of deferredEffects.splice(0)) {
+        runDeferredEffect(effect);
+      }
+    };
+    response.once("finish", () => completeResponse("finish"));
+    response.once("close", () => completeResponse("close"));
     const mcpServer = createAgentMcpServer(this.#service, callerAgentId, {
       name: this.#serverName,
       version: this.#serverVersion,
+      deferUntilResponseFinished: (effect) => {
+        if (responseCompletionKind !== undefined) {
+          runDeferredEffect(effect);
+          return;
+        }
+        deferredEffects.push(effect);
+      },
     });
     const transport = new StreamableHTTPServerTransport({
       enableJsonResponse: true,
@@ -302,6 +321,7 @@ export class AuthenticatedMcpHttpServer {
       // exactOptionalPropertyTypes even though this class implements Transport.
       await mcpServer.connect(transport as unknown as Transport);
       await transport.handleRequest(request, response, body);
+      await responseCompletion;
     } finally {
       await active.close();
       this.#activeRequests.delete(active);
@@ -359,6 +379,35 @@ export class AuthenticatedMcpHttpServer {
     for (const resolve of this.#idleWaiters) resolve();
     this.#idleWaiters.clear();
   }
+}
+
+function runDeferredEffect(effect: () => void): void {
+  queueMicrotask(() => {
+    try {
+      effect();
+    } catch {
+      // The response has finished or disconnected. Runtime shutdown
+      // diagnostics own any later supervisor failure.
+    }
+  });
+}
+
+function waitForResponseCompletion(
+  response: ServerResponse,
+): Promise<"finish" | "close"> {
+  if (response.writableFinished) return Promise.resolve("finish");
+  return new Promise((resolve) => {
+    const onFinish = () => {
+      response.off("close", onClose);
+      resolve("finish");
+    };
+    const onClose = () => {
+      response.off("finish", onFinish);
+      resolve("close");
+    };
+    response.once("finish", onFinish);
+    response.once("close", onClose);
+  });
 }
 
 class HttpRequestError extends Error {

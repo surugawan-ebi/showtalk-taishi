@@ -116,8 +116,6 @@ interface WorkspaceGitApprovalPlanBase {
   readonly planHash: string;
   /** Exact private approval target emitted by workspace-git prepare_*. */
   readonly approvalTarget: string;
-  /** Opaque identity of the private workspace-git approval state. */
-  readonly approvalAuthorityId?: string;
   /**
    * Exact, bounded approval projection emitted by workspace-git itself.
    * ShowTalk validates this against the human-facing plan, then passes the
@@ -125,6 +123,8 @@ interface WorkspaceGitApprovalPlanBase {
    */
   readonly approvalScope?: Readonly<Record<string, unknown>>;
   readonly repoId: string;
+  /** Exact prepare input; omitted only for operations without an environment. */
+  readonly environment?: string;
   readonly expiresAt: string;
 }
 
@@ -337,6 +337,8 @@ export interface AgentChoiceOption {
 export interface AgentChoiceQuestion {
   /** Request-local opaque identifier; never the model-provided question ID. */
   readonly id: string;
+  /** Distinguishes an ordinary choice from a non-Git external action confirmation. */
+  readonly purpose?: "ordinary" | "external_action_confirmation";
   readonly header: string;
   readonly prompt: string;
   readonly options: readonly AgentChoiceOption[];
@@ -423,7 +425,10 @@ export type AgentEvent =
       readonly systemRejectionRecorded?: true;
     }
   | {
-      /** Ordinary, non-secret model question. This is not an approval request. */
+      /**
+       * Ordinary, non-secret model question or non-Git external action
+       * confirmation. It never grants workspace-git approval authority.
+       */
       readonly type: "choice.requested";
       readonly requestId: string;
       readonly expiresAt: string;
@@ -435,6 +440,37 @@ export type AgentEvent =
       /** The original ordinary-choice RPC ended before Slack supplied an answer. */
       readonly type: "choice.resolved_externally";
       readonly requestId: string;
+    }
+  | {
+      /** A Koe-local opt-in selected the first option of an ordinary question. */
+      readonly type: "choice.auto_selected";
+      readonly header: string;
+      readonly optionLabel: string;
+    }
+  | {
+      /** A private provider terminally executed the exact prepared Git plan. */
+      readonly type: "git_automation.executed";
+      readonly plan: WorkspaceGitApprovalPlan;
+    }
+  | {
+      /** Automation failed closed; no manual or public-execute fallback is safe. */
+      readonly type: "git_automation.blocked";
+      readonly plan: WorkspaceGitApprovalPlan;
+      readonly reason:
+        | "contract_mismatch"
+        | "policy_blocked"
+        | "provider_unavailable"
+        | "outcome_uncertain"
+        | "outcome_unknown"
+        | "activation_ambiguous"
+        | "activation_scope_mismatch"
+        | "activation_revision_mismatch"
+        | "activation_digest_mismatch"
+        | "activation_expired"
+        | "activation_security_revoked"
+        | "profile_scope_mismatch"
+        | "quota_exhausted"
+        | "gateway_fence_mismatch";
     }
   | {
       /**

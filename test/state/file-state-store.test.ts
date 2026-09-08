@@ -21,6 +21,38 @@ test("persists state with owner-only file permissions", async () => {
   const store = new FileStateStore(path);
   const state = {
     ...emptyRuntimeState(),
+    recentGatewayRestartReceipts: [{
+      keyHash: "d".repeat(64),
+      originInstanceId: "11111111-1111-4111-8111-111111111111",
+      expiresAt: "2099-08-31T00:10:00.000Z",
+    }],
+    permissionApprovalCards: [{
+      requestId: "permission:durable-card",
+      route: {
+        channelId: "C123",
+        rootThreadTs: "1786654845.402859",
+        messageTs: "1786654846.000100",
+        operation: "gateway.restart",
+      },
+      settlement: {
+        requestId: "permission:durable-card",
+        reason: "allow_once" as const,
+        resolvedBySlackUserId: "U123",
+      },
+    }],
+    workspaceGitAutonomyActivations: [{
+      koeId: "implementer",
+      profileId: "11111111-1111-4111-8111-111111111111",
+      profileRevision: 3,
+      activationHandle: "22222222-2222-4222-8222-222222222222",
+      expiresAt: "2099-08-31T01:10:00.000Z",
+      state: "enabled" as const,
+      updatedAt: "2099-08-31T00:10:00.000Z",
+    }],
+    workspaceGitAutonomyRevisionState: {
+      fingerprint: "a".repeat(64),
+      revision: 4,
+    },
     core: {
       ...emptyRuntimeState().core,
       agents: [{ id: "implementer", adapter: "codex", channelId: "C123" }],

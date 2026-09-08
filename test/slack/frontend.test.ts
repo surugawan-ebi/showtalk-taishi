@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   canSafelyRejectAfterPrivateGitDecisionFailure,
   cancelUnprojectedNativeApproval,
+  choiceReceiptText,
   closeFailedPrivateGitDecisionBeforeRecovery,
   consumeContinuationIterator,
   parseHumanSlackMessage,
+  parseOrphanedPermissionActionSource,
   parseTrustedApprovalAction,
   parseTrustedConversationControlAction,
   parseTrustedGitApprovalRecoveryAction,
@@ -19,15 +21,26 @@ import {
   recordGitDecisionBeforeAppServerResume,
   recordGitProjectionFailureBeforeAppServerResume,
   recordSystemGitRejection,
+  workspaceGitAutonomyStatus,
 } from "../../src/slack/frontend.js";
-import { WorkspaceGitDecisionBrokerError } from "../../src/approvals/workspace-git-decision-broker.js";
+import { WorkspaceGitHumanDecisionBrokerError } from "../../src/approvals/workspace-git-human-decision-broker.js";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
 const exactGitPlan = {
   operationId: "11111111-1111-4111-8111-111111111111",
   planHash: "a".repeat(64),
   approvalTarget: "primary",
-  approvalAuthorityId: "e".repeat(64),
+  approvalScope: {
+    kind: "git_publication",
+    repo_id: "showtalk-taishi",
+    mode: "commit_only",
+    branch: "codex/private-approval",
+    worktree_id: "primary",
+    expected_head: "b".repeat(40),
+    expected_snapshot_id: "c".repeat(64),
+    paths: ["src/slack/frontend.ts"],
+    commit_message: "Record private approval",
+  },
   operation: "git_publication",
   repoId: "showtalk-taishi",
   mode: "commit_only",
@@ -39,6 +52,51 @@ const exactGitPlan = {
   commitMessage: "Record private approval",
   expiresAt: "2099-08-24T02:30:00+09:00",
 } satisfies WorkspaceGitApprovalPlan;
+
+test("distinguishes non-Git external-action receipts from ordinary answers", () => {
+  assert.equal(
+    choiceReceiptText("U0123456789", "external_action_confirmation"),
+    "外部操作への回答を受け付けました（<@U0123456789>）。workspace-gitのGit操作は承認されていません。",
+  );
+  assert.equal(
+    choiceReceiptText("U0123456789", "external_action_confirmation", true),
+    "外部操作への回答を新しいターンとして受け付けました（<@U0123456789>）。workspace-gitのGit操作は承認されていません。",
+  );
+  assert.equal(
+    choiceReceiptText("U0123456789", "ordinary"),
+    "回答を受け付けました（<@U0123456789>）。",
+  );
+});
+
+test("keeps normal OFF available after an autonomy candidate is removed", () => {
+  const status = workspaceGitAutonomyStatus(
+    {
+      koeId: "implementer",
+      channelId: "C0123456789",
+      koeBindingRevision: 9,
+      principalPolicyRevision: 9,
+    },
+    {
+      koeId: "implementer",
+      profileId: "11111111-1111-4111-8111-111111111111",
+      profileRevision: 3,
+      activationHandle: "22222222-2222-4222-8222-222222222222",
+      expiresAt: "2099-08-31T01:10:00.000Z",
+      state: "enabled",
+      updatedAt: "2099-08-31T00:10:00.000Z",
+    },
+    true,
+    Date.parse("2099-08-31T00:20:00.000Z"),
+  );
+  assert.deepEqual(status, {
+    koeId: "implementer",
+    available: true,
+    state: "enabled",
+    profileId: "11111111-1111-4111-8111-111111111111",
+    profileRevision: 3,
+    expiresAt: "2099-08-31T01:10:00.000Z",
+  });
+});
 
 test("releases a continuation iterator when admission projection fails", async () => {
   let released = false;
@@ -99,17 +157,25 @@ test("records the exact private Git decision before resuming App Server", async 
   const order: string[] = [];
   await recordGitDecisionBeforeAppServerResume(
     {
+      contract_version: 1,
       recordDecision: async (input) => {
         order.push("broker");
         assert.equal(input.plan, exactGitPlan);
-      assert.equal(input.actor, "chat-user-via-showtalk");
-      assert.equal(input.decision, "approve");
-      assert.equal(input.deliveryId, "d".repeat(64));
+        assert.equal(input.decision, "approve");
+        assert.equal(input.deliveryId, "d".repeat(64));
+        assert.equal(input.context.callerId, "U0123456789");
       },
     },
     exactGitPlan,
     "approve",
     "d".repeat(64),
+    {
+      callerId: "U0123456789",
+      koeId: "taishi",
+      channelId: "C0123456789",
+      rootThreadTs: "1700000000.000001",
+      sessionId: "session-1",
+    },
     async () => {
       order.push("app-server");
     },
@@ -122,11 +188,19 @@ test("does not resume App Server when the private Git decision fails", async () 
   await assert.rejects(
     recordGitDecisionBeforeAppServerResume(
       {
+        contract_version: 1,
         recordDecision: async () => Promise.reject(new Error("private mismatch")),
       },
       exactGitPlan,
       "approve",
       "d".repeat(64),
+      {
+        callerId: "U0123456789",
+        koeId: "taishi",
+        channelId: "C0123456789",
+        rootThreadTs: "1700000000.000001",
+        sessionId: "session-1",
+      },
       async () => {
         resumed = true;
       },
@@ -193,7 +267,7 @@ test("keeps uncertain or conflicting private decisions pending for exact-deliver
   ] as const) {
     assert.equal(
       canSafelyRejectAfterPrivateGitDecisionFailure(
-        new WorkspaceGitDecisionBrokerError(code),
+        new WorkspaceGitHumanDecisionBrokerError(code),
       ),
       false,
     );
@@ -206,7 +280,7 @@ test("keeps uncertain or conflicting private decisions pending for exact-deliver
   ] as const) {
     assert.equal(
       canSafelyRejectAfterPrivateGitDecisionFailure(
-        new WorkspaceGitDecisionBrokerError(code),
+        new WorkspaceGitHumanDecisionBrokerError(code),
       ),
       true,
     );
@@ -334,6 +408,70 @@ test("accepts permission and control actions only from their exact Slack message
       controlAction,
       approvers,
     ),
+  );
+});
+
+test("recovers an orphaned permission card fail-closed without authorizing it", () => {
+  const channelId = "C0123456789";
+  const messageTs = "1786654846.000100";
+  const rootThreadTs = "1786654845.402859";
+  const action = {
+    action_id: "taishi.permission.allow_once",
+    value: JSON.stringify({
+      requestId: "permission:orphaned",
+      channelId,
+    }),
+  };
+  const body = {
+    type: "block_actions",
+    api_app_id: "A0123456789",
+    team: { id: "T0123456789" },
+    user: { id: "U0123456789" },
+    channel: { id: channelId },
+    message: { ts: messageTs, thread_ts: rootThreadTs },
+    container: {
+      type: "message",
+      channel_id: channelId,
+      message_ts: messageTs,
+    },
+  };
+
+  assert.deepEqual(
+    parseOrphanedPermissionActionSource(
+      body,
+      action,
+      new Set(["U0123456789"]),
+    ),
+    {
+      userId: "U0123456789",
+      channelId,
+      rootThreadTs,
+      messageTs,
+      teamId: "T0123456789",
+      apiAppId: "A0123456789",
+      requestId: "permission:orphaned",
+    },
+  );
+  assert.throws(() =>
+    parseOrphanedPermissionActionSource(
+      {
+        ...body,
+        container: { ...body.container, message_ts: "1786654846.999999" },
+      },
+      action,
+      new Set(["U0123456789"]),
+    ),
+  );
+  assert.equal(
+    parseOrphanedPermissionActionSource(
+      {
+        ...body,
+        message: { ts: messageTs },
+      },
+      action,
+      new Set(["U0123456789"]),
+    ).rootThreadTs,
+    messageTs,
   );
 });
 
@@ -605,12 +743,18 @@ test("parses a Git approval callback only from the bound Slack Block source", ()
       message_ts: routing.messageTs,
     },
   };
+  const actionToken = {
+    version: 1,
+    requestId: routing.requestId,
+    channelId: routing.channelId,
+    rootThreadTs: routing.rootThreadTs,
+  } as const;
   assert.deepEqual(
     parseTrustedGitPlanAction(
       body,
       {
         action_id: "taishi.git_plan.approve",
-        value: JSON.stringify(routing),
+        value: JSON.stringify(actionToken),
       },
       new Set(["U0123456789"]),
     ),
@@ -632,7 +776,7 @@ test("parses a Git approval callback only from the bound Slack Block source", ()
       { ...body, user: { id: "UATTACKER" } },
       {
         action_id: "taishi.git_plan.approve",
-        value: JSON.stringify(routing),
+        value: JSON.stringify(actionToken),
       },
       new Set(["U0123456789"]),
     ),

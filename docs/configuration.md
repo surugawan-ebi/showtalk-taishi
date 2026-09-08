@@ -203,9 +203,13 @@ capability.
 The UI edits existing Koe entries and never returns Slack tokens or adapter
 credentials. Environment-backed fields are displayed as `${NAME}`. Model and
 reasoning-effort choices are obtained from each Koe's live Codex App Server;
-they are not a hard-coded catalog. Those two changes apply to the Koe's next
+they are not a hard-coded catalog. Those two settings apply to the Koe's next
 turn without a Gateway restart. Process, Slack routing, workspace, identity,
 persona, role, and permission changes currently require **Gatewayを再起動**.
+
+The former `automatic_choice_mode` field is accepted only so existing
+configuration can still be loaded. The runtime ignores it and always uses
+manual choices and approvals.
 
 The UI never rewrites `config.yaml`. Its allowlisted Koe changes are stored in
 the owner-only
@@ -217,6 +221,17 @@ instead of silently choosing one. The sidecar is machine-managed; stop Taishi
 and remove it to return completely to the values in `config.yaml`.
 
 The listener is hard-bound to `127.0.0.1`; it has no LAN exposure setting.
+
+The built-in workspace-git flow is manual. Automation-provider and
+autonomy-control compositions are rejected by the production Gateway worker.
+The former per-Koe `workspace_git_autonomy` field is accepted only for
+backward-compatible configuration loading and never authorizes execution.
+The version-1 human-only broker remains a separate manual-approval transport;
+it does not enable autonomous execution. Set
+`SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE` to the absolute built
+`workspace-git-mcp/manual` entrypoint and `WORKSPACE_GIT_STATE_ROOT` to the
+private workspace-git state directory. No signing key, MAC key, private socket,
+profile, or automation setting is used by this path.
 
 ## Local files
 

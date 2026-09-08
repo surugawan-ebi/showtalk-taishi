@@ -72,6 +72,74 @@ export function normalizeCodexImageGenerationCompletion(
   }
 }
 
+/**
+ * Converts authoritative image content returned by a completed dynamic tool.
+ * Only inline data URLs are accepted; remote URLs and local paths are ignored
+ * so tool projection never becomes a file-read or network-fetch primitive.
+ */
+export function normalizeCodexDynamicToolImageCompletions(
+  item: Record<string, unknown>,
+): readonly (GeneratedImageEvent | GeneratedImageErrorEvent)[] {
+  if (
+    item.type !== "dynamicToolCall" ||
+    typeof item.id !== "string" ||
+    item.id.trim().length === 0 ||
+    !Array.isArray(item.contentItems)
+  ) {
+    return [];
+  }
+
+  const events: Array<GeneratedImageEvent | GeneratedImageErrorEvent> = [];
+  let acceptedImages = 0;
+  let acceptedBytes = 0;
+  for (const [index, value] of item.contentItems.entries()) {
+    if (value === null || typeof value !== "object") continue;
+    const content = value as Record<string, unknown>;
+    if (content.type !== "inputImage" || typeof content.imageUrl !== "string") {
+      continue;
+    }
+    if (!content.imageUrl.startsWith("data:image/")) continue;
+    if (acceptedImages >= MAX_CODEX_GENERATED_IMAGE_FILES) {
+      events.push(imageLimitExceeded());
+      break;
+    }
+
+    try {
+      const { bytes, declaredMimeType } = decodeImageResult(content.imageUrl);
+      const detected = detectImage(bytes);
+      if (
+        detected === undefined ||
+        declaredMimeType === undefined ||
+        normalizeMimeType(declaredMimeType) !== detected.mimeType
+      ) {
+        throw new Error("dynamic tool image MIME type does not match its bytes");
+      }
+      if (acceptedBytes + bytes.byteLength > MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES) {
+        events.push(imageLimitExceeded());
+        break;
+      }
+      const safeId = item.id.replace(/[^A-Za-z0-9_-]/gu, "-").slice(0, 56);
+      events.push({
+        type: "attachment.generated",
+        attachmentId: `${item.id}:image:${index}`,
+        attachment: {
+          kind: "image",
+          payload: new Blob([bytes], { type: detected.mimeType }),
+          name: `codex-tool-image-${safeId}-${index + 1}.${detected.extension}`,
+          mimeType: detected.mimeType,
+          title: "Codexツール画像",
+          altText: "Codexツールが返した画像",
+        },
+      });
+      acceptedImages += 1;
+      acceptedBytes += bytes.byteLength;
+    } catch {
+      events.push(rejectedImage());
+    }
+  }
+  return events;
+}
+
 function decodeImageResult(result: string): {
   readonly bytes: Uint8Array<ArrayBuffer>;
   readonly declaredMimeType?: string;
@@ -145,5 +213,13 @@ function rejectedImage(): GeneratedImageErrorEvent {
     type: "error",
     code: "CODEX_GENERATED_IMAGE_REJECTED",
     message: "生成画像をSlackへ転送できませんでした（形式またはサイズが不正です）。",
+  };
+}
+
+function imageLimitExceeded(): GeneratedImageErrorEvent {
+  return {
+    type: "error",
+    code: "CODEX_GENERATED_IMAGE_LIMIT_EXCEEDED",
+    message: "生成画像が1ターンのSlack転送上限を超えたため、一部を省略しました。",
   };
 }

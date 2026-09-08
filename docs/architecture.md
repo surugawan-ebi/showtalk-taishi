@@ -202,6 +202,40 @@ originating channel, thread, message, request, and Slack user, and can never
 approve or reconstruct a workspace-git plan. The short plan-binding grace is
 also applied before classification so a transport-ordering race cannot
 downgrade a malformed same-turn Git approval into an ordinary choice.
+The fixed Git labels require question ID `git_approval`. The sole non-Git use
+of those wire labels requires `external_action_approval`; Taishi replaces the
+Slack-facing labels, adds a non-Git warning to both the active and continuation
+cards, and returns the original wire label only to that App Server RPC. Any
+other ID using either reserved label is rejected instead of being projected as
+an ordinary choice.
+Ordinary workflow choices keep their task-specific labels and carry no external
+write authority. When one selects a non-Git external write, the model issues a
+separate fixed external-action confirmation. A malformed confirmation receives
+one same-turn, machine-readable repair response before Taishi exposes a bounded
+format error. Once that retry is exhausted, the turn cannot project a later
+external-action confirmation; the adapter never infers approval from option
+order or aliases.
+Multiple valid external-action confirmations may be presented sequentially in
+one turn. Only one may be pending at a time, and each answer authorizes only its
+own displayed Target, Scope, and Impact. A previous answer never becomes blanket
+authority for later writes.
+
+Store release writes no longer use an AppOps prepare/execute proof path.
+Codex presents a normal blocking `external_action_approval` for the exact
+repo-local fastlane command it intends to run. The confirmation must include the
+target app, platform, working directory, lane, version/build, track,
+metadata scope, and automatic-release setting. On approval, ShowTalk records the
+answer for that displayed command only. It does not mint Store-specific bearer
+proofs, rewrite Codex tool arguments, call Store MCP tools, or inspect Store
+credentials. Codex then runs only the approved fastlane command with the shared
+machine-local release env sourced in the shell.
+
+The Store approval record is not a reusable capability and never authorizes a
+different lane, app, version/build, track, metadata scope, or release mode.
+The external confirmation parser requires explicit `Target:`, `Scope:`, and
+`Impact:` lines and non-empty option descriptions, then renders a fixed non-Git
+header. Reserved labels still participate in the Git plan-binding grace so a
+late prepare completion cannot be downgraded by the external-action ID.
 
 The Gateway therefore owns the approval-record phase while the resumed Codex
 turn owns only status revalidation and the exact execute call. An isolated
@@ -271,6 +305,30 @@ persistent thread to use the same settings as Codex App and CLI. An operator
 can explicitly override any of those fields per adapter in `config.yaml`.
 Human-reviewed requests are projected into Slack; eligible requests handled by
 Codex auto-review do not require a duplicate Slack approval.
+
+Codex App Server 0.149 derives `request_user_input` blocking behavior from the
+turn collaboration-mode kind: Default requests are non-blocking and can resolve
+with an empty answer, while Plan requests block. ShowTalk therefore starts its
+Slack-owned turns with the blocking-capable mode kind and supplies explicit
+execution-oriented developer instructions instead of the built-in planning-only
+instructions. Normal inspection, editing, testing, and tool use remain enabled,
+while an authority-bearing structured request stays in the same turn until the
+bound Slack answer is returned. If App Server nevertheless marks a Git or
+external-action approval non-blocking, the adapter fails closed.
+
+In Codex 0.149 this internal mode marker also makes `update_plan` unavailable
+and suppresses automatic goal continuation, even with custom execution
+instructions. ShowTalk directs the model to keep progress in commentary and
+treats goal continuation as explicit-turn work. This is an upstream protocol
+tradeoff until blocking lifetime is decoupled from collaboration mode; it must
+not be worked around by accepting non-blocking approval answers.
+
+When a Koe observes `answers: {}`, it keeps the gated action blocked. If
+`showtalk` is an explicitly configured consultation target, the Koe sends only
+sanitized request context there for immediate classification and a bounded bug
+fix when the empty result was not expected. This escalation never carries
+credentials, private approval authority, or hidden plan state, and a later fix
+does not retroactively authorize the original action.
 
 For workspace-git publication/Draft PR and PR Ready/merge, the adapter also
 recognizes a single exact pending plan in the active turn and bridges the
@@ -402,6 +460,12 @@ Koe-global identities. A busy target rejects concurrent independent work. v0.1
 also permits only one active turn per Koe identity so Agent-scoped MCP
 authentication cannot make the originating conversation ambiguous.
 
+`gateway.restart` adds a narrower restart-spanning guard: after human approval,
+Taishi persists a TTL-bounded hash of the authenticated caller and exact host
+request ID. The next Worker may acknowledge that exact replay, but cannot use
+the receipt as approval for a different request. The supervisor callback is
+registered against the originating HTTP response's `finish` event.
+
 ### MCP server
 
 The Gateway also exposes MCP tools to connected Koe. The stable internal tool
@@ -421,8 +485,19 @@ attachments. Runtime resolution rejects symbolic-link path components, verifies
 the canonical file and parent identities around an open file descriptor,
 captures immutable bytes, and accepts only regular supported media files. Count,
 per-file, total, and process-wide concurrent byte limits apply. Slack upload
-remains subject to the caller's existing Slack write policy and any resulting
-human approval.
+remains subject to the caller's existing Slack write policy. The narrow
+exception is an attachment-only, routing-free `slack.reply` during the exact
+active originating Slack turn: an `approval` decision is treated as allowed
+because the user requested that artifact in the bound turn. An explicit
+`deny` remains fail-closed; replies that add a `message`, explicitly routed
+posts or replies, and `slack.post` keep their configured approval behavior.
+
+When both routing fields are omitted from `slack.reply`, the runtime derives
+the channel and root timestamp from the caller's process-local active Slack
+turn. It revalidates that exact turn immediately before posting. Separately,
+the Codex adapter converts validated inline `inputImage` content from completed
+dynamic tools into bounded output attachments; it never follows a tool-provided
+URL or reads a tool-provided local path.
 
 MCP is a Koe-facing control interface, not a shortcut around policy. Taishi
 binds a Streamable HTTP server to `127.0.0.1` on an ephemeral port. Each Koe
@@ -463,6 +538,8 @@ not offer or accept an "Allow session" grant.
 ```text
 Slack Restart control or Koe gateway.restart
   → require configured-human approval
+  → durably terminalize the permission card and record the exact replay receipt
+  → return the MCP result; schedule replacement only after HTTP response finish
   → pause new Slack and MCP work
   → wait for accepted MCP operations (including detached calls), active/queued Koe turns,
     and final Slack projection

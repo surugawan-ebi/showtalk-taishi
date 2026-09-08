@@ -75,6 +75,7 @@ test("accepts the root session cookie or Bearer token and schedules restart once
   const repository = memoryRepository();
   let restarts = 0;
   let appliedSnapshots = 0;
+  const autonomyCalls: Array<{ agentId: string; operation: "enable" | "disable" }> = [];
   const modelCalls: Array<{ agentId: string; refresh: boolean }> = [];
   const server = new LocalAdminServer({
     port: 0,
@@ -101,6 +102,18 @@ test("accepts the root session cookie or Bearer token and schedules restart once
             },
           ],
         };
+      },
+    },
+    workspaceGitAutonomy: {
+      list: () => [{
+        koeId: "leader",
+        available: true,
+        state: "disabled",
+        profileId: "11111111-1111-4111-8111-111111111111",
+        profileRevision: 2,
+      }],
+      request: async (agentId, operation) => {
+        autonomyCalls.push({ agentId, operation });
       },
     },
     onConfigSaved: () => {
@@ -149,6 +162,35 @@ test("accepts the root session cookie or Bearer token and schedules restart once
     });
     assert.equal(currentRead.status, 200);
     assert.deepEqual(await currentRead.json(), snapshot);
+
+    const autonomyStatus = await fetch(`${baseUrl}api/workspace-git-autonomy`, {
+      headers: { cookie },
+    });
+    assert.equal(autonomyStatus.status, 200);
+    assert.deepEqual(await autonomyStatus.json(), {
+      agents: [{
+        koeId: "leader",
+        available: true,
+        state: "disabled",
+        profileId: "11111111-1111-4111-8111-111111111111",
+        profileRevision: 2,
+      }],
+    });
+
+    const autonomyWithoutCsrf = await fetch(
+      `${baseUrl}api/agents/leader/workspace-git-autonomy/enable`,
+      { method: "POST", headers: { cookie } },
+    );
+    assert.equal(autonomyWithoutCsrf.status, 403);
+    const autonomyRequested = await fetch(
+      `${baseUrl}api/agents/leader/workspace-git-autonomy/enable`,
+      {
+        method: "POST",
+        headers: { cookie, "x-showtalk-csrf": csrfToken },
+      },
+    );
+    assert.equal(autonomyRequested.status, 202);
+    assert.deepEqual(autonomyCalls, [{ agentId: "leader", operation: "enable" }]);
 
     const models = await fetch(`${baseUrl}api/agents/leader/models`, {
       headers: { cookie },

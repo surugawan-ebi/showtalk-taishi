@@ -91,13 +91,10 @@ export function normalizeWorkspaceGitPrepareCompletion(
     output.approval_scope,
     "approval scope",
   );
-  const approvalAuthorityId = boundedString(
-    output.approval_authority_id,
-    64,
-    "approval authority ID",
-  );
-  if (!SHA256.test(approvalAuthorityId)) {
-    throw new Error("workspace-git returned an invalid approval authority ID");
+  if (Object.hasOwn(output, "approval_authority_id")) {
+    throw new Error(
+      "workspace-git exposed a private approval authority in its public result",
+    );
   }
   const argumentsRecord = requiredRecord(
     startedItem?.arguments ?? item.arguments,
@@ -117,6 +114,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       "expected_snapshot_id",
       "paths",
       "commit_message",
+      "environment",
       "ttl_minutes",
     ])) {
       throw new Error("workspace-git existing Pull Request update input is invalid");
@@ -272,15 +270,19 @@ export function normalizeWorkspaceGitPrepareCompletion(
     const relativePath = validatedPaths([
       boundedString(scope.relative_path, 1_024, "relative path"),
     ])[0]!;
+    const environment = optionalBoundedString(
+      argumentsRecord.environment,
+      64,
+    ) ?? "development";
     return {
       turnId,
       plan: bindApprovalScope({
         operationId,
         planHash,
         approvalTarget,
-        approvalAuthorityId,
         operation: "existing_pull_request_update",
         repoId,
+        environment,
         mode: "existing_pull_request_update",
         branch,
         paths,
@@ -364,7 +366,6 @@ export function normalizeWorkspaceGitPrepareCompletion(
         operationId,
         planHash,
         approvalTarget,
-        approvalAuthorityId,
         operation: "github_repository_settings",
         repoId,
         mode: "repository_settings",
@@ -383,6 +384,10 @@ export function normalizeWorkspaceGitPrepareCompletion(
       throw new Error("workspace-git returned an invalid publication scope");
     }
     const mode = modeValue;
+    const environment = optionalBoundedString(
+      argumentsRecord.environment,
+      64,
+    ) ?? "development";
     const branch = boundedString(scope.branch, 256, "branch");
     const worktreeId = boundedString(scope.worktree_id, 256, "worktree ID");
     const temporaryWorkspaceId = optionalBoundedString(
@@ -510,9 +515,9 @@ export function normalizeWorkspaceGitPrepareCompletion(
       operationId,
       planHash,
       approvalTarget,
-      approvalAuthorityId,
       operation: "git_publication" as const,
       repoId,
+      environment,
       expectedSnapshotId,
       expiresAt,
     };
@@ -724,7 +729,6 @@ export function normalizeWorkspaceGitPrepareCompletion(
       operationId,
       planHash,
       approvalTarget,
-      approvalAuthorityId,
       operation:
         action === "merge" ? "pull_request_merge" : "pull_request_ready",
       repoId,

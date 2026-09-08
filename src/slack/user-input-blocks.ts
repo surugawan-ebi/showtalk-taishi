@@ -19,6 +19,18 @@ export interface UserInputActionValue {
   readonly messageTs: string;
 }
 
+/**
+ * The action token is safe to render before Slack assigns the message
+ * timestamp. The callback binds it to the exact message timestamp supplied by
+ * Slack before looking up the process-local plan.
+ */
+export interface UserInputActionToken {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly channelId: string;
+  readonly rootThreadTs: string;
+}
+
 export type UserInputPathVisibility = "show" | "hide";
 export type UserInputBodyVisibility = "show" | "hide";
 
@@ -41,6 +53,8 @@ export interface WorkspaceGitApprovalDetails {
   readonly routing: UserInputActionValue;
   readonly expiresAt: number;
   readonly fallbackText: string;
+  /** Bound App Server session; required before a manual human decision is sent. */
+  readonly sessionId?: string;
   readonly sourceUserMention?: string;
   readonly display: WorkspaceGitApprovalDisplayState;
 }
@@ -132,7 +146,7 @@ export class WorkspaceGitApprovalDetailsStore {
 export function buildWorkspaceGitApprovalBlocks(
   prompt: string,
   plan: WorkspaceGitApprovalPlan,
-  value: UserInputActionValue,
+  value: UserInputActionValue | UserInputActionToken,
   options: WorkspaceGitApprovalBlockOptions = {},
 ): KnownBlock[] {
   const pathsExpanded = options.pathsExpanded ?? true;
@@ -199,7 +213,7 @@ export function buildWorkspaceGitApprovalBlocks(
   if (blocks.length > 48) {
     throw new Error("The exact Git plan is too large for Slack Block Kit");
   }
-  const encoded = JSON.stringify(value);
+  const encoded = JSON.stringify(actionToken(value));
   blocks.push({
     type: "actions",
     elements: [
@@ -346,6 +360,44 @@ export function parseUserInputActionValue(value: string): UserInputActionValue {
   };
 }
 
+/** Parses the message-independent token used by newly posted approval cards. */
+export function parseUserInputActionToken(value: string): UserInputActionToken {
+  if (value.length < 1 || value.length > 1_000) {
+    throw new Error("Invalid Git approval action payload");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("Invalid Git approval action payload");
+  }
+  const record = asRecord(parsed);
+  if (
+    record === undefined ||
+    record.version !== 1 ||
+    typeof record.requestId !== "string" ||
+    !/^codex-input:[0-9a-f-]{36}$/iu.test(record.requestId) ||
+    typeof record.channelId !== "string" ||
+    !/^C[A-Z0-9]{1,127}$/u.test(record.channelId) ||
+    typeof record.rootThreadTs !== "string" ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(record.rootThreadTs) ||
+    Object.keys(record).length !== 4 ||
+    countLiteralKey(value, "version") !== 1 ||
+    countLiteralKey(value, "requestId") !== 1 ||
+    countLiteralKey(value, "channelId") !== 1 ||
+    countLiteralKey(value, "rootThreadTs") !== 1 ||
+    countLiteralKey(value, "messageTs") !== 0
+  ) {
+    throw new Error("Invalid Git approval action payload");
+  }
+  return {
+    version: 1,
+    requestId: record.requestId,
+    channelId: record.channelId,
+    rootThreadTs: record.rootThreadTs,
+  };
+}
+
 function planFields(
   plan: WorkspaceGitApprovalPlan,
 ): Array<{ type: "mrkdwn"; text: string }> {
@@ -361,8 +413,13 @@ function planFields(
   const fields = [
     field("操作", operation),
     field("Repository", plan.repoId),
+    ...(plan.environment === undefined
+      ? []
+      : [field("Environment", plan.environment)]),
     field("Branch", plan.branch),
-    field("Mode", plan.mode),
+    ...(plan.operation === "existing_pull_request_update"
+      ? []
+      : [field("Mode", plan.mode)]),
     field("HEAD", plan.expectedHead ?? "unborn"),
     field(
       "Worktree",
@@ -401,7 +458,7 @@ function planFields(
 
 function pathSummaryBlock(
   pathCount: number,
-  routing: UserInputActionValue,
+  routing: UserInputActionValue | UserInputActionToken,
   options: {
     readonly pathsExpanded: boolean;
     readonly allowPathToggle: boolean;
@@ -430,14 +487,14 @@ function pathSummaryBlock(
         emoji: true,
       },
       action_id: `${USER_INPUT_PATH_ACTION_PREFIX}${visibility}`,
-      value: JSON.stringify(routing),
+      value: JSON.stringify(actionToken(routing)),
     },
   };
 }
 
 function bodySummaryBlock(
   body: string,
-  routing: UserInputActionValue,
+  routing: UserInputActionValue | UserInputActionToken,
   options: {
     readonly bodyExpanded: boolean;
     readonly allowBodyToggle: boolean;
@@ -464,7 +521,7 @@ function bodySummaryBlock(
         emoji: true,
       },
       action_id: `${USER_INPUT_BODY_ACTION_PREFIX}${visibility}`,
-      value: JSON.stringify(routing),
+      value: JSON.stringify(actionToken(routing)),
     },
   };
 }
@@ -645,4 +702,15 @@ function approvalDetailsKey(value: UserInputActionValue): string {
     value.rootThreadTs,
     value.messageTs,
   ].join("\u0000");
+}
+
+function actionToken(
+  value: UserInputActionValue | UserInputActionToken,
+): UserInputActionToken {
+  return {
+    version: 1,
+    requestId: value.requestId,
+    channelId: value.channelId,
+    rootThreadTs: value.rootThreadTs,
+  };
 }

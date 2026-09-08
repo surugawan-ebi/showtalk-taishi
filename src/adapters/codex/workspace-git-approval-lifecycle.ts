@@ -441,7 +441,6 @@ export function sameExactWorkspaceGitApprovalPlan(
   }
   const commonMatches = left.operationId === right.operationId &&
     left.planHash === right.planHash &&
-    left.approvalAuthorityId === right.approvalAuthorityId &&
     isDeepStrictEqual(left.approvalScope, right.approvalScope) &&
     left.approvalTarget === right.approvalTarget &&
     left.operation === right.operation &&
@@ -520,7 +519,6 @@ function sameExistingPullRequestUpdatePlan(
 ): boolean {
   return left.operationId === right.operationId &&
     left.planHash === right.planHash &&
-    left.approvalAuthorityId === right.approvalAuthorityId &&
     isDeepStrictEqual(left.approvalScope, right.approvalScope) &&
     left.approvalTarget === right.approvalTarget &&
     left.repoId === right.repoId &&

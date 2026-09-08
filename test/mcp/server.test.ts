@@ -29,11 +29,18 @@ function service(
     agentStatus: (_context, target) => ({ agent_id: target, status: "idle" }),
     agentSend: (_context, target) => ({ target, status: "completed" }),
     gatewayRestart: () => ({ status: "scheduled" }),
+    appOpsPreToolUse: () => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "No synthetic proof is pending",
+      },
+    }),
     slackPost: (_context, channel) => ({ channel, ts: "1710000000.000001" }),
     slackReply: (_context, channel, threadTs) => ({
-      channel,
+      channel: channel ?? "C01",
       ts: "1710000000.000002",
-      thread_ts: threadTs,
+      thread_ts: threadTs ?? "1710000000.000001",
     }),
   };
   return { ...base, ...overrides };
@@ -96,11 +103,15 @@ test("drains accepted MCP responses before becoming idle and rejects new HTTP wo
   const requestRelease = new Promise<void>((resolve) => {
     release = resolve;
   });
+  let responseFinishedEffects = 0;
   const boundary = await runningBoundary(
     t,
     service({
-      gatewayRestart: async () => {
+      gatewayRestart: async (context) => {
         entered();
+        context.deferUntilResponseFinished?.(() => {
+          responseFinishedEffects += 1;
+        });
         await requestRelease;
         return { status: "scheduled" };
       },
@@ -128,11 +139,64 @@ test("drains accepted MCP responses before becoming idle and rejects new HTTP wo
   });
   assert.equal(rejected.status, 503);
   assert.equal(becameIdle, false);
+  assert.equal(responseFinishedEffects, 0);
 
   release();
   assert.deepEqual((await accepted).structuredContent, { status: "scheduled" });
   await idle;
   assert.equal(boundary.isIdle(), true);
+  assert.equal(responseFinishedEffects, 1);
+});
+
+test("runs a deferred approved effect once when the response connection closes", async (t) => {
+  let entered!: () => void;
+  const requestEntered = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let release!: () => void;
+  const requestRelease = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let deferredEffects = 0;
+  const boundary = await runningBoundary(
+    t,
+    service({
+      gatewayRestart: async (context) => {
+        context.deferUntilResponseFinished?.(() => {
+          deferredEffects += 1;
+        });
+        entered();
+        await requestRelease;
+        return { status: "scheduled" };
+      },
+    }),
+  );
+  const credential = await boundary.provisionAgent("implementer");
+  const controller = new AbortController();
+  const pending = fetch(credential.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${credential.token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "gateway.restart", arguments: {} },
+    }),
+    signal: controller.signal,
+  });
+  const pendingRejection = assert.rejects(pending);
+  await requestEntered;
+  controller.abort();
+  await pendingRejection;
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deferredEffects, 1);
+  assert.equal(deferredEffects, 1);
 });
 
 test("rejects the wrong path, method, host origin, and bearer credential before MCP handling", async (t) => {
@@ -207,7 +271,7 @@ test("bounds and validates authenticated HTTP request bodies", async (t) => {
   assert.equal(oversized.status, 413);
 });
 
-test("serves stateless MCP with the six switchboard tools and explicit routing instructions", async (t) => {
+test("serves stateless MCP with the internal hook endpoint and public switchboard tools", async (t) => {
   const calls: Array<{ method: string; caller: string; values: readonly unknown[] }> = [];
   const implementation = service({
     agentList: (context) => {
@@ -250,7 +314,11 @@ test("serves stateless MCP with the six switchboard tools and explicit routing i
         caller: context.agentId,
         values: [channel, threadTs, message],
       });
-      return { channel, ts: "1710000000.000002", thread_ts: threadTs };
+      return {
+        channel: channel ?? "C01",
+        ts: "1710000000.000002",
+        thread_ts: threadTs ?? "1710000000.000009",
+      };
     },
   });
   const boundary = await runningBoundary(t, implementation);
@@ -266,6 +334,7 @@ test("serves stateless MCP with the six switchboard tools and explicit routing i
       "agent.send",
       "agent.status",
       "gateway.restart",
+      "internal.appops-pre-tool-use",
       "slack.post",
       "slack.reply",
     ],
@@ -297,7 +366,7 @@ test("serves stateless MCP with the six switchboard tools and explicit routing i
   );
   assert.match(
     tools.tools.find((tool) => tool.name === "slack.reply")?.description ?? "",
-    /workspace-relative image or audio/u,
+    /workspace-relative image or audio.*current originating Slack thread/u,
   );
   assert.match(
     tools.tools.find((tool) => tool.name === "gateway.restart")?.description ?? "",
@@ -341,6 +410,26 @@ test("serves stateless MCP with the six switchboard tools and explicit routing i
   });
   assert.equal(restarted.isError, undefined);
   assert.deepEqual(restarted.structuredContent, { status: "scheduled" });
+  const hookDenied = await client.callTool({
+    name: "internal.appops-pre-tool-use",
+    arguments: {
+      session_id: "thr_1",
+      turn_id: "turn_1",
+      tool_name: "mcp__appops__execute_approved_app_store_build_upload",
+      tool_use_id: "tool-use-1",
+      tool_input: {
+        app_id: "app07",
+        operation_id: "11111111-1111-4111-8111-111111111111",
+      },
+    },
+  });
+  assert.deepEqual(hookDenied.content, []);
+  const hookOutput = hookDenied.structuredContent as Record<string, unknown>;
+  assert.equal(
+    (hookOutput.hookSpecificOutput as Record<string, unknown>)
+      .permissionDecision,
+    "deny",
+  );
   await client.callTool({
     name: "slack.post",
     arguments: { channel: "C02", message: "Review started" },
@@ -353,6 +442,12 @@ test("serves stateless MCP with the six switchboard tools and explicit routing i
       message: "Review completed",
     },
   });
+  await client.callTool({
+    name: "slack.reply",
+    arguments: {
+      attachments: [{ path: "artifacts/current-screen.png" }],
+    },
+  });
 
   assert.deepEqual(
     calls.map(({ method, caller }) => ({ method, caller })),
@@ -363,8 +458,10 @@ test("serves stateless MCP with the six switchboard tools and explicit routing i
       { method: "gateway.restart", caller: "implementer" },
       { method: "slack.post", caller: "implementer" },
       { method: "slack.reply", caller: "implementer" },
+      { method: "slack.reply", caller: "implementer" },
     ],
   );
+  assert.deepEqual(calls.at(-1)?.values, [undefined, undefined, undefined]);
 });
 
 test("forwards multiple Slack attachments and supports attachment-only replies", async (t) => {
@@ -389,6 +486,8 @@ test("forwards multiple Slack attachments and supports attachment-only replies",
       },
       slackReply: (context, channel, threadTs, message, attachments) => {
         assert.equal(context.agentId, "implementer");
+        assert.ok(channel);
+        assert.ok(threadTs);
         calls.push({
           method: "slack.reply",
           channel,

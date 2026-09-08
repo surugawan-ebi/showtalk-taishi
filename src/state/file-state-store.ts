@@ -12,10 +12,29 @@ import {
 import { dirname } from "node:path";
 
 import type { CoreStateSnapshot } from "../core/index.js";
+import type { PersistedPermissionApprovalCard } from "../slack/permission-card-tracker.js";
+import type { PersistedWorkspaceGitAutonomyActivation } from "../approvals/workspace-git-autonomy-control.js";
+import {
+  validateGatewayRestartReceipt,
+  type RecentGatewayRestartReceipt,
+} from "./gateway-restart-replay-guard.js";
 
 export interface RuntimeState {
   version: 1;
   core: CoreStateSnapshot;
+  /** Bounded replay guard kept outside protocol-neutral core state. */
+  recentGatewayRestartReceipts?: readonly RecentGatewayRestartReceipt[];
+  /** Durable Slack terminal-update outbox kept outside protocol-neutral core state. */
+  permissionApprovalCards?: readonly PersistedPermissionApprovalCard[];
+  /** Opaque correlation handles for user-controlled autonomy disable actions. */
+  workspaceGitAutonomyActivations?: readonly PersistedWorkspaceGitAutonomyActivation[];
+  /** Monotonic generation preventing config-revision ABA from reviving authority. */
+  workspaceGitAutonomyRevisionState?: WorkspaceGitAutonomyRevisionState;
+}
+
+export interface WorkspaceGitAutonomyRevisionState {
+  readonly fingerprint: string;
+  readonly revision: number;
 }
 
 export function emptyRuntimeState(): RuntimeState {
@@ -32,6 +51,9 @@ export function emptyRuntimeState(): RuntimeState {
       handledSlackEvents: [],
       pendingWorkspaceGitSystemRejections: [],
     },
+    recentGatewayRestartReceipts: [],
+    permissionApprovalCards: [],
+    workspaceGitAutonomyActivations: [],
   };
 }
 
@@ -240,6 +262,7 @@ function validateRuntimeState(value: unknown): RuntimeState {
     throw new Error("Unsupported or corrupt ShowTalk Taishi runtime state");
   }
   const core = value.core as Record<string, unknown>;
+  const runtime = value as Record<string, unknown>;
   if (
     core.version !== 1 ||
     !Array.isArray(core.agents) ||
@@ -267,11 +290,166 @@ function validateRuntimeState(value: unknown): RuntimeState {
         core.pendingWorkspaceGitSystemRejections.length > 1_024 ||
         !core.pendingWorkspaceGitSystemRejections.every(
           isPendingWorkspaceGitSystemRejection,
-        )))
+        ))) ||
+    (runtime.recentGatewayRestartReceipts !== undefined &&
+      (!Array.isArray(runtime.recentGatewayRestartReceipts) ||
+        runtime.recentGatewayRestartReceipts.length > 32 ||
+        !runtime.recentGatewayRestartReceipts.every(isGatewayRestartReceipt))) ||
+    (runtime.permissionApprovalCards !== undefined &&
+      (!Array.isArray(runtime.permissionApprovalCards) ||
+        runtime.permissionApprovalCards.length > 128 ||
+        !runtime.permissionApprovalCards.every(isPersistedPermissionApprovalCard))) ||
+    (runtime.workspaceGitAutonomyActivations !== undefined &&
+      (!Array.isArray(runtime.workspaceGitAutonomyActivations) ||
+        runtime.workspaceGitAutonomyActivations.length > 256 ||
+        !runtime.workspaceGitAutonomyActivations.every(
+          isPersistedWorkspaceGitAutonomyActivation,
+        ) ||
+        new Set(
+          runtime.workspaceGitAutonomyActivations.map((activation) =>
+            (activation as PersistedWorkspaceGitAutonomyActivation).koeId
+          ),
+        ).size !== runtime.workspaceGitAutonomyActivations.length)) ||
+    (runtime.workspaceGitAutonomyRevisionState !== undefined &&
+      !isWorkspaceGitAutonomyRevisionState(
+        runtime.workspaceGitAutonomyRevisionState,
+      ))
   ) {
-    throw new Error("Unsupported or corrupt ShowTalk Taishi core state");
+    throw new Error("Unsupported or corrupt ShowTalk Taishi runtime state");
   }
   return value as RuntimeState;
+}
+
+function isWorkspaceGitAutonomyRevisionState(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    Object.keys(record).sort().join("\u0000") ===
+      ["fingerprint", "revision"].sort().join("\u0000") &&
+    typeof record.fingerprint === "string" &&
+    /^[a-f0-9]{64}$/u.test(record.fingerprint) &&
+    Number.isSafeInteger(record.revision) &&
+    Number(record.revision) >= 1
+  );
+}
+
+function isPersistedWorkspaceGitAutonomyActivation(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join("\u0000") !==
+      [
+        "activationHandle",
+        "expiresAt",
+        "koeId",
+        "profileId",
+        "profileRevision",
+        "state",
+        "updatedAt",
+      ].sort().join("\u0000")
+  ) {
+    return false;
+  }
+  return (
+    boundedStateString(record.koeId, 128) &&
+    typeof record.profileId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(record.profileId) &&
+    Number.isSafeInteger(record.profileRevision) &&
+    Number(record.profileRevision) >= 1 &&
+    typeof record.activationHandle === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(record.activationHandle) &&
+    boundedStateString(record.expiresAt, 64) &&
+    Number.isFinite(Date.parse(record.expiresAt as string)) &&
+    (record.state === "enabled" || record.state === "disabled") &&
+    boundedStateString(record.updatedAt, 64) &&
+    Number.isFinite(Date.parse(record.updatedAt as string))
+  );
+}
+
+function isGatewayRestartReceipt(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join("\u0000") !==
+    ["expiresAt", "keyHash", "originInstanceId"].sort().join("\u0000")
+  ) {
+    return false;
+  }
+  try {
+    validateGatewayRestartReceipt(record as unknown as RecentGatewayRestartReceipt);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isPersistedPermissionApprovalCard(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const route = record.route;
+  const settlement = record.settlement;
+  if (
+    Object.keys(record).some(
+      (key) => key !== "requestId" && key !== "route" && key !== "settlement",
+    ) ||
+    !boundedStateString(record.requestId, 256) ||
+    !record.requestId.startsWith("permission:") ||
+    route === null ||
+    typeof route !== "object" ||
+    Array.isArray(route)
+  ) {
+    return false;
+  }
+  const routeRecord = route as Record<string, unknown>;
+  if (
+    Object.keys(routeRecord).some(
+      (key) =>
+        key !== "channelId" &&
+        key !== "messageTs" &&
+        key !== "rootThreadTs" &&
+        key !== "operation",
+    ) ||
+    typeof routeRecord.channelId !== "string" ||
+    !/^[CGD][A-Z0-9]{1,127}$/u.test(routeRecord.channelId) ||
+    typeof routeRecord.messageTs !== "string" ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(routeRecord.messageTs) ||
+    (routeRecord.rootThreadTs !== undefined &&
+      (typeof routeRecord.rootThreadTs !== "string" ||
+        !/^\d{1,20}\.\d{1,20}$/u.test(routeRecord.rootThreadTs))) ||
+    !boundedStateString(routeRecord.operation, 256)
+  ) {
+    return false;
+  }
+  if (settlement === undefined) return true;
+  if (settlement === null || typeof settlement !== "object" || Array.isArray(settlement)) {
+    return false;
+  }
+  const settlementRecord = settlement as Record<string, unknown>;
+  return (
+    Object.keys(settlementRecord).every(
+      (key) =>
+        key === "requestId" || key === "reason" || key === "resolvedBySlackUserId",
+    ) &&
+    settlementRecord.requestId === record.requestId &&
+    (settlementRecord.reason === "allow_once" ||
+      settlementRecord.reason === "allow_session" ||
+      settlementRecord.reason === "deny" ||
+      settlementRecord.reason === "cancel" ||
+      settlementRecord.reason === "expired" ||
+      settlementRecord.reason === "caller_cancelled" ||
+      settlementRecord.reason === "coordinator_closed") &&
+    (settlementRecord.resolvedBySlackUserId === undefined ||
+      (typeof settlementRecord.resolvedBySlackUserId === "string" &&
+        /^[UW][A-Z0-9]{1,127}$/u.test(settlementRecord.resolvedBySlackUserId)))
+  );
 }
 
 function isPendingWorkspaceGitSystemRejection(value: unknown): boolean {

@@ -52,6 +52,11 @@ export class StructuredChoiceContinuationStore {
     this.#displayedByRequestId.delete(requestId);
   }
 
+  getDisplayed(requestId: string): StructuredChoiceDisplay | undefined {
+    this.#prune();
+    return this.#displayedByRequestId.get(requestId);
+  }
+
   resolveExternally(requestId: string): StructuredChoiceContinuation | undefined {
     this.#prune();
     const existingId = this.#continuationIdByRequestId.get(requestId);
@@ -59,6 +64,9 @@ export class StructuredChoiceContinuationStore {
     const display = this.#displayedByRequestId.get(requestId);
     if (display === undefined || display.expiresAt <= this.#now()) return undefined;
     this.#displayedByRequestId.delete(requestId);
+    if (display.question.purpose === "external_action_confirmation") {
+      return undefined;
+    }
     const continuation: StructuredChoiceContinuation = {
       ...display,
       continuationId: `choice-continuation:${randomUUID()}`,
@@ -130,6 +138,9 @@ export class StructuredChoiceContinuationStore {
 export function buildChoiceContinuationBlocks(
   continuation: StructuredChoiceContinuation,
 ): KnownBlock[] {
+  if (continuation.question.purpose === "external_action_confirmation") {
+    throw new Error("External action approval cannot continue as an ordinary turn");
+  }
   const body = [
     "*Codex側の元の質問は先に終了しました*",
     continuation.completedAnswers.length === 0

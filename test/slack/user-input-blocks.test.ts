@@ -7,6 +7,7 @@ import {
   buildExpiredWorkspaceGitApprovalBlocks,
   buildUnavailableWorkspaceGitApprovalBlocks,
   buildWorkspaceGitApprovalBlocks,
+  parseUserInputActionToken,
   parseUserInputActionValue,
   parseUserInputBodyVisibility,
   parseUserInputDecision,
@@ -85,7 +86,18 @@ test("renders an exact Git plan while keeping it out of the action value", () =>
   assert.equal(actions?.type, "actions");
   if (actions?.type !== "actions") return;
   const encoded = "value" in actions.elements[0]! ? actions.elements[0]!.value : undefined;
-  assert.equal(encoded, JSON.stringify(routing));
+  assert.equal(encoded, JSON.stringify({
+    version: 1,
+    requestId: routing.requestId,
+    channelId: routing.channelId,
+    rootThreadTs: routing.rootThreadTs,
+  }));
+  assert.deepEqual(parseUserInputActionToken(String(encoded)), {
+    version: 1,
+    requestId: routing.requestId,
+    channelId: routing.channelId,
+    rootThreadTs: routing.rootThreadTs,
+  });
   assert.doesNotMatch(String(encoded), /showtalk-taishi|planHash|operationId/u);
 });
 
@@ -297,7 +309,12 @@ test("renders an unborn initial publication without inventing a HEAD", () => {
   assert.equal(actions?.type, "actions");
   if (actions?.type !== "actions") return;
   const encoded = "value" in actions.elements[0]! ? actions.elements[0]!.value : undefined;
-  assert.equal(encoded, JSON.stringify(routing));
+  assert.equal(encoded, JSON.stringify({
+    version: 1,
+    requestId: routing.requestId,
+    channelId: routing.channelId,
+    rootThreadTs: routing.rootThreadTs,
+  }));
   assert.doesNotMatch(
     String(encoded),
     /empty-example-repo|initial_commit_and_push|planHash|operationId|unborn/u,
@@ -331,6 +348,29 @@ test("parses only the two fixed Git decision action IDs", () => {
 });
 
 test("rejects forged, replay-targeted, and ambiguous action payload shapes", () => {
+  assert.deepEqual(parseUserInputActionToken(JSON.stringify({
+    version: 1,
+    requestId: routing.requestId,
+    channelId: routing.channelId,
+    rootThreadTs: routing.rootThreadTs,
+  })), {
+    version: 1,
+    requestId: routing.requestId,
+    channelId: routing.channelId,
+    rootThreadTs: routing.rootThreadTs,
+  });
+  assert.throws(() =>
+    parseUserInputActionToken(JSON.stringify(routing)),
+  );
+  assert.throws(() =>
+    parseUserInputActionToken(JSON.stringify({
+      version: 1,
+      requestId: routing.requestId,
+      channelId: routing.channelId,
+      rootThreadTs: routing.rootThreadTs,
+      extra: "forged",
+    })),
+  );
   assert.deepEqual(parseUserInputActionValue(JSON.stringify(routing)), routing);
   assert.throws(() =>
     parseUserInputActionValue(

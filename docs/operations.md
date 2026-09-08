@@ -24,9 +24,57 @@ according to the adapter capability and policy.
 
 Git publication approvals are stricter. The Koe that called the matching
 workspace-git `prepare_*` operation must immediately issue structured choices
-named exactly `承認して実行` and `拒否・保留` in that same turn. Taishi binds one
+under question ID `git_approval`, named exactly `承認して実行` and `拒否・保留`,
+in that same turn. Taishi binds one
 immutable plan to the originating Koe, Slack channel, root thread, Block
 message, approver, expiry, operation ID, and full plan hash.
+
+The fixed labels are reserved. A non-Git external write that needs a human
+confirmation must instead use question ID `external_action_approval`. Slack
+renames its buttons and prominently states that the response does not approve
+workspace-git or change Git approval state. Any other question ID that uses a
+reserved label fails closed after the plan-binding grace period.
+
+Ordinary workflow decisions remain flexible and may use two or three
+task-specific choices. Selecting a choice does not itself authorize an external
+write; if the selected path needs one, Codex follows it with exactly one
+`external_action_approval` question whose wire options are, in order,
+`承認して実行` and `拒否・保留`. Target, scope, and impact belong in the question
+as three non-empty `Target:`, `Scope:`, and `Impact:` lines; both option
+descriptions are also required. Taishi replaces the model-provided header with
+an explicit non-Git confirmation header and never puts those details in renamed
+authority-bearing labels. The final confirmation must be blocking; a
+non-blocking request or `answers: {}` never authorizes the operation. On the first
+malformed external-action request in a turn, Taishi returns a bounded repair
+instruction to App Server without projecting an error to Slack. A corrected
+request may be retried once; a second malformed request is rejected visibly.
+After that bounded retry is exhausted, further external-action confirmations
+in the same turn are refused and cannot produce an approval answer.
+Requests that already carry a reserved approval label still wait through the
+short Git plan-binding grace, even with the external-action ID, so notification
+ordering cannot downgrade a late exact Git plan into a non-Git confirmation.
+
+A complex turn may request multiple external writes sequentially. Each write
+must receive a fresh blocking `external_action_approval` with its current
+Target, Scope, and Impact after the previous confirmation has resolved. Only one
+confirmation may be pending at once, and no approval carries forward as blanket
+authority for later writes.
+
+Store release operations no longer use an AppOps proof or MCP execute path.
+When Codex needs to run a repo-local fastlane lane for App Store Connect or
+Google Play, it must present a normal blocking `external_action_approval` with
+the exact target app, platform, working directory, command, version/build, track,
+metadata scope, and automatic-release setting. Taishi records only the approval
+answer for that displayed command; it does not mint Store-specific proofs,
+rewrite tool arguments, call Store MCP tools, or inspect Store credentials.
+After approval, Codex runs only the displayed fastlane command in the target app
+repository with the shared machine-local release env sourced by the shell.
+
+If `request_user_input` returns `answers: {}`, the gated action remains blocked.
+A Koe with `showtalk` in its consultations immediately sends sanitized context
+there to determine whether the empty result was expected for the request mode
+and to request a bounded diagnosis and fix when it was not. The consultation
+must omit credentials, private approval authority, and hidden plan state.
 
 The narrowly scoped `initial_commit_and_push` and `initial_push_existing`
 modes use the same binding. They are accepted only for the primary `main`
@@ -41,17 +89,13 @@ plan before requesting approval again.
 
 Selecting `承認して実行` first records the exact decision through the
 model-inaccessible workspace-git private broker, then resumes the original
-Codex request. Configure the LaunchAgent `.env` with the absolute built private
-module path and the same private state root used by workspace-git:
-
-```dotenv
-SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE=/absolute/path/to/local-mcp/servers/workspace-git/dist/src/approval/private-approval-broker.js
-WORKSPACE_GIT_STATE_ROOT=/absolute/private/state/workspace-git
-```
-
-Older installations that still set `SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI` are
-migrated by deriving the sibling private-module path; the CLI itself is never
-executed. Update the variable at the next convenient configuration change.
+Codex request. The standard OSS bootstrap optionally loads an operator-selected
+manual composition module from `SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE` inside
+an isolated worker. The module must be an absolute, same-owner, non-symlink,
+non-group/world-writable file implementing the version-1 human-only contract.
+ShowTalk has no compile-time local-mcp dependency and rejects any composition
+that exposes automation or control factories. Without that module, Git
+decisions fail closed instead of manufacturing authority.
 
 Each human decision also carries a delivery ID derived from the exact Slack
 channel, root thread, Block message, request, approver, decision, operation,
@@ -60,16 +104,15 @@ different message or request cannot replay a recorded approval. workspace-git
 recomputes the persisted plan hash while holding its state lock before it
 accepts the decision.
 
-Every prepare result also includes a bounded `approval_scope` and opaque
-`approval_authority_id`. The latter identifies the active private state without
-revealing its path or key. A Gateway connected to another state root, a replaced
-state, or an old card therefore fails before it can authorize a different plan.
-The private approval worker bounds each request and returns only safe error codes;
-local paths and state details do not cross into Slack logs. If the initial reply
-times out, it queries the same exact delivery through the private module. A
-confirmed durable decision continues normally. An inconclusive result keeps the
-App Server request and Slack card pending so pressing the same bound button can
-reconcile idempotently; it is not rewritten as a rejection.
+Every prepare result includes a bounded `approval_scope`; public
+`approval_authority_id` is rejected as a private-authority leak. ShowTalk sends
+only the exact public operation identifiers, decision delivery ID, and
+authenticated Slack caller, Koe, channel, root thread, and App Server session.
+It never sends scope, authority, signing material, profiles, or automation
+state. workspace-git re-reads the persisted operation, scope, and private
+authority before recording the decision. An inconclusive result keeps the App
+Server request and Slack card pending so the same bound button can reconcile
+idempotently; it is not rewritten as a rejection.
 
 The resumed turn must still use workspace-git's status and execute boundaries;
 ShowTalk does not directly perform the Git write from a Slack callback.
@@ -109,9 +152,31 @@ slack.reply(
 )
 ```
 
+During a Slack-originated turn, `slack.reply` may omit both `channel` and
+`thread_ts`. The Gateway then binds the upload to that exact active originating
+thread and rejects the call if the turn has ended or no Slack turn is active.
+Use this form when the Koe creates a screenshot or other workspace artifact for
+the user who requested it. That explicit request authorizes the bound,
+attachment-only upload; no separate attachment approval is required. Adding a
+`message`, specifying a destination, or using `slack.post` keeps the configured
+approval behavior. An explicit `deny` Slack policy still rejects the operation:
+
+```text
+slack.reply(
+  attachments=[
+    {path="artifacts/screenshots/result.png", alt_text="Requested screenshot"}
+  ]
+)
+```
+
 Paths are relative to the authenticated Koe's configured workspace. Absolute
 paths, URLs, traversal, workspace-external symlinks, unsupported formats, and
 oversized files are rejected.
+
+Inline images returned by App Server dynamic tools are also projected to the
+originating Slack thread. Only validated `data:image/...;base64,...` content is
+accepted; remote URLs and local paths from tool output are never fetched or
+read by this projection path.
 
 ## Koe-to-Koe visits
 
@@ -140,6 +205,14 @@ workspace sources, but not automatic memory from other Slack roots.
 approved restart pauses new work, drains accepted responses and active turns,
 flushes state, exits the Worker with a reserved restart code, and starts a fresh
 Worker using the latest local code.
+
+For `gateway.restart`, the permission card is terminalized before authorization
+is released, a bounded replay receipt is persisted, and the restart callback is
+deferred until the MCP HTTP response has finished. A replacement Worker that
+sees the same authenticated request receipt returns `scheduled` without another
+approval card or Worker replacement. Permission cards that could not be updated
+before replacement are replayed from the durable outbox and closed fail-safe at
+startup.
 
 On macOS, a per-user LaunchAgent can keep Taishi independent of the Codex App:
 

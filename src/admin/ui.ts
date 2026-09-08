@@ -1028,6 +1028,15 @@ export function renderAdminPage(csrfToken: string): string {
       transform: translateY(0);
     }
 
+    @media (min-width: 901px) {
+      .koe-panel {
+        max-height: calc(100vh - 40px);
+        max-height: calc(100dvh - 40px);
+        overflow-y: auto;
+        scrollbar-gutter: stable;
+      }
+    }
+
     @media (max-width: 900px) {
       .masthead-inner {
         align-items: flex-start;
@@ -1323,6 +1332,51 @@ export function renderAdminPage(csrfToken: string): string {
           </fieldset>
 
           <fieldset>
+            <legend>承認</legend>
+            <div class="field-grid">
+              <div class="field field-wide">
+                <p class="field-help">自動進行とWorkspace Git自動運転は停止しました。選択肢、Git操作、外部操作はmanualで確認します。</p>
+              </div>
+            </div>
+            <div hidden aria-hidden="true">
+            <div class="field-grid">
+              <div class="field field-wide">
+                <label>
+                  <input id="automaticChoiceMode" name="automaticChoiceMode" type="checkbox">
+                  通常の選択肢は一番上を自動で選ぶ
+                </label>
+                <p class="field-help">Koeが提示した通常の固定選択肢だけが対象です。Git承認、外部操作の最終確認、command/file承認は自動化せず、これまで通り人間へ確認します。選択結果はSlackに記録されます。</p>
+              </div>
+              <div class="field field-wide">
+                <label for="autonomyProfileId">Workspace Git自動運転 profile <span class="optional">任意</span></label>
+                <input id="autonomyProfileId" name="autonomyProfileId" type="text" spellcheck="false" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" placeholder="00000000-0000-4000-8000-000000000000">
+                <p class="field-help">local-mcpのユーザー所有private stateに作成済みのprofile IDです。ここでの保存は候補選択だけで、権限を有効化しません。</p>
+              </div>
+              <div class="field">
+                <label for="autonomyProfileRevision">Profile revision</label>
+                <input id="autonomyProfileRevision" name="autonomyProfileRevision" type="number" min="1" step="1" value="1">
+              </div>
+              <div class="field">
+                <label for="autonomyTtlMinutes">有効時間（分）</label>
+                <input id="autonomyTtlMinutes" name="autonomyTtlMinutes" type="number" min="1" max="1440" step="1" value="60">
+              </div>
+              <div class="field field-wide">
+                <label for="autonomyProfileLabel">表示ラベル <span class="optional">任意</span></label>
+                <input id="autonomyProfileLabel" name="autonomyProfileLabel" type="text" maxlength="80" placeholder="development commit / push / Draft PR">
+              </div>
+              <div class="field field-wide">
+                <p id="autonomyStatus" class="field-help" role="status">自動運転は未設定です。</p>
+                <div class="masthead-actions">
+                  <button class="button button-primary" id="enableAutonomyButton" type="button">SlackでONを確認</button>
+                  <button class="button button-danger" id="disableAutonomyButton" type="button">SlackでOFFを確認</button>
+                </div>
+                <p class="field-help">ON/OFFはKoeのSlackチャンネルへ独立した確認カードを送り、承認者の構造化操作で確定します。既存のGit承認2択や承認待ちplanは変更しません。</p>
+              </div>
+            </div>
+            </div>
+          </fieldset>
+
+          <fieldset>
             <legend>Slackでの立ち位置</legend>
             <div class="field-grid">
               <div class="field">
@@ -1424,7 +1478,8 @@ export function renderAdminPage(csrfToken: string): string {
         toastTimer: 0,
         modelCatalogs: Object.create(null),
         modelRequests: Object.create(null),
-        modelErrors: Object.create(null)
+        modelErrors: Object.create(null),
+        autonomyStatuses: Object.create(null)
       };
 
       var elements = {
@@ -1465,6 +1520,11 @@ export function renderAdminPage(csrfToken: string): string {
         adapterSessionId: document.getElementById("adapterSessionId"),
         model: document.getElementById("model"),
         reasoningEffort: document.getElementById("reasoningEffort"),
+        automaticChoiceMode: document.getElementById("automaticChoiceMode"),
+        autonomyProfileId: document.getElementById("autonomyProfileId"),
+        autonomyProfileRevision: document.getElementById("autonomyProfileRevision"),
+        autonomyTtlMinutes: document.getElementById("autonomyTtlMinutes"),
+        autonomyProfileLabel: document.getElementById("autonomyProfileLabel"),
         workspacePath: document.getElementById("workspacePath"),
         channelId: document.getElementById("channelId"),
         conversationScope: document.getElementById("conversationScope"),
@@ -1475,6 +1535,9 @@ export function renderAdminPage(csrfToken: string): string {
         iconEmoji: document.getElementById("iconEmoji"),
         role: document.getElementById("role")
       };
+      elements.autonomyStatus = document.getElementById("autonomyStatus");
+      elements.enableAutonomyButton = document.getElementById("enableAutonomyButton");
+      elements.disableAutonomyButton = document.getElementById("disableAutonomyButton");
 
       function requireString(value, label) {
         if (typeof value !== "string") {
@@ -1509,6 +1572,25 @@ export function renderAdminPage(csrfToken: string): string {
         return normalized;
       }
 
+      function normalizeAutonomyCandidate(value) {
+        if (value === undefined || value === null) {
+          return undefined;
+        }
+        if (typeof value !== "object" || Array.isArray(value)) {
+          throw new Error("workspace_git_autonomy の形式が正しくありません。");
+        }
+        if (!Number.isSafeInteger(value.profile_revision) || value.profile_revision < 1 ||
+            !Number.isSafeInteger(value.requested_ttl_minutes) || value.requested_ttl_minutes < 1 || value.requested_ttl_minutes > 1440) {
+          throw new Error("workspace_git_autonomy のrevisionまたは期限が正しくありません。");
+        }
+        return {
+          profile_id: requireString(value.profile_id, "workspace_git_autonomy.profile_id"),
+          profile_revision: value.profile_revision,
+          requested_ttl_minutes: value.requested_ttl_minutes,
+          label: optionalString(value.label, "workspace_git_autonomy.label")
+        };
+      }
+
       function normalizeAgent(raw, index) {
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
           throw new Error("agents[" + index + "] の形式が正しくありません。");
@@ -1529,6 +1611,12 @@ export function renderAdminPage(csrfToken: string): string {
           adapter_reasoning_effort: optionalString(raw.adapter_reasoning_effort, "adapter_reasoning_effort"),
           model: optionalString(raw.model, "model"),
           reasoning_effort: optionalString(raw.reasoning_effort, "reasoning_effort"),
+          automatic_choice_mode: raw.automatic_choice_mode === "ordinary_top_choice"
+            ? "ordinary_top_choice"
+            : raw.automatic_choice_mode === "off"
+              ? "off"
+              : (function () { throw new Error("automatic_choice_mode に未対応の値があります。"); })(),
+          workspace_git_autonomy: normalizeAutonomyCandidate(raw.workspace_git_autonomy),
           workspace_path: requireString(raw.workspace_path, "workspace_path"),
           slack: {
             channel_id: requireString(slack.channel_id, "slack.channel_id"),
@@ -1628,6 +1716,11 @@ export function renderAdminPage(csrfToken: string): string {
         elements.refreshModelsButton.disabled = state.busy || !selectedAgent() || Boolean(selectedAgent() && state.modelRequests[selectedAgent().id]);
         elements.reconnectButton.disabled = state.busy;
         elements.confirmRestartButton.disabled = state.busy;
+        var agent = selectedAgent();
+        var status = agent ? state.autonomyStatuses[agent.id] : undefined;
+        var hasCandidate = Boolean(agent && agent.workspace_git_autonomy);
+        elements.enableAutonomyButton.disabled = state.busy || state.dirty || !hasCandidate || Boolean(status && status.state === "enabled");
+        elements.disableAutonomyButton.disabled = state.busy || state.dirty || !status || (status.state !== "enabled" && status.state !== "expired");
       }
 
       function showAuthGate(message) {
@@ -2032,6 +2125,29 @@ export function renderAdminPage(csrfToken: string): string {
         });
       }
 
+      function renderAutonomy(agent) {
+        var candidate = agent.workspace_git_autonomy;
+        setFieldValue(fields.autonomyProfileId, candidate && candidate.profile_id);
+        setFieldValue(fields.autonomyProfileRevision, candidate ? String(candidate.profile_revision) : "1");
+        setFieldValue(fields.autonomyTtlMinutes, candidate ? String(candidate.requested_ttl_minutes) : "60");
+        setFieldValue(fields.autonomyProfileLabel, candidate && candidate.label);
+        var status = state.autonomyStatuses[agent.id];
+        if (status && status.state === "enabled") {
+          elements.autonomyStatus.textContent = "自動運転はONです（期限: " + new Date(status.expiresAt).toLocaleString() + "）。" + (!candidate ? " Profile候補は削除済みのため、OFFのみ実行できます。" : "");
+        } else if (status && status.state === "expired") {
+          elements.autonomyStatus.textContent = "前回のactivationは期限切れです。新しいSlack確認が必要です。";
+        } else if (!candidate) {
+          elements.autonomyStatus.textContent = "Profile候補は未設定です。既定はmanualです。";
+        } else if (!status || status.state === "disabled" || status.state === "unconfigured") {
+          elements.autonomyStatus.textContent = "自動運転はOFFです。保存後、Slack確認カードからONにできます。";
+        } else {
+          elements.autonomyStatus.textContent = "自動運転状態を確認できません。";
+        }
+        var enabled = status && status.state === "enabled";
+        elements.enableAutonomyButton.disabled = state.busy || state.dirty || !candidate || enabled;
+        elements.disableAutonomyButton.disabled = state.busy || state.dirty || !status || (status.state !== "enabled" && status.state !== "expired");
+      }
+
       function renderEditor() {
         var agent = selectedAgent();
         var hasAgent = Boolean(agent);
@@ -2045,6 +2161,8 @@ export function renderAdminPage(csrfToken: string): string {
           elements.modelCatalogStatus.textContent = "Koeを選択するとモデル一覧を取得します。";
           fields.model.disabled = true;
           fields.reasoningEffort.disabled = true;
+          elements.enableAutonomyButton.disabled = true;
+          elements.disableAutonomyButton.disabled = true;
           clearNode(elements.consultationList);
           syncActionState();
           return;
@@ -2072,6 +2190,8 @@ export function renderAdminPage(csrfToken: string): string {
           fields.iconEmoji.setAttribute("pattern", ":[a-z0-9][a-z0-9_+.-]*:");
         }
         setFieldValue(fields.role, agent.role);
+        fields.automaticChoiceMode.checked = agent.automatic_choice_mode === "ordinary_top_choice";
+        renderAutonomy(agent);
         syncAdapterSessionField();
         renderConsultations(agent);
         syncActionState();
@@ -2093,6 +2213,7 @@ export function renderAdminPage(csrfToken: string): string {
         state.dirty = true;
         elements.saveNote.textContent = "未保存の変更があります。";
         setConnection("dirty", "未保存の変更あり");
+        syncActionState();
       }
 
       function selectAgent(index) {
@@ -2203,6 +2324,8 @@ export function renderAdminPage(csrfToken: string): string {
             : undefined,
           model: optionalTrimmed(fields.model),
           reasoning_effort: optionalTrimmed(fields.reasoningEffort),
+          automatic_choice_mode: "off",
+          workspace_git_autonomy: undefined,
           workspace_path: fields.workspacePath.value.trim(),
           slack: {
             channel_id: fields.channelId.value.trim(),
@@ -2232,6 +2355,8 @@ export function renderAdminPage(csrfToken: string): string {
           adapter_session_id: agent.adapter_session_id,
           model: agent.model,
           reasoning_effort: agent.reasoning_effort,
+          automatic_choice_mode: agent.automatic_choice_mode,
+          workspace_git_autonomy: agent.workspace_git_autonomy,
           workspace_path: agent.workspace_path,
           slack: agent.slack,
           role: agent.role,
@@ -2256,6 +2381,8 @@ export function renderAdminPage(csrfToken: string): string {
           adapter_session_id: agent.adapter_session_id,
           model: agent.model,
           reasoning_effort: agent.reasoning_effort,
+          automatic_choice_mode: agent.automatic_choice_mode,
+          workspace_git_autonomy: agent.workspace_git_autonomy,
           workspace_path: agent.workspace_path,
           slack: agent.slack,
           role: agent.role,
@@ -2273,6 +2400,12 @@ export function renderAdminPage(csrfToken: string): string {
         }
         if (JSON.stringify(current.consultations) !== JSON.stringify(nextAgent.consultations)) {
           warnings.push("Koe間の相談許可を変更します。これはagent.sendの権限変更です。");
+        }
+        if (current.automatic_choice_mode !== nextAgent.automatic_choice_mode && nextAgent.automatic_choice_mode === "ordinary_top_choice") {
+          warnings.push("通常の固定選択肢では、Koeが一番上の案を人間の確認なしで選んで処理を続けます。保護された承認は対象外です。");
+        }
+        if (JSON.stringify(current.workspace_git_autonomy) !== JSON.stringify(nextAgent.workspace_git_autonomy)) {
+          warnings.push("Workspace Git自動運転のprofile候補を変更します。保存だけではONにならず、Slack上の独立確認が必要です。すでにONの場合は先にOFFしてください。");
         }
         return warnings.length === 0 || window.confirm(warnings.join("\n\n") + "\n\nこの内容で保存しますか？");
       }
@@ -2307,6 +2440,7 @@ export function renderAdminPage(csrfToken: string): string {
           await requireSuccessfulResponse(response);
           var selectedId = nextAgent.id;
           state.config = normalizeConfig(await response.json());
+          await loadAutonomyStatuses();
           state.selectedIndex = Math.max(0, state.config.agents.findIndex(function (agent) {
             return agent.id === selectedId;
           }));
@@ -2347,6 +2481,7 @@ export function renderAdminPage(csrfToken: string): string {
           });
           await requireSuccessfulResponse(response);
           var config = normalizeConfig(await response.json());
+          await loadAutonomyStatuses();
           state.config = config;
           state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, config.agents.length - 1));
           state.dirty = false;
@@ -2369,6 +2504,59 @@ export function renderAdminPage(csrfToken: string): string {
           showToast("設定を読み込めませんでした: " + (error instanceof Error ? error.message : String(error)), "error");
         } finally {
           setBusy(false);
+        }
+      }
+
+      async function loadAutonomyStatuses() {
+        var response = await fetch("/api/workspace-git-autonomy", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: apiHeaders()
+        });
+        await requireSuccessfulResponse(response);
+        var payload = await response.json();
+        if (!payload || !Array.isArray(payload.agents)) {
+          throw new Error("自動運転状態の形式が正しくありません。");
+        }
+        var next = Object.create(null);
+        payload.agents.forEach(function (entry) {
+          if (!entry || typeof entry !== "object") {
+            throw new Error("自動運転状態の形式が正しくありません。");
+          }
+          var koeId = requireString(entry.koeId, "autonomy.koeId");
+          if (["unconfigured", "disabled", "enabled", "expired"].indexOf(entry.state) < 0) {
+            throw new Error("自動運転状態に未対応の値があります。");
+          }
+          next[koeId] = entry;
+        });
+        state.autonomyStatuses = next;
+      }
+
+      async function requestAutonomyControl(operation) {
+        var agent = selectedAgent();
+        if (!agent || state.busy || state.dirty) {
+          if (state.dirty) showToast("先にprofile候補の変更を保存してください。", "error");
+          return;
+        }
+        setBusy(true);
+        try {
+          var response = await fetch(
+            "/api/agents/" + encodeURIComponent(agent.id) + "/workspace-git-autonomy/" + operation,
+            {
+              method: "POST",
+              credentials: "same-origin",
+              headers: apiHeaders({ "x-showtalk-csrf": csrfToken })
+            }
+          );
+          await requireSuccessfulResponse(response);
+          showToast("KoeのSlackチャンネルへ確認カードを送りました。", "success");
+        } catch (error) {
+          if (isAuthenticationError(error)) showAuthGate(error.message);
+          showToast("自動運転の確認を開始できませんでした: " + (error instanceof Error ? error.message : String(error)), "error");
+        } finally {
+          setBusy(false);
+          renderEditor();
         }
       }
 
@@ -2481,6 +2669,12 @@ export function renderAdminPage(csrfToken: string): string {
         if (agent) {
           void loadModelCatalog(agent.id, true);
         }
+      });
+      elements.enableAutonomyButton.addEventListener("click", function () {
+        void requestAutonomyControl("enable");
+      });
+      elements.disableAutonomyButton.addEventListener("click", function () {
+        void requestAutonomyControl("disable");
       });
       elements.reloadButton.addEventListener("click", function () { loadConfig(true); });
       elements.restartButton.addEventListener("click", openRestartConfirmation);

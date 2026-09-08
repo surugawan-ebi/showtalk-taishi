@@ -19,6 +19,12 @@ import {
 import { RuntimeMcpService, McpServiceError } from "../../src/mcp/index.js";
 import { PermissionApprovalCoordinator } from "../../src/permissions/approval-coordinator.js";
 import { PermissionEngine } from "../../src/permissions/engine.js";
+import {
+  GatewayRestartReplayGuard,
+  type RecentGatewayRestartReceipt,
+} from "../../src/state/gateway-restart-replay-guard.js";
+import { AppOpsApprovalProofBroker } from
+  "../../src/approvals/appops-approval-proof.js";
 
 class FakeAdapter implements AgentAdapter {
   readonly kind = "fake";
@@ -183,6 +189,7 @@ function setup(
   options: {
     projectionFails?: boolean;
     projectionFailsOnceOn?: string;
+    ownChannelWrite?: "allow" | "deny" | "approval";
     agentChannelWrite?: "allow" | "deny" | "approval";
     workspacePath?: string;
     onRestartRequested?: () => void;
@@ -191,6 +198,13 @@ function setup(
     implementerConversationScope?: "channel" | "slack_thread";
     reviewerConversationScope?: "channel" | "slack_thread";
     abortOnStartedProjection?: AbortController;
+    gatewayRestartReplayGuard?: {
+      has(keyHash: string): boolean;
+      record(keyHash: string, originInstanceId: string): Promise<void>;
+      consume(keyHash: string): Promise<boolean>;
+    };
+    runtimeInstanceId?: string;
+    appOpsApprovalProofBroker?: AppOpsApprovalProofBroker;
   } = {},
 ) {
   const registry = new InMemoryAgentRegistry();
@@ -230,7 +244,7 @@ function setup(
       defaults: {
         agents: { send: "allow" },
         slack: {
-          own_channel: { write: "allow" },
+          own_channel: { write: options.ownChannelWrite ?? "allow" },
           agent_channels: { write: options.agentChannelWrite ?? "allow" },
           other_channels: { write: "deny" },
         },
@@ -258,6 +272,17 @@ function setup(
       restartRequests.push("requested");
       options.onRestartRequested?.();
     },
+    ...(options.gatewayRestartReplayGuard === undefined
+      ? {}
+      : {
+          gatewayRestartReplayGuard: options.gatewayRestartReplayGuard,
+          runtimeInstanceId:
+            options.runtimeInstanceId ??
+            "11111111-1111-4111-8111-111111111111",
+        }),
+    ...(options.appOpsApprovalProofBroker === undefined
+      ? {}
+      : { appOpsApprovalProofBroker: options.appOpsApprovalProofBroker }),
   });
   const posts: unknown[][] = [];
   const projected: unknown[] = [];
@@ -322,6 +347,50 @@ function context(agentId = "implementer", requestId?: string) {
     requestId: requestId ?? `test:${++requestSequence}`,
   } as const;
 }
+
+test("deduplicates one AppOps tool-use hook and blocks a new replay", () => {
+  const broker = new AppOpsApprovalProofBroker();
+  const operationId = "11111111-1111-4111-8111-111111111111";
+  broker.register({
+    agentId: "implementer",
+    sessionId: "thr_1",
+    turnId: "turn_1",
+    plan: {
+      operationId,
+      planHash: "a".repeat(64),
+      appId: "app07",
+      approvalScope: "build_upload",
+      executeTool: "execute_approved_app_store_build_upload",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    },
+    proof: "opaque-hook-proof",
+  });
+  const { service } = setup({ appOpsApprovalProofBroker: broker });
+  const input = {
+    session_id: "thr_1",
+    turn_id: "turn_1",
+    tool_name: "mcp__appops__execute_approved_app_store_build_upload",
+    tool_use_id: "tool-use-1",
+    tool_input: { app_id: "app07", operation_id: operationId },
+  };
+
+  const allowed = service.appOpsPreToolUse(context(), input);
+  assert.equal(
+    allowed.hookSpecificOutput.permissionDecision,
+    "allow",
+  );
+  const duplicateHook = service.appOpsPreToolUse(context(), input);
+  assert.equal(
+    duplicateHook.hookSpecificOutput.permissionDecision,
+    "allow",
+  );
+  const replay = service.appOpsPreToolUse(context(), {
+    ...input,
+    tool_use_id: "tool-use-2",
+  });
+  assert.equal(replay.hookSpecificOutput.permissionDecision, "deny");
+  assert.doesNotMatch(JSON.stringify(replay), /opaque-hook-proof/u);
+});
 
 test("routes agent.send directly and returns the final Agent response", async (t) => {
   const { service, registry, projected, continuations } = setup();
@@ -740,7 +809,7 @@ test("waits for a human decision when Slack policy requires approval", async () 
   const posting = service.slackPost(context(), "reviewer", "Approved message");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(posts.length, 0);
-  approvals.resolve(requestId ?? "", "allow_once");
+  await approvals.resolve(requestId ?? "", "allow_once");
   assert.equal((await posting).channel, "C2");
   assert.equal(posts.length, 1);
 });
@@ -769,7 +838,7 @@ test("does not post after an approval-backed MCP request is cancelled", async ()
       error instanceof McpServiceError && error.code === "REQUEST_CANCELLED",
   );
   assert.equal(posts.length, 0);
-  assert.throws(() => approvals.resolve(requestId ?? "", "allow_once"));
+  await assert.rejects(approvals.resolve(requestId ?? "", "allow_once"));
 });
 
 test("authorizes gateway.restart before scheduling it with the authenticated caller", async () => {
@@ -812,7 +881,7 @@ test("authorizes gateway.restart before scheduling it with the authenticated cal
     },
   );
   assert.equal(restartRequests.length, 0);
-  approvals.resolve(presented?.requestId ?? "", "allow_once");
+  await approvals.resolve(presented?.requestId ?? "", "allow_once");
 
   assert.deepEqual(await restarting, { status: "scheduled" });
   assert.equal(restartRequests.length, 1);
@@ -832,7 +901,7 @@ test("does not schedule gateway.restart after deny, cancel, or abort", async () 
     });
     const restarting = service.gatewayRestart(context());
     await new Promise((resolve) => setImmediate(resolve));
-    approvals.resolve(requestId ?? "", decision);
+    await approvals.resolve(requestId ?? "", decision);
     await assert.rejects(
       () => restarting,
       (error) =>
@@ -860,7 +929,7 @@ test("does not schedule gateway.restart after deny, cancel, or abort", async () 
       error instanceof McpServiceError && error.code === "REQUEST_CANCELLED",
   );
   assert.equal(restartRequests.length, 0);
-  assert.throws(() => approvals.resolve(requestId ?? "", "allow_once"));
+  await assert.rejects(approvals.resolve(requestId ?? "", "allow_once"));
 });
 
 test("deduplicates gateway.restart retries and scopes approval grants to the caller", async () => {
@@ -883,7 +952,7 @@ test("deduplicates gateway.restart retries and scopes approval grants to the cal
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(presentations.length, 1);
   assert.equal(presentations[0]?.allowSessionGrant, false);
-  approvals.resolve(presentations[0]?.requestId ?? "", "allow_once");
+  await approvals.resolve(presentations[0]?.requestId ?? "", "allow_once");
   assert.deepEqual(await first, { status: "scheduled" });
   assert.deepEqual(await retried, { status: "scheduled" });
   assert.deepEqual(await service.gatewayRestart(sameRequest), {
@@ -897,7 +966,7 @@ test("deduplicates gateway.restart retries and scopes approval grants to the cal
   );
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(presentations.length, 2);
-  approvals.resolve(presentations[1]?.requestId ?? "", "allow_once");
+  await approvals.resolve(presentations[1]?.requestId ?? "", "allow_once");
   assert.deepEqual(await nextRequest, { status: "scheduled" });
   assert.equal(restartRequests.length, 1);
 
@@ -907,13 +976,116 @@ test("deduplicates gateway.restart retries and scopes approval grants to the cal
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(presentations.length, 3);
   assert.equal(presentations[2]?.sourceAgentId, "reviewer");
-  approvals.resolve(presentations[2]?.requestId ?? "", "deny");
+  await approvals.resolve(presentations[2]?.requestId ?? "", "deny");
   await assert.rejects(
     () => otherCaller,
     (error) =>
       error instanceof McpServiceError && error.code === "PERMISSION_DENIED",
   );
   assert.equal(restartRequests.length, 1);
+});
+
+test("waits for permission settlement and the exact HTTP response before restarting", async () => {
+  const { service, approvals, restartRequests } = setup();
+  let requestId: string | undefined;
+  approvals.setPresenter(async (request) => {
+    requestId = request.requestId;
+  });
+  let releaseSettlement!: () => void;
+  const settlementBlocked = new Promise<void>((resolve) => {
+    releaseSettlement = resolve;
+  });
+  approvals.setSettlementPresenter(async () => settlementBlocked);
+  const deferredEffects: Array<() => void> = [];
+  const restarting = service.gatewayRestart({
+    ...context("implementer", "gateway.restart:number:response-barrier"),
+    deferUntilResponseFinished: (effect) => deferredEffects.push(effect),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const resolving = approvals.resolve(requestId ?? "", "allow_once");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(restartRequests.length, 0);
+  assert.equal(deferredEffects.length, 0);
+
+  releaseSettlement();
+  await resolving;
+  assert.deepEqual(await restarting, { status: "scheduled" });
+  assert.equal(restartRequests.length, 0);
+  assert.equal(deferredEffects.length, 1);
+  deferredEffects[0]?.();
+  assert.equal(restartRequests.length, 1);
+});
+
+test("deduplicates an approved gateway.restart retry in a replacement worker", async () => {
+  let persistedReceipts: readonly RecentGatewayRestartReceipt[] = [];
+  const replayGuard = new GatewayRestartReplayGuard({
+    persist: async (receipts) => {
+      persistedReceipts = structuredClone(receipts);
+    },
+  });
+  const request = context(
+    "implementer",
+    "gateway.restart:number:replacement-retry",
+  );
+  const first = setup({ gatewayRestartReplayGuard: replayGuard });
+  let firstRequestId: string | undefined;
+  first.approvals.setPresenter(async (approval) => {
+    firstRequestId = approval.requestId;
+  });
+  const accepted = first.service.gatewayRestart(request);
+  await new Promise((resolve) => setImmediate(resolve));
+  await first.approvals.resolve(firstRequestId ?? "", "allow_once");
+  assert.deepEqual(await accepted, { status: "scheduled" });
+  assert.equal(first.restartRequests.length, 1);
+  assert.equal(persistedReceipts.length, 1);
+
+  const replacementReplayGuard = new GatewayRestartReplayGuard({
+    initialReceipts: persistedReceipts,
+    persist: async (receipts) => {
+      persistedReceipts = structuredClone(receipts);
+    },
+  });
+
+  const replacement = setup({
+    gatewayRestartReplayGuard: replacementReplayGuard,
+    runtimeInstanceId: "22222222-2222-4222-8222-222222222222",
+  });
+  let replacementPresentations = 0;
+  replacement.approvals.setPresenter(async () => {
+    replacementPresentations += 1;
+  });
+  assert.deepEqual(await replacement.service.gatewayRestart(request), {
+    status: "scheduled",
+  });
+  assert.equal(replacementPresentations, 0);
+  assert.equal(replacement.restartRequests.length, 0);
+  assert.deepEqual(persistedReceipts, []);
+});
+
+test("does not restart when the durable restart receipt cannot be saved", async () => {
+  const { service, approvals, restartRequests } = setup({
+    gatewayRestartReplayGuard: {
+      has: () => false,
+      record: async () => Promise.reject(new Error("state unavailable")),
+      consume: async () => false,
+    },
+  });
+  let requestId: string | undefined;
+  approvals.setPresenter(async (approval) => {
+    requestId = approval.requestId;
+  });
+  const restarting = service.gatewayRestart(
+    context("implementer", "gateway.restart:number:persist-failure"),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  await approvals.resolve(requestId ?? "", "allow_once");
+  await assert.rejects(
+    restarting,
+    (error) =>
+      error instanceof McpServiceError && error.code === "SERVICE_UNAVAILABLE",
+  );
+  assert.equal(restartRequests.length, 0);
 });
 
 test("deduplicates canonical-ID and call-name retries by host request identity", async () => {
@@ -973,6 +1145,168 @@ test("deduplicates slack.reply retries from a call name to its channel ID", asyn
     thread_ts: "1710000000.000010",
   });
   assert.deepEqual(posts, [["C2", "1710000000.000010", "Reply once"]]);
+});
+
+test("binds a routing-free slack.reply to the caller's active originating thread", async () => {
+  const { service, registry, posts } = setup();
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "running",
+    createdAt: "2026-08-31T10:00:00.000Z",
+    updatedAt: "2026-08-31T10:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+  const release = registry.reserveAgentTurn("implementer");
+  registry.beginSessionTurn("source-session", {
+    type: "slack",
+    channelId: "C1",
+    rootThreadTs: "1710000000.000020",
+    messageTs: "1710000000.000021",
+    startedAt: "2026-08-31T10:00:01.000Z",
+  }, "2026-08-31T10:00:01.000Z");
+
+  try {
+    const result = await service.slackReply(
+      context("implementer", "slack.reply:current-thread:1"),
+      undefined,
+      undefined,
+      "Current-thread screenshot",
+    );
+    assert.deepEqual(result, {
+      channel: "C1",
+      ts: "1710000000.000002",
+      thread_ts: "1710000000.000020",
+    });
+    assert.deepEqual(posts, [[
+      "C1",
+      "1710000000.000020",
+      "Current-thread screenshot",
+    ]]);
+  } finally {
+    release();
+  }
+});
+
+test("does not require approval for an attachment reply bound to the active originating thread", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "taishi-mcp-bound-media-"));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  await writeFile(
+    join(workspace, "screenshot.png"),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  );
+  const { service, registry, posts, approvals } = setup({
+    workspacePath: workspace,
+    ownChannelWrite: "approval",
+  });
+  let presentations = 0;
+  approvals.setPresenter(async () => {
+    presentations += 1;
+  });
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "running",
+    createdAt: "2026-09-05T10:00:00.000Z",
+    updatedAt: "2026-09-05T10:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+  const release = registry.reserveAgentTurn("implementer");
+  t.after(release);
+  registry.beginSessionTurn("source-session", {
+    type: "slack",
+    channelId: "C1",
+    rootThreadTs: "1710000000.000030",
+    messageTs: "1710000000.000031",
+    startedAt: "2026-09-05T10:00:01.000Z",
+  }, "2026-09-05T10:00:01.000Z");
+
+  const result = await service.slackReply(
+    context("implementer", "slack.reply:bound-attachment:1"),
+    undefined,
+    undefined,
+    undefined,
+    [{ path: "screenshot.png", alt_text: "Requested screenshot" }],
+  );
+
+  assert.equal(presentations, 0);
+  assert.deepEqual(result, {
+    channel: "C1",
+    ts: "1710000000.000002",
+    thread_ts: "1710000000.000030",
+  });
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0]?.[0], "C1");
+  assert.equal(posts[0]?.[1], "1710000000.000030");
+  assert.equal(posts[0]?.[2], undefined);
+  assert.equal(
+    (posts[0]?.[3] as Array<{ name: string }>)[0]?.name,
+    "screenshot.png",
+  );
+});
+
+test("keeps approval for a message-and-attachment reply bound to the active originating thread", async (t) => {
+  const { service, registry, posts, approvals } = setup({
+    ownChannelWrite: "approval",
+  });
+  let requestId: string | undefined;
+  approvals.setPresenter(async (request) => {
+    requestId = request.requestId;
+  });
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "running",
+    createdAt: "2026-09-05T10:00:00.000Z",
+    updatedAt: "2026-09-05T10:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+  const release = registry.reserveAgentTurn("implementer");
+  t.after(release);
+  registry.beginSessionTurn("source-session", {
+    type: "slack",
+    channelId: "C1",
+    rootThreadTs: "1710000000.000040",
+    messageTs: "1710000000.000041",
+    startedAt: "2026-09-05T10:00:01.000Z",
+  }, "2026-09-05T10:00:01.000Z");
+
+  const replying = service.slackReply(
+    context("implementer", "slack.reply:bound-text:1"),
+    undefined,
+    undefined,
+    "Text still follows policy",
+    [{ path: "not-read-before-denial.png" }],
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 0);
+  await approvals.resolve(requestId ?? "", "deny");
+  await assert.rejects(
+    replying,
+    (error) =>
+      error instanceof McpServiceError && error.code === "PERMISSION_DENIED",
+  );
+  assert.equal(posts.length, 0);
+});
+
+test("rejects a routing-free slack.reply without an active originating thread", async () => {
+  const { service } = setup();
+  await assert.rejects(
+    service.slackReply(
+      context("implementer", "slack.reply:no-current-thread:1"),
+      undefined,
+      undefined,
+      "No target",
+    ),
+    (error) =>
+      error instanceof McpServiceError && error.code === "NO_ACTIVE_SLACK_TURN",
+  );
 });
 
 test("does not confuse reused client request IDs with different agent.send calls", async () => {
@@ -1148,7 +1482,7 @@ test("rejects new MCP methods while draining without aborting an active request"
       error instanceof McpServiceError && error.code === "SERVICE_UNAVAILABLE",
   );
 
-  approvals.resolve(requestId ?? "", "allow_once");
+  await approvals.resolve(requestId ?? "", "allow_once");
   assert.deepEqual(await active, {
     channel: "C2",
     ts: "1710000000.000001",

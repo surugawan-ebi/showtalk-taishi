@@ -122,6 +122,15 @@ export const threadTsSchema = z
 
 export const agentListInputSchema = z.object({}).strict().default({});
 export const gatewayRestartInputSchema = z.object({}).strict().default({});
+export const appOpsPreToolUseInputSchema = z
+  .object({
+    session_id: sessionIdSchema,
+    turn_id: boundedIdentifier("Turn ID", 256),
+    tool_name: boundedIdentifier("Hook tool name", 256),
+    tool_use_id: boundedIdentifier("Hook tool-use ID", 256),
+    tool_input: z.record(z.string(), z.unknown()),
+  })
+  .strict();
 export const agentStatusInputSchema = z
   .object({
     target: koeTargetSchema.describe(
@@ -151,14 +160,22 @@ export const slackPostInputSchema = z
   });
 export const slackReplyInputSchema = z
   .object({
-    channel: channelSchema.describe("Slack channel ID or service-supported channel alias"),
-    thread_ts: threadTsSchema.describe("Root Slack thread timestamp"),
+    channel: channelSchema
+      .describe("Slack channel ID or service-supported channel alias; omit with thread_ts to use the current originating Slack thread")
+      .optional(),
+    thread_ts: threadTsSchema
+      .describe("Root Slack thread timestamp; omit with channel to use the current originating Slack thread")
+      .optional(),
     message: messageSchema.describe("Optional reply to post in the thread").optional(),
     attachments: slackAttachmentsSchema
       .describe("Workspace-relative image or audio files to upload")
       .optional(),
   })
   .strict()
+  .refine(
+    (value) => (value.channel === undefined) === (value.thread_ts === undefined),
+    { message: "channel and thread_ts must either both be supplied or both be omitted" },
+  )
   .refine(requireSlackMessageOrAttachments, {
     message: "A Slack write requires a message, at least one attachment, or both",
   });
@@ -203,6 +220,31 @@ export const agentSendOutputSchema = z
 export const gatewayRestartOutputSchema = z
   .object({
     status: z.literal("scheduled"),
+  })
+  .strict();
+
+const appOpsPreToolUseDenyOutputSchema = z
+  .object({
+    hookEventName: z.literal("PreToolUse"),
+    permissionDecision: z.literal("deny"),
+    permissionDecisionReason: boundedPlainString("Hook denial reason", 512),
+  })
+  .strict();
+
+const appOpsPreToolUseAllowOutputSchema = z
+  .object({
+    hookEventName: z.literal("PreToolUse"),
+    permissionDecision: z.literal("allow"),
+    updatedInput: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+
+export const appOpsPreToolUseOutputSchema = z
+  .object({
+    hookSpecificOutput: z.union([
+      appOpsPreToolUseAllowOutputSchema,
+      appOpsPreToolUseDenyOutputSchema,
+    ]),
   })
   .strict();
 

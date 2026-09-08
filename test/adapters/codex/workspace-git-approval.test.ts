@@ -28,7 +28,6 @@ function publicationNotification() {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "11111111-1111-4111-8111-111111111111",
-          approval_authority_id: "e".repeat(64),
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
             repo_id: "showtalk-taishi",
@@ -77,7 +76,6 @@ function repositorySettingsNotification() {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "33333333-3333-4333-8333-333333333333",
-          approval_authority_id: "e".repeat(64),
           approval_expires_at: "2026-08-26T20:00:00+09:00",
           scope: {
             repo_id: "showtalk-taishi",
@@ -144,7 +142,6 @@ function existingPullRequestUpdateNotification() {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "44444444-4444-4444-8444-444444444444",
-          approval_authority_id: "e".repeat(64),
           approval_target: "existing_pr_update_18",
           approval_expires_at: "2026-08-28T20:00:00+09:00",
           scope: {
@@ -202,11 +199,11 @@ test("captures every public exact-plan field from a publication prepare result",
       operationId: "11111111-1111-4111-8111-111111111111",
       planHash: "a".repeat(64),
       approvalTarget: "primary",
-      approvalAuthorityId: "e".repeat(64),
       approvalScope:
         publicationNotification().item.result.structuredContent.approval_scope,
       operation: "git_publication",
       repoId: "showtalk-taishi",
+      environment: "development",
       mode: "commit_and_push",
       branch: "agent/approval-ui",
       paths: ["src/slack/frontend.ts"],
@@ -220,6 +217,39 @@ test("captures every public exact-plan field from a publication prepare result",
   });
 });
 
+test("preserves an explicit publication environment outside provider policy", () => {
+  const notification = publicationNotification();
+  (notification.item.arguments as Record<string, unknown>).environment =
+    "production";
+  assert.equal(
+    captureWorkspaceGitPlan(notification)?.plan.environment,
+    "production",
+  );
+});
+
+test("does not copy provider-specific autonomous policy into the ShowTalk plan", () => {
+  const notification = publicationNotification();
+  (notification.item.result.structuredContent as Record<string, unknown>)
+    .autonomous_scope = {
+    repo_id: "another-provider-owned-repository",
+    capabilities: ["merge_everything"],
+    private_profile_document: { should_not_enter_showtalk_state: true },
+  };
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.ok(capture);
+  assert.equal("autonomousScope" in capture.plan, false);
+  assert.equal(
+    JSON.stringify(capture.plan).includes("private_profile_document"),
+    false,
+  );
+});
+
+test("never captures a nested dynamic-tool result as Git approval authority", () => {
+  const nested = publicationNotification();
+  nested.item.type = "dynamicToolCall";
+  assert.equal(captureWorkspaceGitPlan(nested), undefined);
+});
+
 test("captures and freezes an exact GitHub repository settings plan", () => {
   assert.deepEqual(captureWorkspaceGitPlan(repositorySettingsNotification()), {
     turnId: "turn_settings",
@@ -227,7 +257,6 @@ test("captures and freezes an exact GitHub repository settings plan", () => {
       operationId: "33333333-3333-4333-8333-333333333333",
       planHash: "f".repeat(64),
       approvalTarget: "repo_settings_showtalk-taishi",
-      approvalAuthorityId: "e".repeat(64),
       approvalScope:
         repositorySettingsNotification().item.result.structuredContent.approval_scope,
       operation: "github_repository_settings",
@@ -264,12 +293,12 @@ test("captures an exact existing Pull Request update plan", () => {
       operationId: "44444444-4444-4444-8444-444444444444",
       planHash: "9".repeat(64),
       approvalTarget: "existing_pr_update_18",
-      approvalAuthorityId: "e".repeat(64),
       approvalScope:
         existingPullRequestUpdateNotification().item.result.structuredContent
           .approval_scope,
       operation: "existing_pull_request_update",
       repoId: "showtalk-taishi",
+      environment: "development",
       mode: "existing_pull_request_update",
       branch: "codex/approval-fix",
       paths: ["src/slack/frontend.ts"],
@@ -617,7 +646,6 @@ test("captures Ready and merge plans with the exact PR HEAD", () => {
           structuredContent: {
             status: "awaiting_human_approval",
             operation_id: "22222222-2222-4222-8222-222222222222",
-            approval_authority_id: "e".repeat(64),
             approval_target: "pr_42",
             approval_expires_at: "2026-08-14T20:00:00+09:00",
             scope: {
@@ -759,7 +787,6 @@ test("rejects an unsupported merge method", () => {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "22222222-2222-4222-8222-222222222222",
-          approval_authority_id: "e".repeat(64),
           approval_target: "pr_42",
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
@@ -824,7 +851,6 @@ test("rejects a Pull Request approval target that does not match its number", ()
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "22222222-2222-4222-8222-222222222222",
-          approval_authority_id: "e".repeat(64),
           approval_target: "pr_99",
           approval_expires_at: "2026-08-14T20:00:00+09:00",
           scope: {
@@ -871,14 +897,12 @@ test("rejects a Pull Request approval target that does not match its number", ()
 });
 
 test("fails closed before Slack projection when the private approval scope is missing or substituted", () => {
-  const missingAuthority = publicationNotification();
-  Reflect.deleteProperty(
-    missingAuthority.item.result.structuredContent,
-    "approval_authority_id",
-  );
+  const exposedAuthority = publicationNotification();
+  (exposedAuthority.item.result.structuredContent as Record<string, unknown>)
+    .approval_authority_id = "e".repeat(64);
   assert.throws(
-    () => captureWorkspaceGitPlan(missingAuthority),
-    /approval authority ID is invalid/u,
+    () => captureWorkspaceGitPlan(exposedAuthority),
+    /exposed a private approval authority/u,
   );
 
   const missing = publicationNotification();
@@ -904,7 +928,7 @@ test("accepts only the fixed, non-secret approval choices", () => {
     itemId: "input_1",
     questions: [
       {
-        id: "approval",
+        id: "git_approval",
         header: "Approval",
         question: "Approve this exact plan?",
         isOther: false,
@@ -918,7 +942,25 @@ test("accepts only the fixed, non-secret approval choices", () => {
     isBlocking: true,
     autoResolutionMs: null,
   };
-  assert.equal(validateWorkspaceGitPlanQuestion(request).questionId, "approval");
+  assert.equal(validateWorkspaceGitPlanQuestion(request).questionId, "git_approval");
+  const recommendedLabelRequest = {
+    ...request,
+    questions: [
+      {
+        ...request.questions[0],
+        options: [
+          { label: "承認して実行 (Recommended)", description: "execute" },
+          { label: "拒否・保留", description: "hold" },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(validateWorkspaceGitPlanQuestion(recommendedLabelRequest), {
+    questionId: "git_approval",
+    prompt: "Approve this exact plan?",
+    approveLabel: "承認して実行",
+    rejectLabel: "拒否・保留",
+  });
   const questionWithoutWireDefaults = {
     ...request.questions[0],
     isOther: undefined,
@@ -932,9 +974,9 @@ test("accepts only the fixed, non-secret approval choices", () => {
     }).autoResolutionMs,
     undefined,
   );
-  assert.equal(
-    validateWorkspaceGitPlanQuestion({ ...request, isBlocking: false }).questionId,
-    "approval",
+  assert.throws(
+    () => validateWorkspaceGitPlanQuestion({ ...request, isBlocking: false }),
+    /must use blocking mode/u,
   );
   assert.throws(() =>
     validateWorkspaceGitPlanQuestion({ ...request, isBlocking: "yes" })
@@ -960,7 +1002,13 @@ test("accepts only the fixed, non-secret approval choices", () => {
       ...request,
       questions: [{ ...request.questions[0], isOther: true }],
     }).questionId,
-    "approval",
+    "git_approval",
+  );
+  assert.throws(() =>
+    validateWorkspaceGitPlanQuestion({
+      ...request,
+      questions: [{ ...request.questions[0], id: "publication_confirmation" }],
+    }),
   );
   assert.throws(() =>
     validateWorkspaceGitPlanQuestion({

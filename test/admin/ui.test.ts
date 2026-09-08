@@ -15,6 +15,21 @@ test("renders a nonce-bound responsive admin page with parseable browser code", 
   assert.match(page, /Codexの声質/u);
   assert.match(page, /"\/models" \+ suffix/u);
   assert.match(page, /次のターンから反映/u);
+  assert.match(page, /自動進行とWorkspace Git自動運転は停止しました/u);
+  assert.match(
+    page,
+    /<div hidden aria-hidden="true">\s*<div class="field-grid">/u,
+  );
+  assert.match(page, /automatic_choice_mode: "off"/u);
+  assert.match(page, /workspace_git_autonomy: undefined/u);
+  assert.match(page, /通常の選択肢は一番上を自動で選ぶ/u);
+  assert.match(page, /Git承認、外部操作の最終確認、command\/file承認は自動化せず/u);
+  assert.match(page, /SlackでONを確認/u);
+  assert.match(page, /SlackでOFFを確認/u);
+  assert.match(page, /既存のGit承認2択や承認待ちplanは変更しません/u);
+  assert.match(page, /workspace-git-autonomy\/" \+ operation/u);
+  assert.match(page, /status\.state !== "enabled" && status\.state !== "expired"/u);
+  assert.match(page, /Profile候補は削除済みのため、OFFのみ実行できます/u);
   assert.match(page, /agentForUpdate\(renameConsultationTarget/u);
   const updateProjection = /function agentForUpdate\(agent\) \{([\s\S]*?)\n      \}/u.exec(page)?.[1];
   assert.ok(updateProjection);
@@ -28,6 +43,18 @@ test("renders a nonce-bound responsive admin page with parseable browser code", 
   const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/u.exec(page)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Script(script));
+});
+
+test("keeps the Koe list independently scrollable on two-column layouts", () => {
+  const page = renderAdminPage("csrf-safe-token");
+  const styles = /<style>([\s\S]*?)<\/style>/u.exec(page)?.[1];
+  assert.ok(styles);
+
+  const desktopRules = /@media \(min-width: 901px\) \{([\s\S]*?)\n    \}/u.exec(styles)?.[1];
+  assert.ok(desktopRules);
+  assert.match(desktopRules, /\.koe-panel \{/u);
+  assert.match(desktopRules, /max-height: calc\(100dvh - 40px\);/u);
+  assert.match(desktopRules, /overflow-y: auto;/u);
 });
 
 test("escapes the page-bound CSRF token before placing it in HTML attributes", () => {

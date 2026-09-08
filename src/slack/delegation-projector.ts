@@ -7,6 +7,7 @@ import {
 } from "./presentation.js";
 import { SlackThreadProjector } from "./projector.js";
 import { formatAgentTextForSlack } from "./text-format.js";
+import type { WorkspaceGitApprovalDetailsStore } from "./user-input-blocks.js";
 
 const MAX_DELEGATION_MESSAGE_TEXT = 3_300;
 const MAX_DELEGATION_ERROR_TEXT = 2_000;
@@ -30,14 +31,19 @@ export interface SlackDelegationDestination {
 export class SlackDelegationProjector {
   readonly #client: WebClient;
   readonly #presentations: SlackPresentationsByChannel;
+  readonly #gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
   readonly #active = new Map<string, ActiveProjection>();
 
   constructor(
     client: WebClient,
     presentations: SlackPresentationsByChannel = {},
+    gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore,
   ) {
     this.#client = client;
     this.#presentations = presentations;
+    if (gitApprovalDetailsStore !== undefined) {
+      this.#gitApprovalDetailsStore = gitApprovalDetailsStore;
+    }
   }
 
   async project(
@@ -71,6 +77,9 @@ export class SlackDelegationProjector {
               this.#presentations,
               activity.targetChannelId,
             ),
+            ...(this.#gitApprovalDetailsStore === undefined
+              ? {}
+              : { gitApprovalDetailsStore: this.#gitApprovalDetailsStore }),
           },
         );
         projector.setSessionId(activity.targetSessionId);

@@ -4,6 +4,8 @@ import test from "node:test";
 
 import {
   CodexAppServerClient,
+  DEFAULT_CODEX_APP_SERVER_ARGS,
+  resolveCodexAppServerArgs,
   type AppServerTransport,
 } from "../../../src/adapters/codex/app-server-client.js";
 import { CodexRpcError } from "../../../src/adapters/codex/protocol.js";
@@ -24,6 +26,16 @@ class TestTransport implements AppServerTransport {
     return data.trim().split("\n").filter(Boolean);
   }
 }
+
+test("uses plain app-server args while thread config controls code mode", () => {
+  assert.deepEqual(DEFAULT_CODEX_APP_SERVER_ARGS, ["app-server"]);
+  assert.equal(Object.isFrozen(DEFAULT_CODEX_APP_SERVER_ARGS), true);
+  assert.deepEqual(resolveCodexAppServerArgs(), ["app-server"]);
+
+  const explicit = ["app-server", "--listen", "stdio://"];
+  assert.deepEqual(resolveCodexAppServerArgs(explicit), explicit);
+  assert.deepEqual(explicit, ["app-server", "--listen", "stdio://"]);
+});
 
 class DelayedCloseTransport extends TestTransport {
   readonly closeStarted: Promise<void>;
@@ -181,17 +193,33 @@ test("rejects a request with the app-server RPC error", async () => {
         value: "Strict reviewer",
       },
     },
+    collaborationMode: {
+      mode: "plan",
+      settings: {
+        model: "gpt-test",
+        reasoning_effort: "medium",
+        developer_instructions: "ShowTalk interactive execution mode",
+      },
+    },
   });
   await new Promise((resolve) => setImmediate(resolve));
   const [rawRequest] = transport.readOutput();
   const request = JSON.parse(rawRequest ?? "null") as {
     id: number;
-    params?: { additionalContext?: unknown };
+    params?: { additionalContext?: unknown; collaborationMode?: unknown };
   };
   assert.deepEqual(request.params?.additionalContext, {
     "showtalk_taishi.slack_persona": {
       kind: "application",
       value: "Strict reviewer",
+    },
+  });
+  assert.deepEqual(request.params?.collaborationMode, {
+    mode: "plan",
+    settings: {
+      model: "gpt-test",
+      reasoning_effort: "medium",
+      developer_instructions: "ShowTalk interactive execution mode",
     },
   });
   transport.input.write(

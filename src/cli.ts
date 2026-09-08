@@ -2,11 +2,6 @@
 
 import { dirname, join, resolve } from "node:path";
 
-import {
-  loadOrCreateAdminAccessToken,
-  LocalAdminServer,
-  YamlAdminConfigRepository,
-} from "./admin/index.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
 import {
   parseCliArguments,
@@ -17,8 +12,11 @@ import { bindCodexThread } from "./commands/bind.js";
 import { loadConfig } from "./config/loader.js";
 import { initializeConfig } from "./config/init.js";
 import {
+  adminUiUrlForLog,
+  runGatewayWorker,
+} from "./gateway-worker.js";
+import {
   createCodexProbeEnvironment,
-  createRuntime,
   validateConfiguredAdapterSession,
   validateRuntimePrerequisites,
 } from "./runtime.js";
@@ -29,11 +27,9 @@ import {
   uninstallMacOSLaunchAgent,
   type MacOSLaunchAgentStatus,
 } from "./service/macos-launch-agent.js";
-import {
-  GATEWAY_RESTART_EXIT_CODE,
-  isGatewayWorker,
-  superviseGatewayWorker,
-} from "./supervisor.js";
+import { isGatewayWorker, superviseGatewayWorker } from "./supervisor.js";
+
+export { adminUiUrlForLog } from "./gateway-worker.js";
 
 try {
   const invocation = parseCliArguments(process.argv.slice(2));
@@ -56,7 +52,7 @@ try {
       break;
     case "start":
       if (isGatewayWorker()) {
-        process.exitCode = await startGatewayWorker(invocation.configPath);
+        process.exitCode = await runGatewayWorker(invocation.configPath);
       } else {
         await superviseGatewayWorker({
           onRestart: () => {
@@ -205,132 +201,9 @@ function printServiceStatus(status: MacOSLaunchAgentStatus): void {
   console.log(`Errors: ${status.stderrPath}`);
 }
 
-async function startGatewayWorker(path: string): Promise<number> {
-  const config = await loadConfig(path);
-  await validateRuntimePrerequisites(config, { checkWorkspaces: false });
-  let requestRestart: (() => void) | undefined;
-  const restartRequested = new Promise<void>((resolve) => {
-    requestRestart = resolve;
-  });
-  const adminAccess = config.gateway.admin_ui.enabled
-    ? await loadOrCreateAdminAccessToken(config.gateway.state_file)
-    : undefined;
-  const runtime = await createRuntime(config, {
-    onRestartRequested: () => requestRestart?.(),
-  });
-  const adminRepository = adminAccess === undefined
-    ? undefined
-    : new YamlAdminConfigRepository(path);
-  const adminToken = adminAccess?.token;
-  const adminServer = adminAccess === undefined
-    ? undefined
-    : new LocalAdminServer({
-        port: config.gateway.admin_ui.port,
-        accessToken: adminToken!,
-        repository: adminRepository!,
-        modelCatalog: {
-          list: async (agentId, listOptions = {}) => {
-            const catalog = await runtime.listModels(agentId, listOptions);
-            return {
-              agent_id: agentId,
-              fetched_at: catalog.fetchedAt,
-              models: catalog.models.map((model) => ({
-                id: model.id,
-                model: model.model,
-                display_name: model.displayName,
-                description: model.description,
-                is_default: model.isDefault,
-                default_reasoning_effort: model.defaultReasoningEffort,
-                supported_reasoning_efforts: model.supportedReasoningEfforts.map(
-                  (effort) => ({
-                    value: effort.reasoningEffort,
-                    description: effort.description,
-                  }),
-                ),
-                input_modalities: [...(model.inputModalities ?? ["text", "image"])],
-              })),
-            };
-          },
-        },
-        onConfigSaved: (snapshot) => {
-          runtime.applyAgentModelSettings(snapshot.agents);
-        },
-        onRestartRequested: () => requestRestart?.(),
-        onError: (error) => {
-          console.error(
-            `ShowTalk Taishi admin UI error: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        },
-      });
-  let resolveStop: (() => void) | undefined;
-  const stopRequested = new Promise<void>((resolve) => {
-    resolveStop = resolve;
-  });
-  const requestStopSignal = () => {
-    resolveStop?.();
-  };
-  process.once("SIGINT", requestStopSignal);
-  process.once("SIGTERM", requestStopSignal);
-
-  let runtimeStopped = false;
-  let adminStopped = false;
-  const stopAdmin = async () => {
-    if (adminStopped) return;
-    adminStopped = true;
-    await adminServer?.stop();
-  };
-  const stopRuntime = async () => {
-    if (runtimeStopped) return;
-    runtimeStopped = true;
-    await runtime.stop();
-  };
-
-  try {
-    await runtime.start();
-    console.log("ShowTalk Taishi is connected to Slack via Socket Mode.");
-    if (adminServer !== undefined) {
-      const adminUrl = await adminServer.start();
-      console.log(
-        `ShowTalk Taishi admin UI: ${adminUiUrlForLog(adminUrl)}`,
-      );
-    }
-    const outcome = await Promise.race([
-      stopRequested.then(() => "stop" as const),
-      restartRequested.then(() => "restart" as const),
-    ]);
-    if (outcome === "stop") {
-      await stopAdmin();
-      await stopRuntime();
-      return 0;
-    }
-
-    runtime.beginRestart();
-    await stopAdmin();
-    console.log("ShowTalk Taishi is draining active work before restart.");
-    const drainOutcome = await Promise.race([
-      runtime.waitForIdle().then(() => "idle" as const),
-      stopRequested.then(() => "stop" as const),
-    ]);
-    await stopRuntime();
-    return drainOutcome === "idle" ? GATEWAY_RESTART_EXIT_CODE : 0;
-  } finally {
-    process.off("SIGINT", requestStopSignal);
-    process.off("SIGTERM", requestStopSignal);
-    await stopAdmin();
-    await stopRuntime();
-  }
-}
-
 function requireParsedValue<T extends string>(value: T | undefined, name: string): T {
   if (value === undefined) throw new Error(`Missing required option: ${name}`);
   return value;
-}
-
-export function adminUiUrlForLog(adminUrl: string): string {
-  const parsed = new URL(adminUrl);
-  return `${parsed.origin}${parsed.pathname}`;
 }
 
 function printHelp(command?: CliCommand): void {

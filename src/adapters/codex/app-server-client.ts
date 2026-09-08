@@ -47,6 +47,14 @@ export interface CodexAppServerCloseOptions {
   reportAsFailure?: boolean;
 }
 
+export const DEFAULT_CODEX_APP_SERVER_ARGS = Object.freeze(["app-server"]);
+
+export function resolveCodexAppServerArgs(
+  args?: readonly string[],
+): string[] {
+  return [...(args ?? DEFAULT_CODEX_APP_SERVER_ARGS)];
+}
+
 export interface ServerRequestEvent {
   id: RpcId;
   method: string;
@@ -91,7 +99,7 @@ export class CodexAppServerClient {
       env?: NodeJS.ProcessEnv;
     } = {},
   ): Promise<CodexAppServerClient> {
-    const child = spawn(options.command ?? "codex", options.args ?? ["app-server"], {
+    const child = spawn(options.command ?? "codex", resolveCodexAppServerArgs(options.args), {
       cwd: options.cwd,
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],

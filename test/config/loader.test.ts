@@ -57,7 +57,61 @@ test("loads config and expands environment references", async () => {
   assert.equal(config.adapters.codex?.sandbox, undefined);
   assert.equal(config.agents.implementer?.adapter_session_id, undefined);
   assert.equal(config.agents.implementer?.consultations, undefined);
+  assert.equal(config.agents.implementer?.automatic_choice_mode, "off");
   assert.deepEqual(config.gateway.admin_ui, { enabled: false, port: 4_781 });
+});
+
+test("loads the opt-in Koe ordinary top-choice mode", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "    adapter: codex",
+      "    adapter: codex\n    automatic_choice_mode: ordinary_top_choice",
+    ),
+  );
+  const config = await loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  });
+  assert.equal(
+    config.agents.implementer?.automatic_choice_mode,
+    "ordinary_top_choice",
+  );
+});
+
+test("loads a bounded non-authoritative workspace-git autonomy candidate", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "    adapter: codex",
+      [
+        "    adapter: codex",
+        "    workspace_git_autonomy:",
+        '      profile_id: "11111111-1111-4111-8111-111111111111"',
+        "      profile_revision: 3",
+        "      requested_ttl_minutes: 45",
+        "      label: autonomous-dev",
+      ].join("\n"),
+    ),
+  );
+  const config = await loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  });
+  assert.deepEqual(config.agents.implementer?.workspace_git_autonomy, {
+    profile_id: "11111111-1111-4111-8111-111111111111",
+    profile_revision: 3,
+    requested_ttl_minutes: 45,
+    label: "autonomous-dev",
+  });
 });
 
 test("rejects malformed and allowlist-bypassing admin overrides", async () => {
@@ -839,6 +893,27 @@ test("rejects Gateway credential names in Agent environment passthrough", async 
     source.replace(
       "    transport: stdio",
       "    transport: stdio\n    env_passthrough: [showtalk_taishi_mcp_token]",
+    ),
+  );
+  await assert.rejects(
+    loadConfig(path, {
+      STATE_FILE: "/tmp/state.json",
+      APP_TOKEN: "xapp-test",
+      BOT_TOKEN: "xoxb-test",
+      WORKSPACE: "/tmp/project",
+    }),
+    /Gateway or Slack token variables cannot be passed through/,
+  );
+});
+
+test("rejects AppOps approval key names in Agent environment passthrough", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "    transport: stdio",
+      "    transport: stdio\n    env_passthrough: [APP_OPS_SHOWTALK_APPROVAL_PUBLIC_KEY]",
     ),
   );
   await assert.rejects(

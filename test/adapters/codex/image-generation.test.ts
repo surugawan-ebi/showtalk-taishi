@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  normalizeCodexDynamicToolImageCompletions,
   normalizeCodexImageGenerationCompletion,
 } from "../../../src/adapters/codex/image-generation.js";
 
@@ -80,4 +81,44 @@ test("reports an image generation failure without exposing protocol details", ()
     code: "CODEX_IMAGE_GENERATION_FAILED",
     message: "Codexでの画像生成が完了しませんでした。",
   });
+});
+
+test("normalizes inline dynamic-tool images without accepting paths or remote URLs", () => {
+  const events = normalizeCodexDynamicToolImageCompletions({
+    type: "dynamicToolCall",
+    id: "browser/screenshot-1",
+    status: "completed",
+    contentItems: [
+      { type: "inputText", text: "private tool output" },
+      { type: "inputImage", imageUrl: `data:image/png;base64,${ONE_PIXEL_PNG_BASE64}` },
+      { type: "inputImage", imageUrl: "https://private.example/screenshot.png" },
+      { type: "inputImage", imageUrl: "/private/tmp/screenshot.png" },
+    ],
+  });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.type, "attachment.generated");
+  if (events[0]?.type !== "attachment.generated") return;
+  assert.equal(events[0].attachmentId, "browser/screenshot-1:image:1");
+  assert.equal(events[0].attachment.name, "codex-tool-image-browser-screenshot-1-2.png");
+  assert.equal(events[0].attachment.mimeType, "image/png");
+  assert.doesNotMatch(JSON.stringify({
+    name: events[0].attachment.name,
+    title: events[0].attachment.title,
+    altText: events[0].attachment.altText,
+  }), /private\.example|private\/tmp|tool output/u);
+});
+
+test("rejects a malformed inline dynamic-tool image", () => {
+  assert.deepEqual(normalizeCodexDynamicToolImageCompletions({
+    type: "dynamicToolCall",
+    id: "browser-image",
+    contentItems: [
+      { type: "inputImage", imageUrl: `data:image/jpeg;base64,${ONE_PIXEL_PNG_BASE64}` },
+    ],
+  }), [{
+    type: "error",
+    code: "CODEX_GENERATED_IMAGE_REJECTED",
+    message: "生成画像をSlackへ転送できませんでした（形式またはサイズが不正です）。",
+  }]);
 });
