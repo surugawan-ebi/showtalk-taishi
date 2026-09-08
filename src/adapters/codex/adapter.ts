@@ -30,6 +30,8 @@ import {
   type CodexTurn,
   type CommandApprovalDecision,
   type FileChangeApprovalDecision,
+  type ModelListParams,
+  type ModelListResponse,
   type PermissionsApprovalResponse,
   type RpcError,
   type RpcId,
@@ -41,6 +43,16 @@ import {
   type TurnStartParams,
 } from "./protocol.js";
 import type { ServerRequestEvent } from "./app-server-client.js";
+import { CodexModelCatalog } from "./model-catalog.js";
+import {
+  normalizeAppOpsPrepareCompletion,
+  type AppOpsApprovalPlanCapture,
+} from "./appops-approval.js";
+import type {
+  AppOpsApprovalProofBroker,
+  AppOpsApprovalProofPlan,
+  AppOpsApprovalProofSigner,
+} from "../../approvals/appops-approval-proof.js";
 import {
   normalizeWorkspaceGitPrepareCompletion,
   toolRequestUserInputParams,
@@ -54,25 +66,64 @@ import {
 import {
   MAX_CODEX_GENERATED_IMAGE_FILES,
   MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES,
+  normalizeCodexDynamicToolImageCompletions,
   normalizeCodexImageGenerationCompletion,
 } from "./image-generation.js";
 import type { WorkspaceGitApprovalPlan } from "../../core/index.js";
 import {
+  hasExternalActionApprovalQuestionId,
   hasWorkspaceGitApprovalQuestionId,
+  looksLikeWorkspaceGitApproval,
   validateOrdinaryChoiceRequest,
   type ValidatedChoiceQuestion,
 } from "./structured-input.js";
+import {
+  WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION,
+  WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4,
+  validateWorkspaceGitAutomationResult,
+  validateWorkspaceGitAutomationResultV4,
+  type WorkspaceGitAutomationContext,
+  type WorkspaceGitAutomationContextV4,
+  type WorkspaceGitAutomationInput,
+  type WorkspaceGitAutomationInputV4,
+  type WorkspaceGitAutomationProviderAny,
+  type WorkspaceGitPreparedPlan,
+} from "../../approvals/workspace-git-automation-provider.js";
 
 const MAX_AGENT_MESSAGE_CHARS = 128_000;
 const MAX_EVENT_JSON_CHARS = 64_000;
 const MAX_QUEUED_EVENTS = 256;
 const MAX_QUEUED_DELTA_CHARS = 128_000;
 const MAX_COALESCED_DELTA_CHARS = 32_000;
+const MAX_STRUCTURED_INPUT_ID_LENGTH = 128;
 const SHOWTALK_SLACK_PERSONA_CONTEXT_KEY = "showtalk_taishi.slack_persona";
 const SHOWTALK_PAGINATED_THREAD_CONTEXT_KEY =
   "showtalk_taishi.paginated_thread_compatibility";
 const SHOWTALK_GIT_APPROVAL_CONTINUATION_CONTEXT_KEY =
   "showtalk_taishi.git_approval_continuation";
+
+class AppOpsApprovalBindingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AppOpsApprovalBindingError";
+  }
+}
+const SHOWTALK_SLACK_ARTIFACT_INSTRUCTIONS = [
+  "# ShowTalk Slack artifact delivery",
+  "A local Markdown link or local filesystem path is not an attachment and cannot be opened by the Slack user.",
+  "When the user asks to receive a screenshot, image, audio file, or other supported workspace artifact, create or locate the file inside the configured Koe workspace and call the showtalk_taishi slack.reply tool with attachments.",
+  "For the originating Slack thread, omit both channel and thread_ts so the Gateway binds the upload to the exact active turn.",
+  "The user's explicit request to receive the artifact authorizes an attachment-only call bound to that originating thread; omit message as well as channel and thread_ts, and do not request a separate attachment approval or call request_user_input for it.",
+  "Do not claim that an artifact was attached or reposted unless slack.reply returns success. If upload is unavailable or fails, report that exact failure instead of returning a local Markdown link.",
+].join("\n");
+const SHOWTALK_INTERACTIVE_EXECUTION_INSTRUCTIONS = [
+  "# ShowTalk interactive execution mode",
+  "This is an execution turn, not a planning-only turn. Continue to inspect, edit, test, and use available tools as the user's request requires.",
+  "The App Server collaboration-mode marker exists so request_user_input can block until Slack returns the bound human answer. It does not prohibit implementation work.",
+  "Codex 0.149 may reject update_plan and suppress automatic goal continuation under this internal marker. Track progress in concise commentary instead, and continue an active goal only from an explicit new ShowTalk turn.",
+  "Use request_user_input only when it is available and required by the active ShowTalk approval or decision rules.",
+  SHOWTALK_SLACK_ARTIFACT_INSTRUCTIONS,
+].join("\n\n");
 const SHOWTALK_KOE_CONSULTATION_INSTRUCTIONS = [
   "ShowTalk Taishi Koe consultation rules:",
   "- Codex internal subagents run inside the current Codex task. They are not Slack channels or ShowTalk Koe.",
@@ -80,16 +131,28 @@ const SHOWTALK_KOE_CONSULTATION_INSTRUCTIONS = [
   "- Use agent.send only for targets explicitly listed in this Koe's configured consultations and only for work inside that target's stated scope.",
   "- Operator-facing call names returned by agent.list are exact aliases for their Koe IDs. Use them only as listed; never infer a Koe from similar prose.",
   "- For a user-requested sequence across multiple Koe, send one bounded step at a time, continue from each returned result, and stop with a clear blocker if a bounded review/fix cycle does not converge.",
+  "- If request_user_input returns `answers: {}`, do not treat it as approval and do not execute the gated action. When `showtalk` is a configured consultation target, immediately use agent.send to ask `showtalk` whether the empty answer is expected for that blocking mode and request a bounded diagnosis and fix when it is not. Include only sanitized context such as whether the call was direct, whether Slack controls appeared, the question ID, and its blocking mode; never send credentials, private approval authority, or hidden plan state. If `showtalk` is unavailable or this Koe is `showtalk`, diagnose locally and report the action as blocked.",
   "- Never choose an unrelated Koe because it is idle, available, or appears in a directory. If no configured consultation matches, continue locally or use Codex internal subagents.",
 ].join("\n");
 const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "ShowTalk Taishi Git approval routing rules:",
   "- A Git approval belongs to the Koe that called workspace-git prepare_* and to the Slack thread that started that same turn.",
-  "- When workspace-git returns awaiting_human_approval, immediately call request_user_input in that same turn with exactly two options named `承認して実行` and `拒否・保留`.",
-  "- Those labels alone never create workspace-git authority. For an external write that workspace-git does not implement, use a non-`git_approval` question ID and state the exact target, scope, and impact in the structured question.",
+  "- Call workspace-git prepare_* and execute_approved_* only as direct MCP tools. Never invoke them through functions.exec, another dynamic/code-mode wrapper, shell, or a relaying agent: ShowTalk cannot bind nested or model-forwarded output as approval authority.",
+  "- When workspace-git returns awaiting_human_approval, immediately call request_user_input in that same turn with question ID `git_approval` and exactly two options named `承認して実行` and `拒否・保留`.",
+  "- Keep ordinary decisions flexible: use an ordinary question ID and two or three task-specific options. If that decision selects a non-Git external write, ask a separate final confirmation before executing it.",
+  "- For that non-Git final confirmation, call request_user_input as a direct tool call, never from functions.exec, code mode, another dynamic tool, shell, or a relaying agent. Nested request_user_input calls cannot preserve the blocking Slack answer and may return `answers: {}` even after the button is clicked.",
+  "- The direct request_user_input call must contain exactly one blocking question whose ID is `external_action_approval` and exactly two options in this order: `承認して実行` (or `承認して実行 (Recommended)` when the client requires its recommended suffix), then `拒否・保留`. Do not otherwise rename or reorder them, or add a third option. The Gateway canonicalizes the optional suffix and returns `承認して実行`. Give both options non-empty descriptions and put the exact details in three separate question lines named `Target:`, `Scope:`, and `Impact:`. A non-blocking request or `answers: {}` is not approval. That answer never approves Git.",
+  "- A turn may contain multiple sequential external-action confirmations. Each distinct external write requires its own blocking confirmation with its current Target, Scope, and Impact; an earlier approval never grants blanket authority for later writes. Do not open a second confirmation while another is still awaiting its Slack answer.",
+  "- After an AppOps prepare tool returns `approval_prompt`, copy those exact three lines into the direct `external_action_approval` question. Do not alter the operation ID, plan hash, target, scope, or impact.",
+  "- After a bound AppOps confirmation is approved, continue with the exact matching AppOps execute call without supplying or requesting `approval_proof`; ShowTalk's trusted Codex PreToolUse hook privately injects it once. Never print, summarize, reuse, or send an approval proof anywhere. A missing or rejected hook binding blocks the execute call.",
+  "- If App Server returns `EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED`, retry request_user_input exactly once in the same turn with that fixed shape. Do not execute the external action unless the corrected structured input returns `承認して実行`.",
+  "- If that retry is malformed or App Server returns `EXTERNAL_ACTION_APPROVAL_REPAIR_EXHAUSTED`, stop requesting approval and do not execute the external action in that turn.",
+  "- Never use another question ID with either fixed Git approval label. Never redisplay or reconstruct a workspace-git approval as an ordinary structured choice; prepare a fresh exact plan in the current turn first.",
   "- A `承認して実行` answer returned from that exact request_user_input is a fresh authenticated human decision. It is not the assistant approving its own plan, even though App Server resumes the same turn after the human interaction.",
   "- Before the App Server receives `承認して実行`, ShowTalk records the bound human decision through workspace-git's model-inaccessible private broker. Continue the resumed turn instead of ending with prose or deferring execution to another user message. Re-read the exact workspace-git operation status and call the matching execute_approved_* tool exactly once when it is approved and operation ID, full plan hash, approval target, worktree, HEAD/snapshot or PR state, scope, and expiry still match.",
   "- One App Server turn has a pre-approval phase and a post-approval phase separated by the blocking request_user_input. A generic rule that forbids autonomous prepare-and-execute in one turn applies to the pre-approval phase; it does not require another Slack message after the bound human response. The post-approval phase may execute only the exact approved plan.",
+  "- If request_user_input returns WORKSPACE_GIT_AUTOMATION_TERMINAL_EXECUTED, a private provider already completed that exact plan. Do not call any public execute tool or retry it; inspect status only if needed and continue reporting the terminal result.",
+  "- If request_user_input returns WORKSPACE_GIT_AUTOMATION_BLOCKED, do not retry, switch to manual approval, or use another Git path in that turn. Report the fail-closed reason.",
   "- If the answer is `拒否・保留`, or revalidation is stale, mismatched, expired, rejected, already executed, or inconclusive, do not approve or execute and report the exact blocker.",
   "- Never use agent.send, slack.post, or slack.reply to ask another Koe or channel to display, relay, approve, or reconstruct a Git approval.",
   "- If the exact plan is unbound, expired, or invalidated by a Gateway restart, inspect status and re-run the matching workspace-git prepare_* operation in this Koe's current turn before requesting approval. Never reconstruct authority from IDs or prose.",
@@ -97,6 +160,10 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "- If request_user_input reports REPREPARE_REQUIRED, do not call request_user_input again in that turn. Do not claim that approval is still available. End the turn so Slack can offer the human a safe fresh-plan recovery action.",
   "- Never claim that approval controls were displayed unless request_user_input is currently waiting for the human response. If a prepared plan is still awaiting approval, do not finish the turn with prose instead of opening that structured request.",
 ].join("\n");
+const SHOWTALK_TURN_DEVELOPER_INSTRUCTIONS = [
+  SHOWTALK_INTERACTIVE_EXECUTION_INSTRUCTIONS,
+  SHOWTALK_GIT_APPROVAL_INSTRUCTIONS,
+].join("\n\n");
 
 export interface CodexAppServer {
   startThread(params: ThreadStartParams): Promise<CodexThread>;
@@ -106,6 +173,7 @@ export interface CodexAppServer {
     threadId: string,
     params?: ThreadTurnsListParams,
   ): Promise<ThreadTurnsListResponse>;
+  listModels(params?: ModelListParams): Promise<ModelListResponse>;
   unsubscribeThread(threadId: string): Promise<void>;
   startTurn(params: TurnStartParams): Promise<CodexTurn>;
   interruptTurn(threadId: string, turnId: string): Promise<void>;
@@ -153,6 +221,8 @@ interface PendingChoiceUserInput {
   readonly sessionId: string;
   readonly questions: readonly ValidatedChoiceQuestion[];
   readonly answers: Map<string, readonly string[]>;
+  readonly appOpsPlan?: AppOpsApprovalProofPlan;
+  readonly appOpsTurnId?: string;
   currentQuestionIndex: number;
   readonly expiresAt: number;
   readonly expirationTimer: NodeJS.Timeout;
@@ -188,10 +258,30 @@ interface PendingExternalGitRejection {
   readonly queue: AsyncEventQueue;
 }
 
+interface WorkspaceGitAutomationSlackOrigin {
+  readonly teamId: string;
+  readonly appId: string;
+  readonly channelId: string;
+  readonly rootThreadTs: string;
+  readonly messageTs: string;
+  readonly userId: string;
+}
+
+interface PendingWorkspaceGitAutomation {
+  readonly sessionId: string;
+  readonly rpcId: RpcId;
+  readonly turnId: string;
+  readonly plan: WorkspaceGitApprovalPlan;
+  readonly abortController: AbortController;
+}
+
 export interface CodexAdapterOptions {
   kind?: string;
+  /** Authenticated runtime Koe identity used only for private provider context. */
+  koeId?: string;
   model?: string;
   reasoningEffort?: string;
+  automaticChoiceMode?: "off" | "ordinary_top_choice";
   approvalPolicy?: "untrusted" | "on-request" | "never";
   /** Override who reviews approvals; omit to inherit Codex App Server configuration. */
   approvalsReviewer?: ApprovalsReviewer;
@@ -213,12 +303,24 @@ export interface CodexAdapterOptions {
   recordExternallyResolvedGitPlan?: (
     plan: WorkspaceGitApprovalPlan,
   ) => Promise<void>;
+  /** Optional opaque provider; manual approval remains the default. */
+  workspaceGitAutomationProvider?: WorkspaceGitAutomationProviderAny;
+  workspaceGitAutomationRevisions?: {
+    readonly koeBindingRevision: number;
+    readonly principalPolicyRevision: number;
+  };
+  /** Issues a short-lived proof only after the bound Slack choice is approved. */
+  appOpsApprovalProofSigner?: AppOpsApprovalProofSigner;
+  /** One-shot handoff consumed only by Codex's AppOps PreToolUse hook. */
+  appOpsApprovalProofBroker?: AppOpsApprovalProofBroker;
 }
 
 export interface CodexRuntimeModelSettings {
   readonly model?: string | undefined;
   readonly reasoningEffort?: string | undefined;
 }
+
+export type CodexAutomaticChoiceMode = "off" | "ordinary_top_choice";
 
 export class CodexAdapter implements AgentAdapter {
   readonly kind: string;
@@ -234,9 +336,11 @@ export class CodexAdapter implements AgentAdapter {
   };
 
   readonly #client: CodexAppServer;
+  readonly #modelCatalog: CodexModelCatalog;
   readonly #options: {
     model?: string;
     reasoningEffort?: string;
+    automaticChoiceMode: CodexAutomaticChoiceMode;
     approvalPolicy?: "untrusted" | "on-request" | "never";
     approvalsReviewer?: ApprovalsReviewer;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access";
@@ -260,6 +364,10 @@ export class CodexAdapter implements AgentAdapter {
     ExternallyResolvedGitUserInput
   >();
   readonly #pendingUserInputBindings = new Map<string, PendingUserInputBinding>();
+  readonly #externalActionApprovalRepairStates = new Map<
+    string,
+    "retry_pending" | "closed"
+  >();
   readonly #externallyResolvedUserInputBindings = new Map<
     string,
     ExternallyResolvedUserInputBinding
@@ -275,6 +383,24 @@ export class CodexAdapter implements AgentAdapter {
   readonly #recordExternallyResolvedGitPlan:
     | ((plan: WorkspaceGitApprovalPlan) => Promise<void>)
     | undefined;
+  readonly #workspaceGitAutomationProvider:
+    | WorkspaceGitAutomationProviderAny
+    | undefined;
+  #workspaceGitAutomationRevisions:
+    | {
+        readonly koeBindingRevision: number;
+        readonly principalPolicyRevision: number;
+      }
+    | undefined;
+  readonly #koeId: string | undefined;
+  readonly #workspaceGitAutomationOrigins = new Map<
+    string,
+    WorkspaceGitAutomationSlackOrigin
+  >();
+  readonly #pendingWorkspaceGitAutomations = new Map<
+    string,
+    PendingWorkspaceGitAutomation
+  >();
   readonly #workspaceGitApprovals = new WorkspaceGitApprovalLifecycle();
   readonly #activeQueues = new Map<string, AsyncEventQueue>();
   readonly #deferredServerRequestsBySession = new Map<
@@ -282,7 +408,16 @@ export class CodexAdapter implements AgentAdapter {
     ServerRequestEvent[]
   >();
   readonly #startedItems = new Map<string, Record<string, unknown>>();
+  readonly #appOpsPlansByTurn = new Map<string, AppOpsApprovalPlanCapture[]>();
+  readonly #appOpsApprovalProofSigner: AppOpsApprovalProofSigner | undefined;
+  readonly #appOpsApprovalProofBroker: AppOpsApprovalProofBroker | undefined;
   readonly #loadedSessions = new Set<string>();
+  /**
+   * App Server ignores resume overrides while a thread is active. These
+   * sessions must be cold-resumed once they become idle before a new turn may
+   * start, otherwise an old tool surface can survive a Gateway restart.
+   */
+  readonly #resumeOverridesPendingSessions = new Set<string>();
   readonly #resumeParamsBySession = new Map<string, ThreadResumeParams>();
   readonly #slackPersonasBySession = new Map<string, string>();
   readonly #legacyPaginatedCompatibilitySessions = new Set<string>();
@@ -291,14 +426,47 @@ export class CodexAdapter implements AgentAdapter {
 
   constructor(client: CodexAppServer, options: CodexAdapterOptions = {}) {
     this.#client = client;
+    this.#modelCatalog = new CodexModelCatalog(client);
     this.kind = options.kind ?? "codex";
     this.#recordExternallyResolvedGitPlan =
       options.recordExternallyResolvedGitPlan;
+    this.#workspaceGitAutomationProvider =
+      options.workspaceGitAutomationProvider;
+    this.#workspaceGitAutomationRevisions = options.workspaceGitAutomationRevisions;
+    this.#koeId = options.koeId;
+    this.#appOpsApprovalProofSigner = options.appOpsApprovalProofSigner;
+    this.#appOpsApprovalProofBroker = options.appOpsApprovalProofBroker;
+    if (
+      this.#workspaceGitAutomationProvider !== undefined &&
+      this.#workspaceGitAutomationProvider.contract_version !==
+        WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION &&
+      this.#workspaceGitAutomationProvider.contract_version !==
+        WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4
+    ) {
+      throw new Error("Unsupported workspace-git automation provider contract");
+    }
+    if (
+      this.#workspaceGitAutomationProvider !== undefined &&
+      (this.#koeId === undefined ||
+        this.#koeId.length < 1 ||
+        this.#koeId.length > 128 ||
+        /[\u0000-\u001f\u007f]/u.test(this.#koeId))
+    ) {
+      throw new Error("Workspace-git automation requires an authenticated Koe ID");
+    }
+    if (
+      this.#workspaceGitAutomationProvider?.contract_version ===
+        WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4 &&
+      !validWorkspaceGitAutomationRevisions(this.#workspaceGitAutomationRevisions)
+    ) {
+      throw new Error("Workspace-git v4 automation requires authenticated revisions");
+    }
     this.#options = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.reasoningEffort === undefined
         ? {}
         : { reasoningEffort: options.reasoningEffort }),
+      automaticChoiceMode: options.automaticChoiceMode ?? "off",
       ...(options.threadConfig === undefined
         ? {}
         : { threadConfig: structuredClone(options.threadConfig) }),
@@ -350,6 +518,50 @@ export class CodexAdapter implements AgentAdapter {
     } else {
       this.#options.reasoningEffort = reasoningEffort;
     }
+  }
+
+  updateWorkspaceGitAutomationRevisions(revisions: {
+    readonly koeBindingRevision: number;
+    readonly principalPolicyRevision: number;
+  }): void {
+    if (!validWorkspaceGitAutomationRevisions(revisions)) {
+      throw new Error("Workspace-git automation revisions are invalid");
+    }
+    this.#workspaceGitAutomationRevisions = { ...revisions };
+  }
+
+  updateAutomaticChoiceMode(mode: CodexAutomaticChoiceMode): void {
+    this.#options.automaticChoiceMode = mode;
+  }
+
+  async #buildInteractiveCollaborationMode(): Promise<
+    NonNullable<TurnStartParams["collaborationMode"]>
+  > {
+    let model = this.#options.model;
+    let reasoningEffort = this.#options.reasoningEffort;
+    if (model === undefined) {
+      const catalog = await this.#modelCatalog.list();
+      const selected = catalog.models.find((candidate) => candidate.isDefault) ??
+        catalog.models[0];
+      if (selected === undefined) {
+        throw new Error(
+          "Codex model catalog is empty; a blocking-capable ShowTalk turn cannot be started",
+        );
+      }
+      model = selected.model;
+      reasoningEffort ??= selected.defaultReasoningEffort;
+    }
+    return {
+      // Codex 0.149 derives request_user_input's blocking lifetime from the
+      // mode kind. Custom developer instructions preserve normal execution
+      // behavior while keeping authority-bearing Slack questions pending.
+      mode: "plan",
+      settings: {
+        model,
+        reasoning_effort: reasoningEffort ?? null,
+        developer_instructions: SHOWTALK_TURN_DEVELOPER_INSTRUCTIONS,
+      },
+    };
   }
 
   /** Ends process-local streams during an intentional Gateway shutdown. */
@@ -411,6 +623,7 @@ export class CodexAdapter implements AgentAdapter {
     });
     this.#statuses.set(thread.id, "idle");
     this.#loadedSessions.add(thread.id);
+    this.#resumeOverridesPendingSessions.delete(thread.id);
     this.#resumeParamsBySession.set(
       thread.id,
       this.#buildResumeParams(request.agent, thread.id),
@@ -435,6 +648,11 @@ export class CodexAdapter implements AgentAdapter {
     }
     this.#statuses.set(thread.id, "idle");
     this.#loadedSessions.add(thread.id);
+    if (threadStatusType(thread) === "active") {
+      this.#resumeOverridesPendingSessions.add(thread.id);
+    } else {
+      this.#resumeOverridesPendingSessions.delete(thread.id);
+    }
     this.#resumeParamsBySession.set(thread.id, params);
     this.#rememberSlackPersona(thread.id, request.agent.slackPersona);
     return toAdapterSession(thread);
@@ -451,10 +669,19 @@ export class CodexAdapter implements AgentAdapter {
       throw new Error(`Codex session ${session.id} already has an active turn`);
     }
     this.#runningSessions.add(session.id);
+    const automationOrigin = workspaceGitAutomationSlackOrigin(request);
+    if (automationOrigin === undefined) {
+      this.#workspaceGitAutomationOrigins.delete(session.id);
+    } else {
+      this.#workspaceGitAutomationOrigins.set(session.id, automationOrigin);
+    }
+    let collaborationMode: TurnStartParams["collaborationMode"];
     try {
       await this.#prepareSessionForTurn(session.id);
+      collaborationMode = await this.#buildInteractiveCollaborationMode();
     } catch (error) {
       this.#runningSessions.delete(session.id);
+      this.#workspaceGitAutomationOrigins.delete(session.id);
       await this.#unsubscribeSession(session.id);
       throw error;
     }
@@ -468,6 +695,26 @@ export class CodexAdapter implements AgentAdapter {
     let clientUserMessageId = randomUUID();
     const generatedAttachmentIds = new Set<string>();
     let generatedAttachmentBytes = 0;
+    const pushAgentEvent = (event: AgentEvent): void => {
+      if (event.type === "attachment.generated") {
+        if (generatedAttachmentIds.has(event.attachmentId)) return;
+        if (
+          generatedAttachmentIds.size >= MAX_CODEX_GENERATED_IMAGE_FILES ||
+          generatedAttachmentBytes + event.attachment.payload.size >
+            MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES
+        ) {
+          queue.push({
+            type: "error",
+            code: "CODEX_GENERATED_IMAGE_LIMIT_EXCEEDED",
+            message: "生成画像が1ターンのSlack転送上限を超えたため、一部を省略しました。",
+          });
+          return;
+        }
+        generatedAttachmentIds.add(event.attachmentId);
+        generatedAttachmentBytes += event.attachment.payload.size;
+      }
+      queue.push(event);
+    };
     const deferredNotifications: Array<{
       readonly method: string;
       readonly params: unknown;
@@ -576,6 +823,11 @@ export class CodexAdapter implements AgentAdapter {
         this.#workspaceGitApprovals.hasExecutionWatch(session.id);
       let finalTurn = turn;
       const completedTurnId = notificationTurnId(params);
+      if (completedTurnId !== undefined) {
+        this.#externalActionApprovalRepairStates.delete(
+          turnKey(session.id, completedTurnId),
+        );
+      }
       if (
         hasExecutionWatch &&
         !hasFullTurnItems(finalTurn) &&
@@ -639,6 +891,7 @@ export class CodexAdapter implements AgentAdapter {
       this.#removePendingApprovals(session.id);
       this.#removePendingUserInputs(session.id);
       this.#workspaceGitApprovals.clearSession(session.id);
+      this.#clearExternalActionApprovalRepairStates(session.id);
       this.#removeStartedItems(session.id);
       queue.close();
     };
@@ -699,38 +952,50 @@ export class CodexAdapter implements AgentAdapter {
               this.#retryPendingUserInputBindings(session.id, capture.turnId);
             });
           }
+          const appOpsCapture = normalizeAppOpsPrepareCompletion(
+            params,
+            startedItem,
+          );
+          if (appOpsCapture !== undefined) {
+            const key = turnKey(session.id, appOpsCapture.turnId);
+            const captures = this.#appOpsPlansByTurn.get(key) ?? [];
+            if (
+              !captures.some(
+                ({ plan }) =>
+                  plan.operationId === appOpsCapture.plan.operationId &&
+                  plan.planHash === appOpsCapture.plan.planHash,
+              )
+            ) {
+              captures.push(appOpsCapture);
+              this.#appOpsPlansByTurn.set(key, captures);
+            }
+            setImmediate(() => {
+              this.#retryPendingUserInputBindings(
+                session.id,
+                appOpsCapture.turnId,
+              );
+            });
+          }
         } catch (error) {
           queue.push({
             type: "error",
             message:
               error instanceof Error
                 ? error.message
-                : "workspace-git returned an invalid pending plan",
-            code: "INVALID_GIT_APPROVAL_PLAN",
+                : "An approval prepare tool returned an invalid pending plan",
+            code: "INVALID_EXTERNAL_APPROVAL_PLAN",
           });
         }
         this.#startedItems.delete(itemKey(session.id, item.id));
       }
       const turn = asRecord(notification?.turn);
-      let event = normalizeNotification(method, params);
-      if (event?.type === "attachment.generated") {
-        if (generatedAttachmentIds.has(event.attachmentId)) return;
-        if (
-          generatedAttachmentIds.size >= MAX_CODEX_GENERATED_IMAGE_FILES ||
-          generatedAttachmentBytes + event.attachment.payload.size >
-            MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES
-        ) {
-          event = {
-            type: "error",
-            code: "CODEX_GENERATED_IMAGE_LIMIT_EXCEEDED",
-            message: "生成画像が1ターンのSlack転送上限を超えたため、一部を省略しました。",
-          };
-        } else {
-          generatedAttachmentIds.add(event.attachmentId);
-          generatedAttachmentBytes += event.attachment.payload.size;
+      if (method === "item/completed" && item !== undefined) {
+        for (const imageEvent of normalizeCodexDynamicToolImageCompletions(item)) {
+          pushAgentEvent(imageEvent);
         }
       }
-      if (method !== "turn/completed" && event !== undefined) queue.push(event);
+      const event = normalizeNotification(method, params);
+      if (method !== "turn/completed" && event !== undefined) pushAgentEvent(event);
       if (method === "turn/completed") {
         const completedTurnId = notificationTurnId(params);
         if (
@@ -785,6 +1050,7 @@ export class CodexAdapter implements AgentAdapter {
           ...(this.#options.reasoningEffort === undefined
             ? {}
             : { effort: this.#options.reasoningEffort }),
+          collaborationMode,
         })
         .then((turn) => {
           if (ownedTurnId !== undefined && ownedTurnId !== turn.id) {
@@ -833,6 +1099,7 @@ export class CodexAdapter implements AgentAdapter {
         ...(this.#options.reasoningEffort === undefined
           ? {}
           : { effort: this.#options.reasoningEffort }),
+        collaborationMode,
       });
       if (ownedTurnId !== undefined && ownedTurnId !== turn.id) {
         const notifiedTurnId = ownedTurnId;
@@ -884,6 +1151,8 @@ export class CodexAdapter implements AgentAdapter {
       }
       this.#runningSessions.delete(session.id);
       this.#activeQueues.delete(session.id);
+      this.#workspaceGitAutomationOrigins.delete(session.id);
+      this.#abortWorkspaceGitAutomations(session.id);
       this.#removePendingApprovals(session.id);
       this.#removePendingUserInputs(session.id);
       await this.#rejectPendingUserInputBindings(
@@ -892,6 +1161,8 @@ export class CodexAdapter implements AgentAdapter {
         "The Slack turn ended before its workspace-git plan could be bound",
       );
       this.#workspaceGitApprovals.clearSession(session.id);
+      this.#clearAppOpsPlans(session.id);
+      this.#clearExternalActionApprovalRepairStates(session.id);
       this.#removeStartedItems(session.id);
       this.#rejectDeferredServerRequests(
         session.id,
@@ -1024,17 +1295,26 @@ export class CodexAdapter implements AgentAdapter {
     while (true) {
       const stored = await this.#client.readThread(sessionId);
       const storedStatus = threadStatusType(stored);
-      if (storedStatus === "systemError") {
-        this.#statuses.set(sessionId, "failed");
-        throw new Error(`Codex thread ${sessionId} is unavailable`);
-      }
+      // systemError is the terminal status of the previous failed turn, not
+      // proof that the persisted thread disappeared. In particular, model
+      // capacity failures leave the thread reusable. Resume the same thread
+      // when necessary and let turn/start report any current model error.
       if (storedStatus !== "active") {
-        if (this.#loadedSessions.has(sessionId)) return;
+        const overridesPending =
+          this.#resumeOverridesPendingSessions.has(sessionId);
+        if (this.#loadedSessions.has(sessionId) && !overridesPending) return;
+        if (this.#loadedSessions.has(sessionId)) {
+          await this.#unsubscribeSession(sessionId);
+        }
         const thread = await this.#resumeThreadWithCompatibility(
           this.#resumeParamsBySession.get(sessionId) ?? { threadId: sessionId },
         );
         this.#loadedSessions.add(sessionId);
-        if (threadStatusType(thread) !== "active") return;
+        if (threadStatusType(thread) !== "active") {
+          this.#resumeOverridesPendingSessions.delete(sessionId);
+          return;
+        }
+        this.#resumeOverridesPendingSessions.add(sessionId);
       }
 
       this.#statuses.set(sessionId, "running");
@@ -1284,15 +1564,63 @@ export class CodexAdapter implements AgentAdapter {
     receivedAt = Date.now(),
   ): void {
     let requestTurnId: string | undefined;
-    const shouldWaitForGitPlan = hasWorkspaceGitApprovalQuestionId(
+    const hasGitApprovalQuestionId = hasWorkspaceGitApprovalQuestionId(
       serverRequest.params,
     );
+    const hasExternalActionApprovalId =
+      hasExternalActionApprovalQuestionId(serverRequest.params);
+    const hasReservedGitApprovalShape =
+      looksLikeWorkspaceGitApproval(serverRequest.params);
+    const shouldWaitForGitPlan =
+      hasGitApprovalQuestionId || hasReservedGitApprovalShape;
     let mustUseGitApprovalPath = shouldWaitForGitPlan;
     try {
       let params: ReturnType<typeof toolRequestUserInputParams>;
       try {
         params = toolRequestUserInputParams(serverRequest.params);
       } catch (error) {
+        const identity = hasExternalActionApprovalId
+          ? structuredInputTurnIdentity(serverRequest.params)
+          : undefined;
+        if (identity !== undefined) {
+          requestTurnId = identity.turnId;
+          if (identity.threadId !== sessionId) {
+            throw new InvalidGitApprovalRequestError(
+              "Structured input thread does not match the active session",
+            );
+          }
+          const binding = this.#workspaceGitApprovals.inspectPlanBinding(
+            sessionId,
+            identity.turnId,
+          );
+          if (
+            binding.kind === "missing" &&
+            allowBindingWait &&
+            shouldWaitForGitPlan
+          ) {
+            this.#waitForWorkspaceGitPlan(
+              serverRequest,
+              sessionId,
+              identity.turnId,
+              queue,
+              receivedAt,
+            );
+            return;
+          }
+          if (
+            binding.kind === "missing" &&
+            !hasGitApprovalQuestionId
+          ) {
+            this.#handleOrdinaryChoiceRequest(
+              serverRequest,
+              sessionId,
+              identity.turnId,
+              queue,
+              receivedAt,
+            );
+            return;
+          }
+        }
         throw new InvalidGitApprovalRequestError(publicStructuredInputError(error));
       }
       requestTurnId = params.turnId;
@@ -1336,10 +1664,27 @@ export class CodexAdapter implements AgentAdapter {
       }
       if (
         binding.kind === "missing" &&
-        !mustUseGitApprovalPath
+        (!mustUseGitApprovalPath ||
+          (hasExternalActionApprovalId && !hasGitApprovalQuestionId))
       ) {
-        this.#handleOrdinaryChoiceRequest(serverRequest, sessionId, queue, receivedAt);
+        this.#handleOrdinaryChoiceRequest(
+          serverRequest,
+          sessionId,
+          params.turnId,
+          queue,
+          receivedAt,
+        );
         return;
+      }
+      if (
+        binding.kind === "missing" &&
+        mustUseGitApprovalPath &&
+        !hasGitApprovalQuestionId &&
+        !hasExternalActionApprovalId
+      ) {
+        throw new RepreparableGitApprovalError(
+          "Fixed Git approval choices used a non-Git question ID without a fresh exact plan",
+        );
       }
       let question: ReturnType<typeof validateWorkspaceGitPlanQuestion>;
       try {
@@ -1417,43 +1762,86 @@ export class CodexAdapter implements AgentAdapter {
           "The workspace-git plan has already expired",
         );
       }
-      this.#workspaceGitApprovals.consumeExactPlan(sessionId, params.turnId, plan);
-      const requestId = `codex-input:${randomUUID()}`;
-      const expirationTimer = setTimeout(() => {
-        const pending = this.#pendingUserInputs.get(requestId);
-        if (pending === undefined || pending.kind !== "git_approval") return;
-        try {
-          this.#expireGitUserInput(requestId, pending);
-        } catch (error) {
-          queue.fail(error);
-        }
-      }, timeoutMs);
-      expirationTimer.unref();
-      this.#pendingUserInputs.set(requestId, {
-        kind: "git_approval",
-        rpcId: serverRequest.id,
+      const presentManualApproval = () => {
+        this.#workspaceGitApprovals.consumeExactPlan(sessionId, params.turnId, plan);
+        const requestId = `codex-input:${randomUUID()}`;
+        const expirationTimer = setTimeout(() => {
+          const pending = this.#pendingUserInputs.get(requestId);
+          if (pending === undefined || pending.kind !== "git_approval") return;
+          try {
+            this.#expireGitUserInput(requestId, pending);
+          } catch (error) {
+            queue.fail(error);
+          }
+        }, timeoutMs);
+        expirationTimer.unref();
+        this.#pendingUserInputs.set(requestId, {
+          kind: "git_approval",
+          rpcId: serverRequest.id,
+          sessionId,
+          turnId: params.turnId,
+          questionId: question.questionId,
+          approveLabel: question.approveLabel,
+          rejectLabel: question.rejectLabel,
+          plan,
+          expiresAt: now + timeoutMs,
+          expirationTimer,
+        });
+        this.#statuses.set(sessionId, "waiting_for_approval");
+        queue.push({ type: "status.changed", status: "waiting_for_approval" });
+        queue.push({
+          type: "user_input.requested",
+          requestId,
+          expiresAt: new Date(now + timeoutMs).toISOString(),
+          prompt: question.prompt,
+          options: [
+            { id: "approve", label: "承認して実行" },
+            { id: "reject", label: "拒否・保留" },
+          ],
+          plan,
+        });
+      };
+      const automationInput = this.#workspaceGitAutomationInput({
+        serverRequest,
         sessionId,
         turnId: params.turnId,
-        questionId: question.questionId,
-        approveLabel: question.approveLabel,
-        rejectLabel: question.rejectLabel,
+        itemId: params.itemId,
         plan,
-        expiresAt: now + timeoutMs,
-        expirationTimer,
+        deadlineAt: new Date(now + timeoutMs).toISOString(),
       });
-      this.#statuses.set(sessionId, "waiting_for_approval");
-      queue.push({ type: "status.changed", status: "waiting_for_approval" });
-      queue.push({
-        type: "user_input.requested",
-        requestId,
-        expiresAt: new Date(now + timeoutMs).toISOString(),
-        prompt: question.prompt,
-        options: [
-          { id: "approve", label: "承認して実行" },
-          { id: "reject", label: "拒否・保留" },
-        ],
+      if (
+        this.#workspaceGitAutomationProvider === undefined ||
+        automationInput === undefined
+      ) {
+        presentManualApproval();
+        return;
+      }
+      const automationKey = rpcKey(serverRequest.id);
+      if (this.#pendingWorkspaceGitAutomations.has(automationKey)) {
+        throw new Error("Workspace Git automation request is already pending");
+      }
+      const abortController = new AbortController();
+      const pendingAutomation: PendingWorkspaceGitAutomation = {
+        sessionId,
+        rpcId: serverRequest.id,
+        turnId: params.turnId,
         plan,
+        abortController,
+      };
+      this.#pendingWorkspaceGitAutomations.set(
+        automationKey,
+        pendingAutomation,
+      );
+      void this.#resolveWorkspaceGitAutomation({
+        key: automationKey,
+        pending: pendingAutomation,
+        input: { ...automationInput, signal: abortController.signal },
+        plan,
+        turnId: params.turnId,
+        queue,
+        presentManualApproval,
       });
+      return;
     } catch (error) {
       if (!mustUseGitApprovalPath) {
         const reason = publicStructuredInputError(error);
@@ -1493,11 +1881,51 @@ export class CodexAdapter implements AgentAdapter {
   #handleOrdinaryChoiceRequest(
     serverRequest: ServerRequestEvent,
     sessionId: string,
+    turnId: string,
     queue: AsyncEventQueue,
     receivedAt: number,
   ): void {
+    const externalActionApproval = hasExternalActionApprovalQuestionId(
+      serverRequest.params,
+    );
     try {
       const request = validateOrdinaryChoiceRequest(serverRequest.params);
+      const appOpsCapture = externalActionApproval
+        ? this.#resolveAppOpsApprovalPlan(
+            sessionId,
+            turnId,
+            externalActionQuestionPrompt(serverRequest.params),
+          )
+        : undefined;
+      if (
+        externalActionApproval &&
+        looksLikeAppOpsApprovalPrompt(externalActionQuestionPrompt(serverRequest.params)) &&
+        appOpsCapture === undefined
+      ) {
+        throw new AppOpsApprovalBindingError(
+          "AppOps approval prompt does not match one exact same-turn prepare result",
+        );
+      }
+      if (
+        appOpsCapture !== undefined &&
+        (this.#appOpsApprovalProofSigner === undefined ||
+          this.#appOpsApprovalProofBroker === undefined ||
+          this.#koeId === undefined)
+      ) {
+        throw new AppOpsApprovalBindingError(
+          "AppOps approval proof handoff is not configured",
+        );
+      }
+      if (
+        externalActionApproval &&
+        !this.#acceptExternalActionApprovalRepair(
+          serverRequest.id,
+          sessionId,
+          turnId,
+        )
+      ) {
+        return;
+      }
       if (request.threadId !== sessionId) {
         throw new Error("Structured input thread does not match the active session");
       }
@@ -1507,9 +1935,39 @@ export class CodexAdapter implements AgentAdapter {
         request.autoResolutionMs === undefined
           ? Number.POSITIVE_INFINITY
           : receivedAt + request.autoResolutionMs - now,
+        appOpsCapture === undefined
+          ? Number.POSITIVE_INFINITY
+          : Date.parse(appOpsCapture.plan.expiresAt) - now,
       );
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        if (appOpsCapture !== undefined) {
+          throw new AppOpsApprovalBindingError(
+            "AppOps approval plan has already expired",
+          );
+        }
         throw new Error("Structured input request has already expired");
+      }
+      if (
+        this.#options.automaticChoiceMode === "ordinary_top_choice" &&
+        request.questions.every((question) => question.purpose === "ordinary")
+      ) {
+        const answers: Record<string, { answers: string[] }> = {};
+        for (const question of request.questions) {
+          const option = question.options[0];
+          if (option === undefined) {
+            throw new Error("Structured input question has no first option");
+          }
+          answers[question.appServerQuestionId] = {
+            answers: [option.appServerLabel],
+          };
+          queue.push({
+            type: "choice.auto_selected",
+            header: question.header,
+            optionLabel: option.label,
+          });
+        }
+        this.#client.respondToUserInput(serverRequest.id, { answers });
+        return;
       }
       const requestId = `codex-choice:${randomUUID()}`;
       const expirationTimer = setTimeout(() => {
@@ -1536,6 +1994,12 @@ export class CodexAdapter implements AgentAdapter {
         sessionId,
         questions: request.questions,
         answers: new Map(),
+        ...(appOpsCapture === undefined
+          ? {}
+          : {
+              appOpsPlan: appOpsCapture.plan,
+              appOpsTurnId: appOpsCapture.turnId,
+            }),
         currentQuestionIndex: 0,
         expiresAt: now + timeoutMs,
         expirationTimer,
@@ -1545,6 +2009,32 @@ export class CodexAdapter implements AgentAdapter {
       queue.push({ type: "status.changed", status: "waiting_for_input" });
       this.#pushCurrentChoice(requestId, pending, queue);
     } catch (error) {
+      if (error instanceof AppOpsApprovalBindingError) {
+        this.#client.respondError(serverRequest.id, {
+          code: -32602,
+          message: `APPOPS_APPROVAL_BLOCKED: ${error.message}`,
+          data: { recovery: "fresh_appops_prepare_required" },
+        });
+        this.#appOpsPlansByTurn.delete(turnKey(sessionId, turnId));
+        queue.push({
+          type: "error",
+          code: "APPOPS_APPROVAL_BLOCKED",
+          message:
+            "AppOpsの承認計画を現在のターンへ安全に固定できないため、" +
+            "外部操作を実行しません。新しいprepareからやり直してください。",
+        });
+        return;
+      }
+      if (
+        externalActionApproval &&
+        this.#requestExternalActionApprovalRepair(
+          serverRequest.id,
+          sessionId,
+          turnId,
+        )
+      ) {
+        return;
+      }
       const reason = publicStructuredInputError(error);
       this.#client.respondError(serverRequest.id, {
         code: -32602,
@@ -1558,6 +2048,334 @@ export class CodexAdapter implements AgentAdapter {
           ` 診断: ${reason}`,
         code: "UNSUPPORTED_STRUCTURED_INPUT",
       });
+    }
+  }
+
+  #workspaceGitAutomationInput(input: {
+    readonly serverRequest: ServerRequestEvent;
+    readonly sessionId: string;
+    readonly turnId: string;
+    readonly itemId: string;
+    readonly plan: WorkspaceGitApprovalPlan;
+    readonly deadlineAt: string;
+  }): WorkspaceGitAutomationInput | WorkspaceGitAutomationInputV4 | undefined {
+    const origin = this.#workspaceGitAutomationOrigins.get(input.sessionId);
+    const plan = workspaceGitAutomationPlan(input.plan);
+    if (origin === undefined || plan === undefined) return undefined;
+    const context: WorkspaceGitAutomationContext = {
+      invocation_id: randomUUID(),
+      deadline_at: input.deadlineAt,
+      koe_id: this.#koeId!,
+      app_server: {
+        method: "item/tool/requestUserInput",
+        rpc_request_id: input.serverRequest.id,
+        thread_id: input.sessionId,
+        turn_id: input.turnId,
+        item_id: input.itemId,
+        question_id: "git_approval",
+        is_blocking: true,
+      },
+      slack: {
+        team_id: origin.teamId,
+        app_id: origin.appId,
+        channel_id: origin.channelId,
+        root_thread_ts: origin.rootThreadTs,
+        source_message_ts: origin.messageTs,
+        user_id: origin.userId,
+      },
+    };
+    if (
+      this.#workspaceGitAutomationProvider?.contract_version ===
+        WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4
+    ) {
+      const revisions = this.#workspaceGitAutomationRevisions;
+      if (!validWorkspaceGitAutomationRevisions(revisions)) return undefined;
+      const contextV4: WorkspaceGitAutomationContextV4 = {
+        ...context,
+        koe_binding_revision: revisions.koeBindingRevision,
+        principal_policy_revision: revisions.principalPolicyRevision,
+      };
+      return {
+        contract_version: WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4,
+        plan,
+        context: contextV4,
+      };
+    }
+    return {
+      contract_version: WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION,
+      plan,
+      context,
+    };
+  }
+
+  async #resolveWorkspaceGitAutomation(input: {
+    readonly key: string;
+    readonly pending: PendingWorkspaceGitAutomation;
+    readonly input: WorkspaceGitAutomationInput | WorkspaceGitAutomationInputV4;
+    readonly plan: WorkspaceGitApprovalPlan;
+    readonly turnId: string;
+    readonly queue: AsyncEventQueue;
+    readonly presentManualApproval: () => void;
+  }): Promise<void> {
+    let result;
+    try {
+      const provider = this.#workspaceGitAutomationProvider!;
+      result = provider.contract_version === WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4 &&
+          input.input.contract_version === WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4
+        ? validateWorkspaceGitAutomationResultV4(
+            input.input,
+            await provider.executePreparedPlan(input.input),
+          )
+        : provider.contract_version === WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION &&
+            input.input.contract_version === WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION
+          ? validateWorkspaceGitAutomationResult(
+              input.input,
+              await provider.executePreparedPlan(input.input),
+            )
+          : (() => {
+              throw new Error("Workspace Git automation contract changed");
+            })();
+    } catch {
+      result = {
+        status: "blocked" as const,
+        operation_id: input.input.plan.operation_id,
+        plan_hash: input.input.plan.plan_hash,
+        reason: "outcome_unknown" as const,
+      };
+    }
+    const pending = this.#pendingWorkspaceGitAutomations.get(input.key);
+    if (
+      pending !== input.pending ||
+      pending.abortController.signal.aborted
+    ) {
+      return;
+    }
+    this.#pendingWorkspaceGitAutomations.delete(input.key);
+    if (result.status === "manual") {
+      input.presentManualApproval();
+      return;
+    }
+    try {
+      this.#workspaceGitApprovals.consumeExactPlan(
+        input.pending.sessionId,
+        input.turnId,
+        input.plan,
+      );
+    } catch {
+      this.#client.respondError(input.pending.rpcId, {
+        code: -32000,
+        message:
+          "WORKSPACE_GIT_AUTOMATION_BLOCKED: Exact plan binding changed; " +
+          "do not retry or fall back to public execution",
+      });
+      input.queue.push({
+        type: "git_automation.blocked",
+        plan: input.plan,
+        reason: "outcome_unknown",
+      });
+      return;
+    }
+    if (result.status === "terminal_executed") {
+      this.#client.respondError(input.pending.rpcId, {
+        code: -32000,
+        message:
+          "WORKSPACE_GIT_AUTOMATION_TERMINAL_EXECUTED: The private provider " +
+          "completed this exact plan. Do not call a public execute tool or retry it.",
+        data: {
+          operation_id: result.operation_id,
+          plan_hash: result.plan_hash,
+          status: result.status,
+        },
+      });
+      input.queue.push({
+        type: "git_automation.executed",
+        plan: input.plan,
+      });
+    } else {
+      this.#client.respondError(input.pending.rpcId, {
+        code: -32000,
+        message:
+          `WORKSPACE_GIT_AUTOMATION_BLOCKED: ${result.reason}. ` +
+          "Do not retry or fall back to public execution.",
+        data: {
+          operation_id: result.operation_id,
+          plan_hash: result.plan_hash,
+          status: result.status,
+          reason: result.reason,
+        },
+      });
+      input.queue.push({
+        type: "git_automation.blocked",
+        plan: input.plan,
+        reason: result.reason,
+      });
+    }
+    this.#statuses.set(input.pending.sessionId, "running");
+    input.queue.push({ type: "status.changed", status: "running" });
+  }
+
+  #abortWorkspaceGitAutomations(sessionId: string): void {
+    for (const [key, pending] of this.#pendingWorkspaceGitAutomations) {
+      if (pending.sessionId !== sessionId) continue;
+      this.#pendingWorkspaceGitAutomations.delete(key);
+      pending.abortController.abort();
+    }
+  }
+
+  #requestExternalActionApprovalRepair(
+    rpcId: RpcId,
+    sessionId: string,
+    turnId: string,
+  ): boolean {
+    const key = turnKey(sessionId, turnId);
+    const state = this.#externalActionApprovalRepairStates.get(key);
+    if (state === "closed") {
+      this.#respondExternalActionApprovalRepairExhausted(rpcId);
+      return true;
+    }
+    if (state !== undefined) {
+      this.#externalActionApprovalRepairStates.set(key, "closed");
+      return false;
+    }
+    this.#externalActionApprovalRepairStates.set(key, "retry_pending");
+    this.#client.respondError(rpcId, {
+      code: -32602,
+      message:
+        "EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED: Retry request_user_input " +
+        "exactly once in this turn as a direct tool call, never through " +
+        "functions.exec, code mode, another dynamic tool, shell, or a " +
+        "relaying agent. Use one question whose id is " +
+        "external_action_approval and exactly two options in this order: " +
+        "承認して実行 (the client-required suffix (Recommended) is accepted), " +
+        "拒否・保留. Do not otherwise rename, reorder, or add an option. " +
+        "Both descriptions must be non-empty. " +
+        "Use exactly one non-empty line for each required question field: " +
+        "Target: <target>, Scope: <scope>, Impact: <impact>. isBlocking must " +
+        "be true and isSecret must be false. Do not execute the external " +
+        "action before the corrected answer approves it.",
+      data: {
+        recovery: "retry_external_action_approval",
+        attempt: 1,
+        questionId: "external_action_approval",
+        requiredQuestionFields: ["Target", "Scope", "Impact"],
+        requiredOptionLabels: ["承認して実行", "拒否・保留"],
+        requireNonEmptyDescriptions: true,
+        requireBlocking: true,
+        forbidOtherAnswer: true,
+        forbidSecret: true,
+      },
+    });
+    return true;
+  }
+
+  #acceptExternalActionApprovalRepair(
+    rpcId: RpcId,
+    sessionId: string,
+    turnId: string,
+  ): boolean {
+    const key = turnKey(sessionId, turnId);
+    const state = this.#externalActionApprovalRepairStates.get(key);
+    if (state === "closed") {
+      this.#respondExternalActionApprovalRepairExhausted(rpcId);
+      return false;
+    }
+    if (this.#hasPendingExternalActionApproval(sessionId)) {
+      this.#client.respondError(rpcId, {
+        code: -32602,
+        message:
+          "EXTERNAL_ACTION_APPROVAL_ALREADY_PENDING: Wait for the current " +
+          "blocking external-action confirmation to resolve before requesting " +
+          "another one. Do not execute either action without its own answer.",
+        data: {
+          recovery: "wait_for_external_action_approval",
+          questionId: "external_action_approval",
+        },
+      });
+      return false;
+    }
+    if (state === "retry_pending") {
+      this.#externalActionApprovalRepairStates.delete(key);
+    }
+    return true;
+  }
+
+  #hasPendingExternalActionApproval(sessionId: string): boolean {
+    for (const pending of this.#pendingUserInputs.values()) {
+      if (
+        pending.kind === "choice" &&
+        pending.sessionId === sessionId &&
+        pending.questions.some(
+          (question) => question.purpose === "external_action_confirmation",
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  #respondExternalActionApprovalRepairExhausted(rpcId: RpcId): void {
+    this.#client.respondError(rpcId, {
+      code: -32602,
+      message:
+        "EXTERNAL_ACTION_APPROVAL_REPAIR_EXHAUSTED: The one same-turn " +
+        "structured-input repair was already used. Do not call " +
+        "request_user_input again or execute the external action in this turn.",
+      data: {
+        recovery: "stop_external_action_approval",
+        questionId: "external_action_approval",
+      },
+    });
+  }
+
+  #clearExternalActionApprovalRepairStates(sessionId: string): void {
+    const prefix = `${sessionId}\u0000`;
+    for (const key of this.#externalActionApprovalRepairStates.keys()) {
+      if (key.startsWith(prefix)) {
+        this.#externalActionApprovalRepairStates.delete(key);
+      }
+    }
+  }
+
+  #resolveAppOpsApprovalPlan(
+    sessionId: string,
+    turnId: string,
+    approvalPrompt: string | undefined,
+  ): AppOpsApprovalPlanCapture | undefined {
+    if (approvalPrompt === undefined) return undefined;
+    const captures = this.#appOpsPlansByTurn.get(turnKey(sessionId, turnId)) ?? [];
+    const matches = captures.filter(
+      (capture) => capture.approvalPrompt === approvalPrompt,
+    );
+    if (matches.length > 1) {
+      throw new Error("More than one AppOps plan matches this approval request");
+    }
+    return matches[0];
+  }
+
+  #consumeAppOpsApprovalPlan(
+    sessionId: string,
+    plan: AppOpsApprovalProofPlan,
+  ): void {
+    for (const [key, captures] of this.#appOpsPlansByTurn) {
+      if (!key.startsWith(`${sessionId}\u0000`)) continue;
+      const remaining = captures.filter(
+        (capture) =>
+          capture.plan.operationId !== plan.operationId ||
+          capture.plan.planHash !== plan.planHash,
+      );
+      if (remaining.length === 0) this.#appOpsPlansByTurn.delete(key);
+      else this.#appOpsPlansByTurn.set(key, remaining);
+    }
+  }
+
+  #clearAppOpsPlans(sessionId: string): void {
+    const prefix = `${sessionId}\u0000`;
+    for (const key of this.#appOpsPlansByTurn.keys()) {
+      if (key.startsWith(prefix)) this.#appOpsPlansByTurn.delete(key);
+    }
+    if (this.#koeId !== undefined) {
+      this.#appOpsApprovalProofBroker?.clearSession(this.#koeId, sessionId);
     }
   }
 
@@ -1863,6 +2681,7 @@ export class CodexAdapter implements AgentAdapter {
     this.#activeTurns.clear();
     this.#runningSessions.clear();
     this.#loadedSessions.clear();
+    this.#resumeOverridesPendingSessions.clear();
     for (const pending of this.#pendingApprovals.values()) {
       clearTimeout(pending.expirationTimer);
     }
@@ -1871,12 +2690,19 @@ export class CodexAdapter implements AgentAdapter {
       clearTimeout(pending.expirationTimer);
     }
     this.#pendingUserInputs.clear();
+    for (const pending of this.#pendingWorkspaceGitAutomations.values()) {
+      pending.abortController.abort();
+    }
+    this.#pendingWorkspaceGitAutomations.clear();
+    this.#workspaceGitAutomationOrigins.clear();
     this.#externallyResolvedGitUserInputs.clear();
     this.#externallyResolvedUserInputBindings.clear();
     for (const pending of this.#pendingUserInputBindings.values()) {
       clearTimeout(pending.expirationTimer);
     }
     this.#pendingUserInputBindings.clear();
+    this.#externalActionApprovalRepairStates.clear();
+    this.#appOpsPlansByTurn.clear();
     this.#workspaceGitApprovals.clearAll();
     this.#startedItems.clear();
   }
@@ -1894,6 +2720,26 @@ export class CodexAdapter implements AgentAdapter {
     rpcId: RpcId,
     queue: AsyncEventQueue,
   ): void {
+    const automationKey = rpcKey(rpcId);
+    const automation = this.#pendingWorkspaceGitAutomations.get(automationKey);
+    if (automation !== undefined) {
+      this.#pendingWorkspaceGitAutomations.delete(automationKey);
+      automation.abortController.abort();
+      try {
+        this.#workspaceGitApprovals.consumeExactPlan(
+          automation.sessionId,
+          automation.turnId,
+          automation.plan,
+        );
+      } catch {
+        // The external resolver may already have consumed the exact binding.
+      }
+      queue.push({
+        type: "git_automation.blocked",
+        plan: automation.plan,
+        reason: "outcome_unknown",
+      });
+    }
     for (const [requestId, pending] of this.#pendingApprovals) {
       if (pending.rpcId === rpcId) {
         clearTimeout(pending.expirationTimer);
@@ -2190,8 +3036,47 @@ export class CodexAdapter implements AgentAdapter {
       return false;
     }
 
+    let appOpsApprovalProof: string | undefined;
+    if (pending.appOpsPlan !== undefined && value === "承認して実行") {
+      try {
+        const signer = this.#appOpsApprovalProofSigner;
+        const broker = this.#appOpsApprovalProofBroker;
+        if (
+          signer === undefined ||
+          broker === undefined ||
+          this.#koeId === undefined ||
+          pending.appOpsTurnId === undefined
+        ) {
+          throw new Error("AppOps approval proof handoff is unavailable");
+        }
+        appOpsApprovalProof = signer.issue(pending.appOpsPlan);
+        broker.register({
+          agentId: this.#koeId,
+          sessionId: pending.sessionId,
+          turnId: pending.appOpsTurnId,
+          plan: pending.appOpsPlan,
+          proof: appOpsApprovalProof,
+        });
+      } catch {
+        clearTimeout(pending.expirationTimer);
+        this.#pendingUserInputs.delete(requestId);
+        this.#consumeAppOpsApprovalPlan(pending.sessionId, pending.appOpsPlan);
+        this.#client.respondError(pending.rpcId, {
+          code: -32000,
+          message:
+            "APPOPS_APPROVAL_PROOF_FAILED: The approved AppOps proof could not " +
+            "be issued. Do not call AppOps execute; prepare a fresh operation.",
+        });
+        throw new Error(
+          "AppOps approval proof issuance failed; the Store operation remains blocked",
+        );
+      }
+    }
     clearTimeout(pending.expirationTimer);
     this.#pendingUserInputs.delete(requestId);
+    if (pending.appOpsPlan !== undefined) {
+      this.#consumeAppOpsApprovalPlan(pending.sessionId, pending.appOpsPlan);
+    }
     this.#client.respondToUserInput(pending.rpcId, {
       answers: Object.fromEntries(
         [...pending.answers].map(([questionId, answers]) => [
@@ -2232,6 +3117,9 @@ export class CodexAdapter implements AgentAdapter {
         }),
       question: {
         id: question.id,
+        ...(question.purpose === "external_action_confirmation"
+          ? { purpose: question.purpose }
+          : {}),
         header: question.header,
         prompt: question.prompt,
         options: question.options.map(({ id, label, description }) => ({
@@ -2418,15 +3306,25 @@ export class CodexAdapter implements AgentAdapter {
         if (status === "idle" || status === "notLoaded") {
           return true;
         }
+        if (status === "systemError") {
+          // The thread has no live turn to interrupt. A failed model request
+          // may leave this terminal status while keeping the persisted thread
+          // available for a later resume.
+          return true;
+        }
         if (status === "active" && knownTurnId === undefined) {
           // This may be a turn started concurrently by Codex App. Never
           // interrupt a turn that this adapter did not observe or create.
-          return false;
+          // A rejected turn/start can also report active briefly before its
+          // terminal systemError arrives, so re-read for a bounded interval
+          // before closing the transport as an ambiguous-state fallback.
         }
       } catch {
         // A transient read failure is inconclusive; retry while notifications stay subscribed.
       }
-      await delay(this.#options.ambiguousStartRetryMs * 2 ** attempt);
+      if (attempt < 2) {
+        await delay(this.#options.ambiguousStartRetryMs * 2 ** attempt);
+      }
     }
     return false;
   }
@@ -2449,12 +3347,33 @@ function isMissingCodexThreadError(error: unknown): boolean {
   return error instanceof CodexRpcError && /\bthread not loaded\b/iu.test(error.message);
 }
 
+function structuredInputTurnIdentity(
+  value: unknown,
+): { readonly threadId: string; readonly turnId: string } | undefined {
+  const params = asRecord(value);
+  if (params === undefined) return undefined;
+  const threadId = boundedIdentity(params.threadId);
+  const turnId = boundedIdentity(params.turnId);
+  return threadId === undefined || turnId === undefined
+    ? undefined
+    : { threadId, turnId };
+}
+
+function boundedIdentity(value: unknown): string | undefined {
+  return typeof value === "string" &&
+      value.trim().length > 0 &&
+      value.length <= MAX_STRUCTURED_INPUT_ID_LENGTH
+    ? value
+    : undefined;
+}
+
 function codexDeveloperInstructions(role: string | undefined): string {
   const configuredRole = role?.trim();
   return [
     ...(configuredRole === undefined || configuredRole.length === 0
       ? []
       : [configuredRole]),
+    SHOWTALK_SLACK_ARTIFACT_INSTRUCTIONS,
     SHOWTALK_KOE_CONSULTATION_INSTRUCTIONS,
     SHOWTALK_GIT_APPROVAL_INSTRUCTIONS,
   ].join("\n\n");
@@ -2595,6 +3514,101 @@ function toAdapterSession(thread: CodexThread): AdapterSession {
   };
 }
 
+function workspaceGitAutomationSlackOrigin(
+  request: SendMessageRequest,
+): WorkspaceGitAutomationSlackOrigin | undefined {
+  if (request.source.type !== "human") return undefined;
+  const metadata = request.metadata;
+  const teamId = metadata?.showtalkSlackTeamId;
+  const appId = metadata?.showtalkSlackAppId;
+  const channelId = metadata?.showtalkChannelId;
+  const rootThreadTs = metadata?.showtalkRootThreadTs;
+  const messageTs = metadata?.showtalkMessageTs;
+  const userId = metadata?.showtalkSlackUserId;
+  if (
+    typeof teamId !== "string" ||
+    typeof appId !== "string" ||
+    typeof channelId !== "string" ||
+    typeof rootThreadTs !== "string" ||
+    typeof messageTs !== "string" ||
+    typeof userId !== "string" ||
+    request.source.slackUserId !== userId ||
+    !/^T[A-Z0-9]{1,127}$/u.test(teamId) ||
+    !/^A[A-Z0-9]{1,127}$/u.test(appId) ||
+    !/^[CGD][A-Z0-9]{1,127}$/u.test(channelId) ||
+    !/^[UW][A-Z0-9]{1,127}$/u.test(userId) ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(rootThreadTs) ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(messageTs)
+  ) {
+    return undefined;
+  }
+  return { teamId, appId, channelId, rootThreadTs, messageTs, userId };
+}
+
+function workspaceGitAutomationPlan(
+  plan: WorkspaceGitApprovalPlan,
+): WorkspaceGitPreparedPlan | undefined {
+  if (plan.branch === "main") return undefined;
+  let capabilities: WorkspaceGitPreparedPlan["capabilities"];
+  if (plan.operation === "existing_pull_request_update") {
+    capabilities = ["commit", "push"];
+  } else if (plan.operation === "git_publication") {
+    switch (plan.mode) {
+      case "commit_only":
+        capabilities = ["commit"];
+        break;
+      case "push_existing":
+        capabilities = ["push"];
+        break;
+      case "commit_and_push":
+        capabilities = ["commit", "push"];
+        break;
+      case "push_existing_and_open_draft_pr":
+        capabilities = ["push", "draft_pr"];
+        break;
+      case "commit_push_and_open_draft_pr":
+        capabilities = ["commit", "push", "draft_pr"];
+        break;
+      case "initial_commit_and_push":
+      case "initial_push_existing":
+        return undefined;
+    }
+  } else {
+    return undefined;
+  }
+  return {
+    operation_id: plan.operationId,
+    plan_hash: plan.planHash,
+    approval_target: plan.approvalTarget,
+    repo_id: plan.repoId,
+    expires_at: plan.expiresAt,
+    environment: plan.environment ?? "development",
+    capabilities,
+    branch: plan.branch,
+    paths: plan.paths,
+    expected_head: plan.expectedHead,
+    expected_snapshot_id: plan.expectedSnapshotId,
+  };
+}
+
+function validWorkspaceGitAutomationRevisions(
+  value:
+    | {
+        readonly koeBindingRevision: number;
+        readonly principalPolicyRevision: number;
+      }
+    | undefined,
+): value is {
+  readonly koeBindingRevision: number;
+  readonly principalPolicyRevision: number;
+} {
+  return value !== undefined &&
+    Number.isSafeInteger(value.koeBindingRevision) &&
+    value.koeBindingRevision >= 1 &&
+    Number.isSafeInteger(value.principalPolicyRevision) &&
+    value.principalPolicyRevision >= 1;
+}
+
 function getWorkspacePath(
   request: { readonly agent: AgentDefinition },
 ): string | undefined {
@@ -2653,7 +3667,7 @@ function normalizeNotification(method: string, params: unknown): AgentEvent | un
           type: "tool.started",
           toolCallId: item.id,
           name: toolEventName(item),
-          input: toJsonValue(item.arguments ?? item),
+          input: toJsonValue(redactApprovalProofs(item.arguments ?? item)),
         };
       }
       return undefined;
@@ -2683,7 +3697,7 @@ function normalizeNotification(method: string, params: unknown): AgentEvent | un
         return {
           type: "tool.completed",
           toolCallId: item.id,
-          output: toJsonValue(item.result ?? item.error ?? item),
+          output: toolCompletionOutput(item),
           ...(item.status === "failed" || item.status === "declined"
             ? { isError: true }
             : {}),
@@ -2707,6 +3721,23 @@ function normalizeNotification(method: string, params: unknown): AgentEvent | un
     default:
       return undefined;
   }
+}
+
+function toolCompletionOutput(item: Record<string, unknown>): JsonValue {
+  if (item.type !== "dynamicToolCall") {
+    return toJsonValue(item.result ?? item.error ?? item);
+  }
+  const contentTypes = Array.isArray(item.contentItems)
+    ? item.contentItems.flatMap((value) => {
+        const content = asRecord(value);
+        return typeof content?.type === "string" ? [content.type] : [];
+      })
+    : [];
+  return toJsonValue({
+    status: item.status,
+    success: item.success,
+    contentTypes,
+  });
 }
 
 function toolEventName(item: Record<string, unknown>): string {
@@ -2857,6 +3888,34 @@ function turnKey(sessionId: string, turnId: string): string {
 
 function rpcKey(rpcId: RpcId): string {
   return `${typeof rpcId}:${String(rpcId)}`;
+}
+
+function externalActionQuestionPrompt(value: unknown): string | undefined {
+  const questions = asRecord(value)?.questions;
+  if (!Array.isArray(questions) || questions.length !== 1) return undefined;
+  const prompt = asRecord(questions[0])?.question;
+  return typeof prompt === "string" ? prompt : undefined;
+}
+
+function looksLikeAppOpsApprovalPrompt(value: string | undefined): boolean {
+  return value !== undefined &&
+    (/^Target:\s*AppOps\b/mu.test(value) ||
+      /\bexecute_approved_app_store_/u.test(value) ||
+      /\bplan_hash=[0-9a-f]{64}\b/u.test(value));
+}
+
+function redactApprovalProofs(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactApprovalProofs);
+  const record = asRecord(value);
+  if (record === undefined) return value;
+  return Object.fromEntries(
+    Object.entries(record).map(([key, child]) => [
+      key,
+      key === "approval_proof" || key === "appops_approval_proof"
+        ? "<redacted-approval-proof>"
+        : redactApprovalProofs(child),
+    ]),
+  );
 }
 
 function delay(milliseconds: number): Promise<void> {

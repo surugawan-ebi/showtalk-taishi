@@ -2,16 +2,50 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertWorkspaceGitManualRuntimeOptions,
   createCodexChildEnvironment,
   createCodexProbeEnvironment,
   createRegistry,
   configuredKoeRole,
+  reconcileWorkspaceGitAutonomyRevisionState,
   startFrontendWithStateRollback,
   validateConfiguredAdapterSession,
   validateRuntimePrerequisites,
+  workspaceGitAutonomyPolicyFingerprint,
+  workspaceGitAutonomySettingsFromConfig,
 } from "../src/runtime.js";
 import { taishiConfigSchema, type TaishiConfig } from "../src/config/schema.js";
 import type { RuntimeState } from "../src/state/file-state-store.js";
+
+test("rejects Workspace Git automation injection at the runtime boundary", () => {
+  assert.throws(
+    () => assertWorkspaceGitManualRuntimeOptions({
+      workspaceGitAutomationProviderFactory: {
+        contract_version: 1,
+        create: () => undefined,
+      },
+    }),
+    /automation is retired/u,
+  );
+  assert.throws(
+    () => assertWorkspaceGitManualRuntimeOptions({
+      workspaceGitAutonomyControlBrokerFactory: {
+        contract_version: 4,
+        create: () => ({
+          contract_version: 4,
+          enable: async () => {
+            throw new Error("not called");
+          },
+          disable: async () => {
+            throw new Error("not called");
+          },
+        }),
+      },
+    }),
+    /automation is retired/u,
+  );
+  assert.doesNotThrow(() => assertWorkspaceGitManualRuntimeOptions({}));
+});
 
 test("injects only configured Koe consultation targets into the role", () => {
   const config = taishiConfigSchema.parse({
@@ -85,6 +119,86 @@ test("injects only configured Koe consultation targets into the role", () => {
   assert.equal(registry.requireAgent("reviewer").callName, "レビュー係");
 });
 
+test("uses a durable monotonic revision so config rollback cannot revive authority", () => {
+  const base = taishiConfigSchema.parse({
+    version: 1,
+    gateway: { state_file: "/tmp/taishi-state.json" },
+    slack: {
+      socket_mode: true,
+      app_token: "xapp-test",
+      bot_token: "xoxb-test",
+      approver_user_ids: ["U1"],
+    },
+    adapters: {
+      codex: { type: "codex-app-server", command: "codex", transport: "stdio" },
+    },
+    agents: {
+      implementer: {
+        adapter: "codex",
+        workspace_git_autonomy: {
+          profile_id: "11111111-1111-4111-8111-111111111111",
+          profile_revision: 3,
+          requested_ttl_minutes: 60,
+        },
+        workspace: { path: "/workspace/source" },
+        slack: { channel_id: "C1" },
+        role: "Implementer",
+      },
+    },
+    permissions: { defaults: {}, agents: {} },
+  });
+  const firstState = reconcileWorkspaceGitAutonomyRevisionState(
+    workspaceGitAutonomyPolicyFingerprint(base),
+  );
+  const first = workspaceGitAutonomySettingsFromConfig(
+    base,
+    firstState.revision,
+  )[0];
+  assert.equal(first?.candidate?.profileRevision, 3);
+  assert.equal(first?.koeBindingRevision, 1);
+  assert.equal(first?.principalPolicyRevision, 1);
+
+  const changed = taishiConfigSchema.parse({
+    ...base,
+    agents: {
+      ...base.agents,
+      implementer: {
+        ...base.agents.implementer!,
+        workspace_git_autonomy: {
+          ...base.agents.implementer!.workspace_git_autonomy!,
+          profile_revision: 4,
+        },
+      },
+    },
+  });
+  const secondState = reconcileWorkspaceGitAutonomyRevisionState(
+    workspaceGitAutonomyPolicyFingerprint(changed),
+    firstState,
+  );
+  const restoredState = reconcileWorkspaceGitAutonomyRevisionState(
+    workspaceGitAutonomyPolicyFingerprint(base),
+    secondState,
+  );
+  assert.equal(secondState.revision, 2);
+  assert.equal(restoredState.revision, 3);
+  assert.notEqual(restoredState.revision, firstState.revision);
+  const restored = workspaceGitAutonomySettingsFromConfig(
+    base,
+    restoredState.revision,
+  )[0];
+  assert.equal(restored?.koeBindingRevision, 3);
+  assert.equal(restored?.principalPolicyRevision, 3);
+});
+
+test("keeps the current autonomy revision for an unchanged canonical policy", () => {
+  const fingerprint = "a".repeat(64);
+  const current = { fingerprint, revision: 7 };
+  assert.equal(
+    reconcileWorkspaceGitAutonomyRevisionState(fingerprint, current),
+    current,
+  );
+});
+
 test("does not leak Slack credentials into isolated Codex Agent processes", () => {
   const config = {
     slack: {
@@ -101,6 +215,10 @@ test("does not leak Slack credentials into isolated Codex Agent processes", () =
     SHOWTALK_TAISHI_MCP_TOKEN: "old-agent-token",
     SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI: "/private/approval-cli.js",
     WORKSPACE_GIT_STATE_ROOT: "/private/workspace-git-state",
+    SHOWTALK_APPOPS_APPROVAL_PRIVATE_KEY_FILE: "/private/appops-key.pem",
+    SHOWTALK_APPOPS_APPROVAL_KEY_ID: "private-key-id",
+    APP_OPS_SHOWTALK_APPROVAL_PUBLIC_KEY: "untrusted-public-key",
+    APP_OPS_SHOWTALK_APPROVAL_KEY_ID: "untrusted-public-key-id",
     GITHUB_TOKEN: "not-forwarded",
     DATABASE_URL: "not-forwarded",
   });
@@ -161,6 +279,28 @@ test("passes only explicitly requested additional Agent environment variables", 
       SHOWTALK_TAISHI_MCP_TOKEN: "agent-token",
     },
   );
+});
+
+test("never passes AppOps approval key material through user passthrough", () => {
+  const config = {
+    slack: { app_token: "xapp-secret", bot_token: "xoxb-secret" },
+  } as TaishiConfig;
+  const environment = createCodexProbeEnvironment(
+    config,
+    {
+      SHOWTALK_APPOPS_APPROVAL_PRIVATE_KEY_FILE: "/private/appops-key.pem",
+      SHOWTALK_APPOPS_APPROVAL_KEY_ID: "private-key-id",
+      APP_OPS_SHOWTALK_APPROVAL_PUBLIC_KEY: "untrusted-public-key",
+      APP_OPS_SHOWTALK_APPROVAL_KEY_ID: "untrusted-public-key-id",
+    },
+    [
+      "SHOWTALK_APPOPS_APPROVAL_PRIVATE_KEY_FILE",
+      "SHOWTALK_APPOPS_APPROVAL_KEY_ID",
+      "APP_OPS_SHOWTALK_APPROVAL_PUBLIC_KEY",
+      "APP_OPS_SHOWTALK_APPROVAL_KEY_ID",
+    ],
+  );
+  assert.deepEqual(environment, {});
 });
 
 test("validates that a declared backend session is persistent and exact", async () => {

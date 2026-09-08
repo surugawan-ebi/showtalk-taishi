@@ -20,6 +20,7 @@ import {
   type AdminConfigUpdate,
 } from "./config-repository.js";
 import { renderAdminPage } from "./ui.js";
+import type { WorkspaceGitAutonomyStatus } from "../approvals/workspace-git-autonomy-control.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 1_048_576;
@@ -35,6 +36,16 @@ const adminAgentSchema = z
     adapter_session_id: z.string().max(256).optional(),
     model: z.string().min(1).max(256).optional(),
     reasoning_effort: z.string().min(1).max(64).optional(),
+    automatic_choice_mode: z.enum(["off", "ordinary_top_choice"]).default("off"),
+    workspace_git_autonomy: z
+      .object({
+        profile_id: z.string().uuid(),
+        profile_revision: z.number().int().min(1),
+        requested_ttl_minutes: z.number().int().min(1).max(24 * 60),
+        label: z.string().min(1).max(80).optional(),
+      })
+      .strict()
+      .optional(),
     workspace_path: z.string().min(1),
     slack: z
       .object({
@@ -98,7 +109,13 @@ export interface LocalAdminServerOptions {
   readonly accessToken: string;
   readonly repository: AdminConfigPort;
   readonly modelCatalog?: AdminModelCatalogPort;
-  readonly onConfigSaved?: (snapshot: AdminConfigSnapshot) => void;
+  readonly workspaceGitAutonomy?: {
+    list(): readonly WorkspaceGitAutonomyStatus[];
+    request(agentId: string, operation: "enable" | "disable"): Promise<void>;
+  };
+  readonly onConfigSaved?: (
+    snapshot: AdminConfigSnapshot,
+  ) => void | Promise<void>;
   readonly onRestartRequested: () => void;
   readonly onError?: (error: unknown) => void;
 }
@@ -129,6 +146,9 @@ export class LocalAdminServer {
         ...(this.#options.modelCatalog === undefined
           ? {}
           : { modelCatalog: this.#options.modelCatalog }),
+        ...(this.#options.workspaceGitAutonomy === undefined
+          ? {}
+          : { workspaceGitAutonomy: this.#options.workspaceGitAutonomy }),
         ...(this.#options.onConfigSaved === undefined
           ? {}
           : { onConfigSaved: this.#options.onConfigSaved }),
@@ -282,6 +302,12 @@ async function handleRequest(
     });
     return;
   }
+  if (request.method === "GET" && url.pathname === "/api/workspace-git-autonomy") {
+    writeJson(response, 200, {
+      agents: options.workspaceGitAutonomy?.list() ?? [],
+    });
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/favicon.ico") {
     response.statusCode = 204;
     response.end();
@@ -302,7 +328,7 @@ async function handleRequest(
         options.modelCatalog,
       );
       const saved = await options.repository.save(payload);
-      options.onConfigSaved?.(saved);
+      await options.onConfigSaved?.(saved);
       writeJson(response, 200, saved);
     } catch (error) {
       writeAdminError(response, error);
@@ -324,8 +350,49 @@ async function handleRequest(
     return;
   }
 
+  const autonomyRoute = parseWorkspaceGitAutonomyRoute(url.pathname);
+  if (request.method === "POST" && autonomyRoute !== undefined) {
+    if (!authorizeMutation(request, options.csrfToken)) {
+      writeJson(response, 403, { error: "操作トークンを確認できません。画面を再読み込みしてください。" });
+      return;
+    }
+    if (options.workspaceGitAutonomy === undefined) {
+      writeJson(response, 503, { error: "Workspace Git自動運転は現在のGatewayで利用できません。" });
+      return;
+    }
+    try {
+      await options.workspaceGitAutonomy.request(
+        autonomyRoute.agentId,
+        autonomyRoute.operation,
+      );
+      writeJson(response, 202, { status: "confirmation_posted" });
+    } catch (error) {
+      writeJson(response, 409, {
+        error: error instanceof Error ? error.message : "自動運転の確認を開始できませんでした。",
+      });
+    }
+    return;
+  }
+
   response.setHeader("allow", "GET, PUT, POST");
   writeJson(response, 404, { error: "ページが見つかりません。" });
+}
+
+function parseWorkspaceGitAutonomyRoute(
+  pathname: string,
+): { readonly agentId: string; readonly operation: "enable" | "disable" } | undefined {
+  const match = /^\/api\/agents\/([^/]+)\/workspace-git-autonomy\/(enable|disable)$/u.exec(pathname);
+  if (match === null) return undefined;
+  try {
+    const agentId = decodeURIComponent(match[1] ?? "");
+    const operation = match[2];
+    if (agentId.length === 0 || agentId.includes("/") || (operation !== "enable" && operation !== "disable")) {
+      return undefined;
+    }
+    return { agentId, operation };
+  } catch {
+    return undefined;
+  }
 }
 
 async function validateModelSettingChanges(

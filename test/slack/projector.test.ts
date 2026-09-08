@@ -6,6 +6,7 @@ import type { WebClient } from "@slack/web-api";
 import { SlackThreadProjector } from "../../src/slack/projector.js";
 import { StructuredChoiceContinuationStore } from "../../src/slack/choice-continuation.js";
 import { WorkspaceGitApprovalDetailsStore } from "../../src/slack/user-input-blocks.js";
+import type { InteractionAuditInput } from "../../src/slack/interaction-audit.js";
 
 function recordingClient(): {
   client: WebClient;
@@ -490,6 +491,29 @@ test("does not append a generic success after a text-less turn error", async () 
   assert.ok(posts.every((post) => !String(post.text).includes("処理が完了しました")));
 });
 
+test("audits structured input rejected before Slack controls are displayed", async () => {
+  const { client } = recordingClient();
+  const audit: InteractionAuditInput[] = [];
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    interactionAudit: (event) => audit.push(event),
+  });
+  projector.setSessionId("session_1");
+
+  await projector.project({
+    type: "error",
+    code: "UNSUPPORTED_STRUCTURED_INPUT",
+    message: "The approval shape is invalid",
+  });
+
+  assert.deepEqual(audit, [{
+    event: "structured_input.rejected_before_display",
+    channelId: "C1",
+    rootThreadTs: "100.0",
+    sessionId: "session_1",
+    outcome: "UNSUPPORTED_STRUCTURED_INPUT",
+  }]);
+});
+
 test("uses the configured channel identity for every new projected message", async () => {
   const { client, posts } = recordingClient();
   const projector = new SlackThreadProjector(client, "C1", "100.0", {
@@ -659,6 +683,42 @@ test("projects an ordinary model question as non-Git Slack choices", async () =>
   assert.doesNotMatch(rendered, /Git操作|承認して実行|拒否・保留/u);
 });
 
+test("projects an external-action confirmation with an explicit non-Git warning", async () => {
+  const { client, posts, updates } = recordingClient();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+  });
+
+  await projector.project({
+    type: "choice.requested",
+    requestId: "codex-choice:11111111-1111-4111-8111-111111111113",
+    expiresAt: "2030-01-01T00:00:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "外部設定",
+      prompt: "main保護を設定しますか？",
+      options: [
+        {
+          id: "option_1",
+          label: "外部操作を承認（Git承認ではありません）",
+          description: "設定する",
+        },
+        { id: "option_2", label: "外部操作を拒否・保留", description: "保留する" },
+      ],
+      allowsOther: false,
+    },
+  });
+
+  const rendered = JSON.stringify(updates.find((update) => update.ts === "102.1")?.blocks);
+  assert.match(String(posts[1]?.text), /Git承認ではありません/u);
+  assert.match(rendered, /workspace-gitのGit承認ではありません/u);
+  assert.match(rendered, /Git承認状態を変更しません/u);
+  assert.match(rendered, /external_action_confirmation/u);
+  assert.doesNotMatch(rendered, /taishi\.git_plan/u);
+});
+
 test("replaces an externally resolved ordinary choice with a new-turn continuation", async () => {
   const { client, updates } = recordingClient();
   const store = new StructuredChoiceContinuationStore(
@@ -682,11 +742,16 @@ test("replaces an externally resolved ordinary choice with a new-turn continuati
     }],
     question: {
       id: "question_1",
-      header: "公開設定",
-      prompt: "main保護を設定しますか？",
+      purpose: "ordinary",
+      header: "公開方針",
+      prompt: "公開設定案を作りますか？",
       options: [
-        { id: "option_1", label: "承認して実行", description: "設定する" },
-        { id: "option_2", label: "拒否・保留", description: "設定しない" },
+        {
+          id: "option_1",
+          label: "設定案を作る",
+          description: "変更は実行しない",
+        },
+        { id: "option_2", label: "保留する", description: "今回は進めない" },
       ],
       allowsOther: false,
     },
@@ -703,10 +768,73 @@ test("replaces an externally resolved ordinary choice with a new-turn continuati
   }]);
   const terminalUpdate = updates.at(-1);
   assert.equal(terminalUpdate?.ts, "102.1");
+  assert.match(String(terminalUpdate?.text), /通常の新しいターン/u);
   const rendered = JSON.stringify(terminalUpdate?.blocks);
   assert.match(rendered, /通常の新しいターン/u);
+  assert.match(rendered, /設定案を作る/u);
   assert.match(rendered, /taishi\.choice_continue\.select\.option_1/u);
   assert.doesNotMatch(rendered, /codex-choice:/u);
+});
+
+test("terminalizes an externally resolved external approval without continuation buttons", async () => {
+  const { client, updates } = recordingClient();
+  const audit: InteractionAuditInput[] = [];
+  const store = new StructuredChoiceContinuationStore(
+    () => Date.parse("2026-08-27T00:00:00.000Z"),
+  );
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    choiceContinuationStore: store,
+    interactionAudit: (event) => audit.push(event),
+  });
+  projector.setSessionId("session_1");
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111113";
+
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: "2026-08-27T00:10:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "外部操作の最終確認",
+      prompt: "対象を変更しますか？",
+      options: [
+        {
+          id: "option_1",
+          label: "外部操作を承認（Git承認ではありません）",
+          description: "実行する",
+        },
+        {
+          id: "option_2",
+          label: "外部操作を拒否・保留",
+          description: "実行しない",
+        },
+      ],
+      allowsOther: false,
+    },
+  });
+  await projector.project({ type: "choice.resolved_externally", requestId });
+
+  assert.equal(store.getForOriginalRequest(requestId), undefined);
+  assert.equal(store.getDisplayed(requestId), undefined);
+  const terminalUpdate = updates.at(-1);
+  assert.equal(terminalUpdate?.ts, "102.1");
+  assert.match(String(terminalUpdate?.text), /未承認として閉じました/u);
+  assert.match(String(terminalUpdate?.text), /新しい最終承認が必要/u);
+  assert.deepEqual(terminalUpdate?.blocks, []);
+  assert.deepEqual(
+    audit.map(({ event }) => event),
+    [
+      "choice.request_received",
+      "choice.card_posted",
+      "choice.controls_attached",
+      "choice.resolved_externally",
+      "choice.card_terminalized",
+    ],
+  );
+  assert.ok(audit.every((entry) => entry.requestId === requestId));
 });
 
 test("projects an exact workspace-git plan as Slack buttons in the originating thread", async () => {
@@ -748,12 +876,12 @@ test("projects an exact workspace-git plan as Slack buttons in the originating t
   });
 
   assert.equal(posts.length, 2);
+  assert.equal(updates.length, 0);
   const approvalPost = posts[1];
   assert.equal(approvalPost?.channel, "C1");
   assert.equal(approvalPost?.thread_ts, "100.0");
   assert.match(String(approvalPost?.text), /<@U123>$/u);
-  const approvalUpdate = updates.find((update) => update.ts === "102.1");
-  const blocks = JSON.stringify(approvalUpdate?.blocks);
+  const blocks = JSON.stringify(approvalPost?.blocks);
   assert.match(blocks, /承認して実行/u);
   assert.match(blocks, /拒否・保留/u);
   assert.match(blocks, /22222222-2222-4222-8222-222222222222/u);
@@ -761,7 +889,7 @@ test("projects an exact workspace-git plan as Slack buttons in the originating t
 });
 
 test("projects GitHub repository settings as an exact Slack approval card", async () => {
-  const { client, posts, updates } = recordingClient();
+  const { client, posts } = recordingClient();
   const projector = new SlackThreadProjector(client, "C1", "100.0", {
     sourceUserId: "U123",
     gitApprovalDetailsStore: new WorkspaceGitApprovalDetailsStore(),
@@ -803,13 +931,47 @@ test("projects GitHub repository settings as an exact Slack approval card", asyn
   });
 
   assert.equal(posts.length, 2);
-  const approvalUpdate = updates.find((update) => update.ts === "102.1");
-  const rendered = JSON.stringify(approvalUpdate?.blocks);
+  const rendered = JSON.stringify(posts[1]?.blocks);
   assert.match(rendered, /GitHub Repository設定を変更/u);
   assert.match(rendered, /Old description/u);
   assert.match(rendered, /New description/u);
   assert.match(rendered, /承認して実行/u);
   assert.doesNotMatch(rendered, /変更ファイル|Branch|Worktree/u);
+});
+
+test("projects terminal and blocked Git automation without approval buttons", async () => {
+  const { client, posts } = recordingClient();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+  });
+  const plan = {
+    operationId: "11111111-1111-4111-8111-111111111111",
+    planHash: "a".repeat(64),
+    approvalTarget: "primary",
+    operation: "git_publication" as const,
+    repoId: "showtalk-taishi",
+    mode: "commit_only" as const,
+    branch: "agent/provider",
+    paths: ["src/runtime.ts"],
+    expectedHead: "b".repeat(40),
+    expectedSnapshotId: "c".repeat(64),
+    worktreeId: "primary",
+    commitMessage: "Wire provider",
+    expiresAt: "2099-08-26T20:00:00+09:00",
+  };
+
+  await projector.project({ type: "git_automation.executed", plan });
+  await projector.project({
+    type: "git_automation.blocked",
+    plan,
+    reason: "outcome_unknown",
+  });
+
+  assert.equal(posts.length, 2);
+  assert.match(String(posts[0]?.text), /Git自動運転が完了/u);
+  assert.match(String(posts[1]?.text), /Git自動運転を安全停止/u);
+  assert.match(String(posts[1]?.text), /manual承認にも切り替えていません/u);
+  assert.ok(posts.every((post) => post.blocks === undefined));
 });
 
 test("projects Git approvals with the file list collapsed when toggle state is available", async () => {
@@ -852,8 +1014,7 @@ test("projects Git approvals with the file list collapsed when toggle state is a
 
   const approvalPost = posts[1];
   assert.ok(approvalPost);
-  const approvalUpdate = updates.find((update) => update.ts === "102.1");
-  const rendered = JSON.stringify(approvalUpdate?.blocks);
+  const rendered = JSON.stringify(approvalPost.blocks);
   assert.match(rendered, /変更ファイルを表示/u);
   assert.match(rendered, /PR本文を表示/u);
   assert.match(rendered, /2件/u);

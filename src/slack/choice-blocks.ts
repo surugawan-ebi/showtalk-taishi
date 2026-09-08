@@ -11,6 +11,7 @@ export interface ChoiceActionRouting {
   readonly version: 1;
   readonly requestId: string;
   readonly questionId: string;
+  readonly purpose?: "external_action_confirmation";
   readonly channelId: string;
   readonly rootThreadTs: string;
   readonly messageTs: string;
@@ -29,6 +30,10 @@ export function buildChoiceBlocks(
   question: AgentChoiceQuestion,
   routing: ChoiceActionRouting,
 ): KnownBlock[] {
+  const actionRouting: ChoiceActionRouting =
+    question.purpose === "external_action_confirmation"
+      ? { ...routing, purpose: "external_action_confirmation" }
+      : routing;
   const optionDetails = question.options
     .map((option) => {
       const description = option.description.trim();
@@ -38,6 +43,9 @@ export function buildChoiceBlocks(
     })
     .join("\n");
   const body = [
+    question.purpose === "external_action_confirmation"
+      ? "*外部操作の確認（workspace-gitのGit承認ではありません）*\nこの回答はworkspace-gitのGit操作を承認せず、Git承認状態を変更しません。"
+      : "",
     `*${escapeSlack(question.header)}*`,
     escapeSlack(question.prompt),
     optionDetails,
@@ -50,14 +58,14 @@ export function buildChoiceBlocks(
       emoji: true,
     },
     action_id: `${CHOICE_ACTION_PREFIX}select.${option.id}`,
-    value: encodeChoiceActionValue({ ...routing, optionId: option.id }),
+    value: encodeChoiceActionValue({ ...actionRouting, optionId: option.id }),
   }));
   if (question.allowsOther) {
     elements.push({
       type: "button",
       text: { type: "plain_text", text: "その他を入力", emoji: true },
       action_id: `${CHOICE_ACTION_PREFIX}other`,
-      value: encodeChoiceActionValue(routing),
+      value: encodeChoiceActionValue(actionRouting),
     });
   }
   return [
@@ -126,6 +134,7 @@ export function parseChoiceActionValue(value: string): ChoiceActionValue {
   const record = asRecord(parsed);
   const expectedKeys =
     6 +
+    (record?.purpose === undefined ? 0 : 1) +
     (record?.responderUserId === undefined ? 0 : 1) +
     (record?.optionId === undefined ? 0 : 1);
   if (
@@ -135,6 +144,8 @@ export function parseChoiceActionValue(value: string): ChoiceActionValue {
     !/^codex-choice:[0-9a-f-]{36}$/iu.test(record.requestId) ||
     typeof record.questionId !== "string" ||
     !/^question_[1-3]$/u.test(record.questionId) ||
+    (record.purpose !== undefined &&
+      record.purpose !== "external_action_confirmation") ||
     typeof record.channelId !== "string" ||
     !/^[CDG][A-Z0-9]{1,127}$/u.test(record.channelId) ||
     !isSlackTs(record.rootThreadTs) ||

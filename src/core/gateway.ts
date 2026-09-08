@@ -22,6 +22,9 @@ export interface HumanMessage {
   readonly text: string;
   readonly attachments?: readonly AgentInputAttachment[];
   readonly slackUserId?: string;
+  /** Authenticated Socket Mode envelope identities; adapter-private context only. */
+  readonly slackTeamId?: string;
+  readonly slackAppId?: string;
 }
 
 /** A completed routed turn that must be delivered after its caller turn ended. */
@@ -103,6 +106,21 @@ export class Gateway {
         ...(message.slackUserId === undefined
           ? {}
           : { slackUserId: message.slackUserId }),
+      },
+      metadata: {
+        showtalkAgentId: this.#registry.requireAgentByChannel(message.channelId).id,
+        showtalkChannelId: message.channelId,
+        showtalkRootThreadTs: message.rootThreadTs,
+        showtalkMessageTs: message.messageTs ?? message.rootThreadTs,
+        ...(message.slackUserId === undefined
+          ? {}
+          : { showtalkSlackUserId: message.slackUserId }),
+        ...(message.slackTeamId === undefined
+          ? {}
+          : { showtalkSlackTeamId: message.slackTeamId }),
+        ...(message.slackAppId === undefined
+          ? {}
+          : { showtalkSlackAppId: message.slackAppId }),
       },
     });
   }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { CodexAdapter, type CodexAppServer } from "../../../src/adapters/codex/adapter.js";
@@ -11,12 +12,24 @@ import {
   AgentWorkspaceUnavailableError,
 } from "../../../src/core/index.js";
 import type { ServerRequestEvent } from "../../../src/adapters/codex/app-server-client.js";
+import { buildCodexMcpThreadConfig } from "../../../src/adapters/codex/mcp-config.js";
 import { CodexRpcError } from "../../../src/adapters/codex/protocol.js";
+import type {
+  WorkspaceGitAutomationInput,
+  WorkspaceGitAutomationProvider,
+  WorkspaceGitAutomationResult,
+} from "../../../src/approvals/workspace-git-automation-provider.js";
+import {
+  AppOpsApprovalProofBroker,
+  type AppOpsApprovalProofPlan,
+} from "../../../src/approvals/appops-approval-proof.js";
 import type {
   CodexThread,
   CodexTurn,
   CommandApprovalDecision,
   FileChangeApprovalDecision,
+  ModelListParams,
+  ModelListResponse,
   PermissionsApprovalResponse,
   RpcError,
   RpcId,
@@ -37,7 +50,12 @@ class FakeAppServer implements CodexAppServer {
     id: RpcId;
     response: PermissionsApprovalResponse;
   }> = [];
-  readonly errorResponses: Array<{ id: RpcId; code: number; message: string }> = [];
+  readonly errorResponses: Array<{
+    id: RpcId;
+    code: number;
+    message: string;
+    data?: unknown;
+  }> = [];
   readonly userInputResponses: Array<{
     id: RpcId;
     response: ToolRequestUserInputResponse;
@@ -45,10 +63,13 @@ class FakeAppServer implements CodexAppServer {
   readonly unsubscribeCalls: string[] = [];
   readonly readThreadIncludeTurns: boolean[] = [];
   readonly listTurnsParams: ThreadTurnsListParams[] = [];
+  readonly modelListParams: ModelListParams[] = [];
   readonly hydratedTurns = new Map<string, CodexTurn>();
   readCalls = 0;
   listTurnsCalls = 0;
   threadStatusType = "idle";
+  readonly threadStatusSequence: string[] = [];
+  readonly resumeThreadStatusSequence: string[] = [];
   threadHistoryMode: CodexThread["historyMode"];
   readFailures = 0;
   listTurnsFailures = 0;
@@ -60,6 +81,7 @@ class FakeAppServer implements CodexAppServer {
   readonly turnStatuses = new Map<string, CodexTurn["status"]>();
   readonly interruptCalls: Array<{ threadId: string; turnId: string }> = [];
   startTurnBehavior?: (params: TurnStartParams) => Promise<CodexTurn>;
+  onListTurns?: (callCount: number) => void;
   interruptFailures = 0;
   userInputResponseError: Error | undefined;
   closed = false;
@@ -97,8 +119,10 @@ class FakeAppServer implements CodexAppServer {
     if (this.rejectResumeWithoutExcludeTurns && params.excludeTurns !== true) {
       throw new Error("legacy resume failed");
     }
+    const statusType = this.resumeThreadStatusSequence.shift();
     return {
       id: params.threadId,
+      ...(statusType === undefined ? {} : { status: { type: statusType } }),
       ...(this.threadHistoryMode === undefined
         ? {}
         : { historyMode: this.threadHistoryMode }),
@@ -112,9 +136,11 @@ class FakeAppServer implements CodexAppServer {
       this.readFailures -= 1;
       throw new Error("transient read failure");
     }
+    const threadStatusType =
+      this.threadStatusSequence.shift() ?? this.threadStatusType;
     return {
       id: threadId,
-      status: { type: this.threadStatusType },
+      status: { type: threadStatusType },
       ...(this.threadHistoryMode === undefined
         ? {}
         : { historyMode: this.threadHistoryMode }),
@@ -124,9 +150,9 @@ class FakeAppServer implements CodexAppServer {
               const id = `turn_${index + 1}`;
               const hydrated = this.hydratedTurns.get(id);
               if (hydrated !== undefined) return hydrated;
-              const inferred = this.threadStatusType === "active"
+              const inferred = threadStatusType === "active"
                 ? "inProgress"
-                : this.threadStatusType === "systemError"
+                : threadStatusType === "systemError"
                   ? "failed"
                   : "completed";
               return {
@@ -145,6 +171,7 @@ class FakeAppServer implements CodexAppServer {
   ): Promise<ThreadTurnsListResponse> {
     this.listTurnsCalls += 1;
     this.listTurnsParams.push(params);
+    this.onListTurns?.(this.listTurnsCalls);
     if (this.rejectTurnPaginationAsUnsupported) {
       throw new CodexRpcError(
         "paginated_threads is not supported yet",
@@ -174,6 +201,27 @@ class FakeAppServer implements CodexAppServer {
       }),
       nextCursor: null,
       backwardsCursor: null,
+    };
+  }
+
+  async listModels(params: ModelListParams = {}): Promise<ModelListResponse> {
+    this.modelListParams.push(params);
+    return {
+      data: [{
+        id: "model_default",
+        model: "gpt-test-default",
+        displayName: "Test default",
+        description: "Synthetic test model",
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: [{
+          reasoningEffort: "medium",
+          description: "Medium",
+        }],
+        inputModalities: ["text"],
+      }],
+      nextCursor: null,
     };
   }
 
@@ -223,7 +271,12 @@ class FakeAppServer implements CodexAppServer {
   }
 
   respondError(id: RpcId, error: RpcError): void {
-    this.errorResponses.push({ id, code: error.code, message: error.message });
+    this.errorResponses.push({
+      id,
+      code: error.code,
+      message: error.message,
+      ...(error.data === undefined ? {} : { data: error.data }),
+    });
   }
 
   onNotification(listener: (method: string, params: unknown) => void): () => void {
@@ -300,6 +353,33 @@ function workspaceGitQuestionForTurn(turnId: string) {
   };
 }
 
+function automationSlackRequest(text: string) {
+  return {
+    text,
+    source: { type: "human" as const, slackUserId: "U0123456789" },
+    metadata: {
+      showtalkSlackTeamId: "T0123456789",
+      showtalkSlackAppId: "A0123456789",
+      showtalkChannelId: "C0123456789",
+      showtalkRootThreadTs: "1700000000.000001",
+      showtalkMessageTs: "1700000000.000002",
+      showtalkSlackUserId: "U0123456789",
+    },
+  };
+}
+
+function automationProvider(
+  execute: (
+    input: WorkspaceGitAutomationInput,
+  ) => Promise<WorkspaceGitAutomationResult>,
+): WorkspaceGitAutomationProvider {
+  return {
+    contract_version: 1,
+    id: "test-provider",
+    executePreparedPlan: execute,
+  };
+}
+
 function ordinaryChoiceQuestion(
   questions: readonly Record<string, unknown>[] = [
     {
@@ -326,6 +406,94 @@ function ordinaryChoiceQuestion(
   };
 }
 
+function externalActionQuestion(
+  options: readonly { readonly label: string; readonly description: string }[] = [
+    { label: "承認して実行", description: "指定workerを再検証して1回再起動する" },
+    { label: "拒否・保留", description: "workerを再起動せず現状を維持する" },
+  ],
+) {
+  const params = workspaceGitQuestion();
+  const question = params.questions[0];
+  assert.ok(question);
+  return {
+    ...params,
+    questions: [{
+      ...question,
+      id: "external_action_approval",
+      header: "Gateway restart",
+      question: [
+        "Target: ShowTalk Taishi Gateway worker",
+        "Scope: 現在稼働中のworkerを1回だけ置換",
+        "Impact: 処理中requestをdrain後、短時間Slack応答が停止",
+      ].join("\n"),
+      options,
+    }],
+  };
+}
+
+function notifyAppOpsPlan(server: FakeAppServer) {
+  const operationId = "55555555-5555-4555-8555-555555555555";
+  const plan = {
+    operation: "build_upload",
+    app_id: "app07",
+    apple_id: "1234567890",
+    bundle_id: "com.example.app07",
+    artifact: {
+      source: { kind: "local", relative_path: "app07/release.ipa" },
+      file_name: "release.ipa",
+      size_bytes: 1234,
+      sha256: "b".repeat(64),
+      bundle_id: "com.example.app07",
+      version: "1.2.3",
+      build_number: "45",
+    },
+    localized_metadata_write: false,
+    screenshots_write: false,
+    release_type: "unchanged",
+  };
+  const planHash = createHash("sha256").update(JSON.stringify(plan)).digest("hex");
+  const executeTool = "execute_approved_app_store_build_upload";
+  const approvalPrompt = [
+    "Target: AppOps app_id=app07 bundle_id=com.example.app07",
+    `Scope: ${executeTool} operation_id=${operationId} plan_hash=${planHash} version=1.2.3 build=45 artifact_sha256=${"b".repeat(64)}`,
+    "Impact: App Store build_upload external write; metadata/screenshots unchanged; one execution only",
+  ].join("\n");
+  const item = {
+    type: "mcpToolCall",
+    id: "appops-plan-1",
+    server: "appops",
+    tool: "prepare_app_store_build_upload",
+    arguments: { app_id: "app07", artifact_path: "app07/release.ipa" },
+  };
+  server.notify("item/started", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: { ...item, status: "inProgress" },
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: {
+      ...item,
+      status: "completed",
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          external_write: false,
+          approval_scope: "build_upload",
+          approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
+          operation_id: operationId,
+          plan_hash: planHash,
+          plan,
+          approval_prompt: approvalPrompt,
+          execute_tool: executeTool,
+        },
+      },
+    },
+  });
+  return { operationId, planHash, executeTool, approvalPrompt };
+}
+
 function notifyPublicationPlan(
   server: FakeAppServer,
   overrides: {
@@ -334,6 +502,7 @@ function notifyPublicationPlan(
     readonly operationId?: string;
     readonly planHash?: string;
     readonly expiresAt?: string;
+    readonly environment?: string;
   } = {},
 ): void {
   const itemId = overrides.itemId ?? "mcp-plan-1";
@@ -346,6 +515,9 @@ function notifyPublicationPlan(
     expected_head: "b".repeat(40),
     expected_snapshot_id: "c".repeat(64),
     paths: ["src/core/gateway.ts", "README.md"],
+    ...(overrides.environment === undefined
+      ? {}
+      : { environment: overrides.environment }),
     pr: {
       title: "Add Slack Git approval buttons",
       body: "Render an exact pending plan and accept only fixed Block Kit actions.",
@@ -379,7 +551,6 @@ function notifyPublicationPlan(
           status: "awaiting_human_approval",
           operation_id:
             overrides.operationId ?? "11111111-1111-4111-8111-111111111111",
-          approval_authority_id: "e".repeat(64),
           approval_expires_at:
             overrides.expiresAt ?? new Date(Date.now() + 60_000).toISOString(),
           scope: {
@@ -405,6 +576,17 @@ function notifyPublicationPlan(
                 "Render an exact pending plan and accept only fixed Block Kit actions.",
             },
             pr_base_branch: "main",
+          },
+          autonomous_scope: {
+            repo_id: "showtalk-taishi",
+            environment: "development",
+            branch: "agent/slack-git-approval",
+            target: "primary",
+            capabilities: ["commit", "push", "draft_pr"],
+            paths: ["src/core/gateway.ts", "README.md"],
+            total_bytes: 4096,
+            expected_head: "b".repeat(40),
+            expected_snapshot_id: "c".repeat(64),
           },
           plan_hash: overrides.planHash ?? "a".repeat(64),
           execute_tool: "execute_approved_git_publication",
@@ -444,7 +626,6 @@ function notifyRepositorySettingsPlan(server: FakeAppServer): void {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "33333333-3333-4333-8333-333333333333",
-          approval_authority_id: "e".repeat(64),
           approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
           scope: {
             repo_id: "showtalk-taishi",
@@ -513,6 +694,7 @@ function notifyPublicationExecution(
     readonly turnId?: string;
     readonly operationId?: string;
     readonly status?: "completed" | "failed";
+    readonly outcomeStatus?: string;
   } = {},
 ): void {
   const turnId = overrides.turnId ?? "turn_1";
@@ -532,7 +714,7 @@ function notifyPublicationExecution(
         structuredContent: {
           operation_id:
             overrides.operationId ?? "11111111-1111-4111-8111-111111111111",
-          status: "executed",
+          status: overrides.outcomeStatus ?? "executed",
         },
       },
     },
@@ -653,7 +835,6 @@ function notifyInitialPushPlan(server: FakeAppServer): void {
         structuredContent: {
           status: "awaiting_human_approval",
           operation_id: "33333333-3333-4333-8333-333333333333",
-          approval_authority_id: "e".repeat(64),
           approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
           scope: {
             repo_id: "empty-example-repo",
@@ -700,7 +881,11 @@ test("creates a Codex thread with workspace and role instructions", async () => 
   assert.equal(server.threadStarts[0]?.serviceName, "showtalk_taishi");
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
-    /^Implement carefully\.\n\nShowTalk Taishi Koe consultation rules:/u,
+    /^Implement carefully\.\n\n# ShowTalk Slack artifact delivery/u,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /local Markdown link.*not an attachment.*slack\.reply tool with attachments.*omit both channel and thread_ts.*explicit request.*authorizes.*omit message.*do not request a separate attachment approval.*Do not claim.*returns success/su,
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -716,7 +901,35 @@ test("creates a Codex thread with workspace and role instructions", async () => 
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
-    /labels alone never create workspace-git authority.*external write.*exact target.*scope.*impact/su,
+    /direct MCP tools.*Never invoke them through functions\.exec.*cannot bind nested or model-forwarded output as approval authority/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /ordinary decisions flexible.*two or three task-specific options.*separate final confirmation/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /external.*request_user_input as a direct tool call.*never from functions\.exec.*answers: \{\}/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /answers: \{\}.*do not execute.*agent\.send.*showtalk.*bounded diagnosis and fix/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /external_action_approval.*exactly two options in this order.*承認して実行.*Recommended.*拒否・保留.*non-empty descriptions.*Target:.*Scope:.*Impact:/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED.*exactly once in the same turn.*corrected structured input/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /EXTERNAL_ACTION_APPROVAL_REPAIR_EXHAUSTED.*stop requesting approval.*do not execute/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /multiple sequential external-action confirmations.*own blocking confirmation.*never grants blanket authority.*still awaiting its Slack answer/su,
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -1050,15 +1263,10 @@ test("records legacy compatibility only after fallback resume succeeds", async (
 
 test("attaches the required MCP config on both thread creation and resume", async () => {
   const server = new FakeAppServer();
-  const threadConfig = {
-    mcp_servers: {
-      showtalk_taishi: {
-        url: "http://127.0.0.1:3210/mcp",
-        bearer_token_env_var: "SHOWTALK_TAISHI_MCP_TOKEN",
-        required: true,
-      },
-    },
-  } as const;
+  const threadConfig = buildCodexMcpThreadConfig({
+    url: "http://127.0.0.1:3210/mcp",
+    bearerTokenEnvVar: "SHOWTALK_TAISHI_MCP_TOKEN",
+  });
   const adapter = new CodexAdapter(server, { threadConfig });
   const agent = {
     id: "implementer",
@@ -1070,6 +1278,12 @@ test("attaches the required MCP config on both thread creation and resume", asyn
 
   assert.deepEqual(server.threadStarts[0]?.config, threadConfig);
   assert.deepEqual(server.threadResumes[0]?.config, threadConfig);
+  assert.deepEqual(server.threadStarts[0]?.config?.features, {
+    code_mode: {
+      enabled: false,
+      direct_only_tool_namespaces: ["mcp__workspace_git"],
+    },
+  });
   assert.equal(server.threadStarts[0]?.approvalsReviewer, undefined);
   assert.equal(server.threadResumes[0]?.approvalsReviewer, undefined);
   assert.match(
@@ -1078,7 +1292,15 @@ test("attaches the required MCP config on both thread creation and resume", asyn
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
+    /direct MCP tools.*Never invoke them through functions\.exec.*cannot bind nested or model-forwarded output as approval authority/su,
+  );
+  assert.match(
+    server.threadResumes[0]?.developerInstructions ?? "",
     /Before the App Server receives `承認して実行`.*instead of ending with prose or deferring execution/su,
+  );
+  assert.match(
+    server.threadResumes[0]?.developerInstructions ?? "",
+    /external_action_approval.*Target:.*Scope:.*Impact:.*EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED/su,
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
@@ -1107,6 +1329,28 @@ test("applies an explicit reasoning effort to Codex turns", async () => {
   assert.equal(server.turnStarts[0]?.approvalPolicy, undefined);
   assert.equal(server.turnStarts[0]?.approvalsReviewer, undefined);
   assert.equal(server.turnStarts[0]?.effort, "low");
+  assert.deepEqual(server.turnStarts[0]?.collaborationMode, {
+    mode: "plan",
+    settings: {
+      model: "gpt-test-default",
+      reasoning_effort: "low",
+      developer_instructions: server.turnStarts[0]?.collaborationMode
+        ?.settings.developer_instructions,
+    },
+  });
+  assert.match(
+    server.turnStarts[0]?.collaborationMode?.settings.developer_instructions ?? "",
+    /execution turn, not a planning-only turn.*request_user_input can block.*update_plan.*explicit new ShowTalk turn/su,
+  );
+  assert.match(
+    server.turnStarts[0]?.collaborationMode?.settings.developer_instructions ?? "",
+    /external.*request_user_input as a direct tool call.*never from functions\.exec.*answers: \{\}/su,
+  );
+  assert.match(
+    server.turnStarts[0]?.collaborationMode?.settings.developer_instructions ?? "",
+    /local Markdown link.*not an attachment.*slack\.reply tool with attachments.*omit both channel and thread_ts.*explicit request.*authorizes.*omit message.*do not request a separate attachment approval.*Do not claim.*returns success/su,
+  );
+  assert.equal(server.modelListParams.length, 1);
   server.notify("turn/completed", {
     threadId: "thr_1",
     turn: { id: "turn_1", status: "completed" },
@@ -1134,6 +1378,14 @@ test("applies hot model settings only to subsequent Codex turns", async () => {
   });
   assert.equal(server.turnStarts[0]?.model, "model-before");
   assert.equal(server.turnStarts[0]?.effort, "low");
+  assert.equal(
+    server.turnStarts[0]?.collaborationMode?.settings.model,
+    "model-before",
+  );
+  assert.equal(
+    server.turnStarts[0]?.collaborationMode?.settings.reasoning_effort,
+    "low",
+  );
   server.notify("turn/completed", {
     threadId: session.id,
     turn: { id: "turn_1", status: "completed" },
@@ -1149,6 +1401,14 @@ test("applies hot model settings only to subsequent Codex turns", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(server.turnStarts[1]?.model, "model-after");
   assert.equal(server.turnStarts[1]?.effort, "high");
+  assert.equal(
+    server.turnStarts[1]?.collaborationMode?.settings.model,
+    "model-after",
+  );
+  assert.equal(
+    server.turnStarts[1]?.collaborationMode?.settings.reasoning_effort,
+    "high",
+  );
   server.notify("turn/completed", {
     threadId: session.id,
     turn: { id: "turn_2", status: "completed" },
@@ -1165,6 +1425,14 @@ test("applies hot model settings only to subsequent Codex turns", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(server.turnStarts[2]?.model, undefined);
   assert.equal(server.turnStarts[2]?.effort, undefined);
+  assert.equal(
+    server.turnStarts[2]?.collaborationMode?.settings.model,
+    "gpt-test-default",
+  );
+  assert.equal(
+    server.turnStarts[2]?.collaborationMode?.settings.reasoning_effort,
+    "medium",
+  );
   server.notify("turn/completed", {
     threadId: session.id,
     turn: { id: "turn_3", status: "completed" },
@@ -1298,6 +1566,173 @@ test("releases and resumes the same Codex thread between turns", async () => {
   assert.equal(server.threadResumes.length, 1);
   assert.equal(server.threadResumes[0]?.threadId, session.id);
   assert.equal(server.threadResumes[0]?.cwd, "/tmp");
+});
+
+test("reuses the same Codex thread after a model capacity failure", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const agent = {
+    id: "implementer",
+    adapter: "codex",
+    channelId: "C123",
+  } as const;
+  const session = await adapter.createSession({
+    reason: "slack_conversation",
+    agent,
+  });
+
+  const failedTurn = collectEvents(
+    adapter.sendMessage(session, {
+      text: "Use the selected model",
+      source: { type: "human" },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("error", {
+    threadId: session.id,
+    turnId: "turn_1",
+    error: { message: "Selected model is at capacity. Please try a different model." },
+    willRetry: false,
+  });
+  server.threadStatusType = "systemError";
+  server.notify("turn/completed", {
+    threadId: session.id,
+    turn: { id: "turn_1", status: "failed" },
+  });
+  const failedEvents = await failedTurn;
+  assert.ok(failedEvents.some(
+    (event) =>
+      event.type === "error" &&
+      /Selected model is at capacity/u.test(event.message),
+  ));
+
+  const continuedTurn = collectEvents(
+    adapter.sendMessage(session, {
+      text: "Continue in the same Slack thread",
+      source: { type: "human" },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  server.threadStatusType = "idle";
+  server.notify("turn/completed", {
+    threadId: session.id,
+    turn: { id: "turn_2", status: "completed" },
+  });
+  await continuedTurn;
+
+  assert.equal(server.threadStarts.length, 1);
+  assert.equal(server.threadResumes.length, 1);
+  assert.equal(server.threadResumes[0]?.threadId, session.id);
+  assert.deepEqual(server.turnStarts.map(({ threadId }) => threadId), [
+    session.id,
+    session.id,
+  ]);
+});
+
+test("resumes the same capacity-failed Codex thread after an adapter restart", async () => {
+  const server = new FakeAppServer();
+  const agent = {
+    id: "implementer",
+    adapter: "codex",
+    channelId: "C123",
+  } as const;
+  const firstAdapter = new CodexAdapter(server);
+  const session = await firstAdapter.createSession({
+    reason: "slack_conversation",
+    agent,
+  });
+
+  const failedTurn = collectEvents(firstAdapter.sendMessage(session, {
+    text: "Use the selected model",
+    source: { type: "human" },
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("error", {
+    threadId: session.id,
+    turnId: "turn_1",
+    error: { message: "Selected model is at capacity. Please try a different model." },
+    willRetry: false,
+  });
+  server.threadStatusType = "systemError";
+  server.notify("turn/completed", {
+    threadId: session.id,
+    turn: { id: "turn_1", status: "failed" },
+  });
+  await failedTurn;
+
+  const restartedAdapter = new CodexAdapter(server);
+  const resumed = await restartedAdapter.resumeSession({
+    adapterSessionId: session.id,
+    agent,
+  });
+  assert.equal(resumed.id, session.id);
+
+  const continuedTurn = collectEvents(restartedAdapter.sendMessage(resumed, {
+    text: "Continue after the Gateway restart",
+    source: { type: "human" },
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  server.threadStatusType = "idle";
+  server.notify("turn/completed", {
+    threadId: session.id,
+    turn: { id: "turn_2", status: "completed" },
+  });
+  await continuedTurn;
+
+  assert.equal(server.threadStarts.length, 1);
+  assert.equal(server.threadResumes.at(-1)?.threadId, session.id);
+  assert.deepEqual(server.turnStarts.map(({ threadId }) => threadId), [
+    session.id,
+    session.id,
+  ]);
+});
+
+test("keeps the transport reusable while a capacity failure settles to systemError", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const agent = {
+    id: "implementer",
+    adapter: "codex",
+    channelId: "C123",
+  } as const;
+  const session = await adapter.createSession({
+    reason: "slack_conversation",
+    agent,
+  });
+  server.startTurnBehavior = async () => {
+    server.threadStatusSequence.push("active", "systemError");
+    throw new Error("Selected model is at capacity. Please try a different model.");
+  };
+
+  await assert.rejects(
+    collectEvents(adapter.sendMessage(session, {
+      text: "Use the selected model",
+      source: { type: "human" },
+    })),
+    /Selected model is at capacity/u,
+  );
+  assert.equal(server.threadStatusSequence.length, 0);
+  assert.equal(server.closed, false);
+
+  delete server.startTurnBehavior;
+  const continuedTurn = collectEvents(
+    adapter.sendMessage(session, {
+      text: "Try again in the same thread",
+      source: { type: "human" },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  server.threadStatusType = "idle";
+  server.notify("turn/completed", {
+    threadId: session.id,
+    turn: { id: "turn_2", status: "completed" },
+  });
+  await continuedTurn;
+
+  assert.equal(server.threadStarts.length, 1);
+  assert.equal(server.threadResumes.length, 1);
+  assert.equal(server.threadResumes[0]?.threadId, session.id);
+  assert.equal(server.closed, false);
 });
 
 test("ignores stale completion and approval requests from another turn", async () => {
@@ -1439,6 +1874,45 @@ test("queues a Slack turn until the external client becomes idle", async () => {
   assert.deepEqual(server.interruptCalls, []);
 });
 
+test("reapplies resume overrides after an active thread becomes idle", async () => {
+  const server = new FakeAppServer();
+  server.resumeThreadStatusSequence.push("active", "idle");
+  server.threadStatusType = "idle";
+  const adapter = new CodexAdapter(server, {
+    externalTurnPollMs: 1,
+    externalTurnWaitMs: 100,
+    threadConfig: buildCodexMcpThreadConfig({
+      url: "http://127.0.0.1:3210/mcp",
+      bearerTokenEnvVar: "SHOWTALK_TAISHI_MCP_TOKEN",
+    }),
+  });
+  const session = await adapter.resumeSession({
+    agent: { id: "implementer", adapter: "codex", channelId: "C123" },
+    adapterSessionId: "thr_1",
+  });
+
+  const consuming = collectEvents(adapter.sendMessage(session, {
+    text: "Run only after cold resume reapplies the tool config",
+    source: { type: "human" },
+  }));
+  while (server.turnStarts.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  server.notify("turn/completed", {
+    threadId: session.id,
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.equal(server.threadResumes.length, 2);
+  assert.deepEqual(
+    server.threadResumes.map((params) => params.config),
+    [server.threadResumes[0]?.config, server.threadResumes[0]?.config],
+  );
+  assert.deepEqual(server.unsubscribeCalls, [session.id, session.id]);
+  assert.equal(server.turnStarts.length, 1);
+});
+
 test("status inspection does not retain an idle thread subscription", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
@@ -1560,6 +2034,69 @@ test("normalizes completed generated images once for Slack projection", async ()
   assert.equal(generated[0]?.attachmentId, "generated-image-1");
   assert.equal(generated[0]?.attachment.mimeType, "image/png");
   assert.doesNotMatch(generated[0]?.attachment.name ?? "", /private|tmp/u);
+});
+
+test("projects completed dynamic-tool images once without retaining image data in tool output", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Capture the page", source: { type: "human" } },
+    )) {
+      events.push(event);
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  const imageData =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=";
+  const item = {
+    type: "dynamicToolCall",
+    id: "browser-screenshot-1",
+    namespace: "browser",
+    tool: "screenshot",
+    status: "completed",
+    success: true,
+    arguments: {},
+    contentItems: [
+      { type: "inputText", text: "sensitive tool text" },
+      { type: "inputImage", imageUrl: `data:image/png;base64,${imageData}` },
+    ],
+  };
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item,
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item,
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  const generated = events.filter(
+    (event): event is Extract<AgentEvent, { type: "attachment.generated" }> =>
+      event.type === "attachment.generated",
+  );
+  assert.equal(generated.length, 1);
+  assert.equal(generated[0]?.attachmentId, "browser-screenshot-1:image:1");
+  const completed = events.filter(
+    (event): event is Extract<AgentEvent, { type: "tool.completed" }> =>
+      event.type === "tool.completed" && event.toolCallId === "browser-screenshot-1",
+  );
+  assert.equal(completed.length, 2);
+  assert.deepEqual(completed[0]?.output, {
+    status: "completed",
+    success: true,
+    contentTypes: ["inputText", "inputImage"],
+  });
+  assert.doesNotMatch(JSON.stringify(completed), /sensitive tool text|iVBOR/u);
 });
 
 test("suppresses retrying App Server errors and emits only the final error", async () => {
@@ -2158,6 +2695,65 @@ test("bridges non-blocking ordinary structured choices from current Codex normal
   }]);
 });
 
+test("auto-selects the first option for every ordinary question when the Koe opts in", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, {
+    automaticChoiceMode: "ordinary_top_choice",
+  });
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "自動で選ぶ", source: { type: "human" } },
+    )) {
+      events.push(event);
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 905,
+    method: "item/tool/requestUserInput",
+    params: ordinaryChoiceQuestion([
+      ordinaryChoiceQuestion().questions[0]!,
+      {
+        id: "finish",
+        header: "仕上げ",
+        question: "表面の仕上げは？",
+        isOther: true,
+        isSecret: false,
+        options: [
+          { label: "粗い", description: "岩らしい表面" },
+          { label: "滑らか", description: "簡素な表面" },
+        ],
+      },
+    ]),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.equal(events.some((event) => event.type === "choice.requested"), false);
+  assert.deepEqual(
+    events.filter((event) => event.type === "choice.auto_selected"),
+    [
+      { type: "choice.auto_selected", header: "地形", optionLabel: "砂漠盆地" },
+      { type: "choice.auto_selected", header: "仕上げ", optionLabel: "粗い" },
+    ],
+  );
+  assert.deepEqual(server.userInputResponses, [{
+    id: 905,
+    response: {
+      answers: {
+        terrain: { answers: ["砂漠盆地"] },
+        finish: { answers: ["粗い"] },
+      },
+    },
+  }]);
+});
+
 test("terminalizes a non-blocking ordinary choice when App Server resolves it first", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
@@ -2219,9 +2815,9 @@ test("terminalizes a non-blocking ordinary choice when App Server resolves it fi
   assert.deepEqual(server.userInputResponses, []);
 });
 
-test("projects plan-less reserved labels as an ordinary external action", async () => {
+test("repairs a non-blocking external action before projecting its final approval", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 60_000 });
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
   const session = { id: "thr_1" };
   const events: AgentEvent[] = [];
   let releaseChoice!: () => void;
@@ -2235,10 +2831,26 @@ test("projects plan-less reserved labels as an ordinary external action", async 
     })) {
       events.push(event);
       if (event.type !== "choice.requested") continue;
-      assert.equal(event.question.header, "Git approval");
+      assert.equal(
+        event.question.header,
+        "外部操作の最終確認（Git承認ではありません）",
+      );
+      assert.equal(
+        event.question.prompt,
+        [
+          "対象: ShowTalk Taishi Gateway worker",
+          "範囲: 現在稼働中のworkerを1回だけ置換",
+          "影響: 処理中requestをdrain後、短時間Slack応答が停止",
+        ].join("\n"),
+      );
+      assert.equal(event.question.purpose, "external_action_confirmation");
+      assert.equal(event.question.allowsOther, false);
       assert.deepEqual(
         event.question.options.map((option) => option.label),
-        ["承認して実行", "拒否・保留"],
+        [
+          "外部操作を承認（Git承認ではありません）",
+          "外部操作を拒否・保留",
+        ],
       );
       releaseChoice();
       await adapter.respondToUserInput(session, {
@@ -2253,7 +2865,7 @@ test("projects plan-less reserved labels as an ordinary external action", async 
   })();
 
   await new Promise((resolve) => setImmediate(resolve));
-  const params = workspaceGitQuestion();
+  const params = externalActionQuestion();
   const question = params.questions[0];
   assert.ok(question);
   server.request({
@@ -2261,7 +2873,22 @@ test("projects plan-less reserved labels as an ordinary external action", async 
     method: "item/tool/requestUserInput",
     params: {
       ...params,
-      questions: [{ ...question, id: "main_protection" }],
+      isBlocking: false,
+      questions: [{
+        ...question,
+        isOther: true,
+      }],
+    },
+  });
+  server.request({
+    id: 903,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{
+        ...question,
+        isOther: true,
+      }],
     },
   });
   await Promise.race([
@@ -2283,30 +2910,35 @@ test("projects plan-less reserved labels as an ordinary external action", async 
     events.some((event) => event.type === "user_input.requested"),
     false,
   );
-  assert.deepEqual(server.errorResponses, []);
+  assert.equal(server.errorResponses.length, 1);
+  assert.equal(server.errorResponses[0]?.id, 902);
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED.*isBlocking must be true/su,
+  );
   assert.deepEqual(server.userInputResponses, [{
-    id: 902,
+    id: 903,
     response: {
-      answers: { main_protection: { answers: ["承認して実行"] } },
+      answers: { external_action_approval: { answers: ["承認して実行"] } },
     },
   }]);
 });
 
-test("keeps an exact plan on the Git path with an ordinary question ID", async () => {
+test("repairs one malformed external-action confirmation without a Slack error", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server);
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
   const session = { id: "thr_1" };
   const events: AgentEvent[] = [];
   const consuming = (async () => {
     for await (const event of adapter.sendMessage(session, {
-      text: "公開計画を確認する",
+      text: "外部操作の方針を選んでから最終確認する",
       source: { type: "human" },
     })) {
       events.push(event);
-      if (event.type !== "user_input.requested") continue;
+      if (event.type !== "choice.requested") continue;
       await adapter.respondToUserInput(session, {
         requestId: event.requestId,
-        optionId: "reject",
+        answer: { questionId: event.question.id, optionId: "option_1" },
       });
       server.notify("turn/completed", {
         threadId: "thr_1",
@@ -2314,6 +2946,632 @@ test("keeps an exact plan on the Git path with an ordinary question ID", async (
       });
     }
   })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const params = externalActionQuestion();
+  const question = params.questions[0];
+  assert.ok(question);
+  server.request({
+    id: 907,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{
+        ...question,
+        options: [
+          { label: "再起動する (Recommended)", description: "Gatewayを再起動する" },
+          { label: "今回は保留", description: "変更しない" },
+        ],
+      }],
+    },
+  });
+  server.request({
+    id: 908,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{ ...question }],
+    },
+  });
+  await consuming;
+
+  assert.equal(server.errorResponses.length, 1);
+  assert.equal(server.errorResponses[0]?.id, 907);
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED.*exactly once.*direct tool call.*never through functions\.exec.*external_action_approval.*承認して実行.*Recommended.*拒否・保留/su,
+  );
+  assert.deepEqual(server.errorResponses[0]?.data, {
+    recovery: "retry_external_action_approval",
+    attempt: 1,
+    questionId: "external_action_approval",
+    requiredQuestionFields: ["Target", "Scope", "Impact"],
+    requiredOptionLabels: ["承認して実行", "拒否・保留"],
+    requireNonEmptyDescriptions: true,
+    requireBlocking: true,
+    forbidOtherAnswer: true,
+    forbidSecret: true,
+  });
+  assert.equal(
+    events.some(
+      (event) => event.type === "error" &&
+        event.code === "UNSUPPORTED_STRUCTURED_INPUT",
+    ),
+    false,
+  );
+  assert.deepEqual(server.userInputResponses, [{
+    id: 908,
+    response: {
+      answers: { external_action_approval: { answers: ["承認して実行"] } },
+    },
+  }]);
+});
+
+test("accepts the Codex-recommended suffix and returns a canonical approval", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const session = { id: "thr_1" };
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "外部操作を最終確認する",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "choice.requested") continue;
+      assert.equal(
+        event.question.options[0]?.label,
+        "外部操作を承認（Git承認ではありません）",
+      );
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId: "option_1" },
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 913,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion([
+      {
+        label: "承認して実行 (Recommended)",
+        description: "指定workerを再検証して1回再起動する",
+      },
+      { label: "拒否・保留", description: "workerを再起動しない" },
+    ]),
+  });
+  await consuming;
+
+  assert.deepEqual(server.errorResponses, []);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 913,
+    response: {
+      answers: { external_action_approval: { answers: ["承認して実行"] } },
+    },
+  }]);
+});
+
+test("binds an AppOps prepare to Slack approval, issues one proof, and redacts it", async () => {
+  const server = new FakeAppServer();
+  const issued: AppOpsApprovalProofPlan[] = [];
+  const broker = new AppOpsApprovalProofBroker();
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    gitPlanBindingGraceMs: 10,
+    appOpsApprovalProofBroker: broker,
+    appOpsApprovalProofSigner: {
+      keyId: "test-key",
+      publicKeyPem: "public-only-test-value",
+      issue: (plan) => {
+        issued.push(plan);
+        return "opaque-appops-proof";
+      },
+    },
+  });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "prepare済みAppOps操作を確認する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "choice.requested") continue;
+      assert.match(event.question.prompt, /bundle_id=com\.example\.app07/u);
+      assert.match(event.question.prompt, /artifact_sha256=/u);
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId: "option_1" },
+      });
+      const hookDecision = broker.consume("implementer", {
+        sessionId: "thr_1",
+        turnId: "turn_1",
+        toolName: "mcp__appops__execute_approved_app_store_build_upload",
+        toolUseId: "appops-execute-1",
+        toolInput: {
+          app_id: "app07",
+          operation_id: issued[0]?.operationId,
+        },
+      });
+      assert.equal(hookDecision.kind, "allow");
+      if (hookDecision.kind !== "allow") return;
+      server.notify("item/started", {
+        threadId: "thr_1",
+        turnId: "turn_1",
+        item: {
+          type: "mcpToolCall",
+          id: "appops-execute-1",
+          server: "appops",
+          tool: "execute_approved_app_store_build_upload",
+          status: "inProgress",
+          arguments: hookDecision.updatedInput,
+        },
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const prepared = notifyAppOpsPlan(server);
+  server.request({
+    id: 916,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...externalActionQuestion(),
+      questions: [{
+        ...externalActionQuestion().questions[0]!,
+        header: "AppOps Store operation",
+        question: prepared.approvalPrompt,
+      }],
+    },
+  });
+  await consuming;
+
+  assert.equal(issued.length, 1);
+  assert.equal(issued[0]?.operationId, prepared.operationId);
+  assert.equal(issued[0]?.planHash, prepared.planHash);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 916,
+    response: {
+      answers: {
+        external_action_approval: { answers: ["承認して実行"] },
+      },
+    },
+  }]);
+  const executeStarted = events.find(
+    (event) => event.type === "tool.started" &&
+      event.name === "appops.execute_approved_app_store_build_upload",
+  );
+  assert.ok(executeStarted?.type === "tool.started");
+  assert.equal(
+    (executeStarted.input as Record<string, unknown>).approval_proof,
+    "<redacted-approval-proof>",
+  );
+  assert.doesNotMatch(JSON.stringify(events), /opaque-appops-proof/u);
+});
+
+test("does not issue an AppOps proof when the bound confirmation is rejected", async () => {
+  const server = new FakeAppServer();
+  let issueCount = 0;
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    gitPlanBindingGraceMs: 10,
+    appOpsApprovalProofBroker: new AppOpsApprovalProofBroker(),
+    appOpsApprovalProofSigner: {
+      keyId: "test-key",
+      publicKeyPem: "public-only-test-value",
+      issue: () => {
+        issueCount += 1;
+        return "must-not-be-issued";
+      },
+    },
+  });
+  const session = { id: "thr_1" };
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "AppOps操作を拒否する",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "choice.requested") continue;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId: "option_2" },
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  const prepared = notifyAppOpsPlan(server);
+  server.request({
+    id: 917,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...externalActionQuestion(),
+      questions: [{
+        ...externalActionQuestion().questions[0]!,
+        header: "AppOps Store operation",
+        question: prepared.approvalPrompt,
+      }],
+    },
+  });
+  await consuming;
+  assert.equal(issueCount, 0);
+  assert.deepEqual(server.userInputResponses[0]?.response.answers, {
+    external_action_approval: { answers: ["拒否・保留"] },
+  });
+});
+
+test("rejects a concurrent external-action confirmation while one is pending", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const session = { id: "thr_1" };
+  const choices: Array<Extract<AgentEvent, { type: "choice.requested" }>> = [];
+  let releaseChoice!: () => void;
+  const choiceReady = new Promise<void>((resolve) => {
+    releaseChoice = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "外部操作を一度だけ確認する",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "choice.requested") continue;
+      choices.push(event);
+      releaseChoice();
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 914,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  await choiceReady;
+  server.request({
+    id: 915,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.equal(choices.length, 1);
+  assert.match(
+    server.errorResponses.find(({ id }) => id === 915)?.message ?? "",
+    /EXTERNAL_ACTION_APPROVAL_ALREADY_PENDING/u,
+  );
+  await adapter.respondToUserInput(session, {
+    requestId: choices[0]!.requestId,
+    answer: { questionId: choices[0]!.question.id, optionId: "option_2" },
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.equal(choices.length, 1);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 914,
+    response: {
+      answers: { external_action_approval: { answers: ["拒否・保留"] } },
+    },
+  }]);
+});
+
+test("projects multiple sequential external-action confirmations per turn", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const session = { id: "thr_1" };
+  const choices: Array<Extract<AgentEvent, { type: "choice.requested" }>> = [];
+  let releaseFirstAnswer!: () => void;
+  let releaseSecondAnswer!: () => void;
+  const firstAnswered = new Promise<void>((resolve) => {
+    releaseFirstAnswer = resolve;
+  });
+  const secondAnswered = new Promise<void>((resolve) => {
+    releaseSecondAnswer = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "外部操作を順番に確認する",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "choice.requested") continue;
+      choices.push(event);
+      const optionId = choices.length === 1 ? "option_1" : "option_2";
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        answer: { questionId: event.question.id, optionId },
+      });
+      if (choices.length === 1) {
+        releaseFirstAnswer();
+      } else {
+        releaseSecondAnswer();
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed" },
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 916,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  await firstAnswered;
+  server.request({
+    id: 917,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  await secondAnswered;
+  await consuming;
+
+  assert.equal(choices.length, 2);
+  assert.deepEqual(server.errorResponses, []);
+  assert.deepEqual(server.userInputResponses, [
+    {
+      id: 916,
+      response: {
+        answers: { external_action_approval: { answers: ["承認して実行"] } },
+      },
+    },
+    {
+      id: 917,
+      response: {
+        answers: { external_action_approval: { answers: ["拒否・保留"] } },
+      },
+    },
+  ]);
+});
+
+test("offers the same bounded repair for every external-action validation failure", async () => {
+  const base = externalActionQuestion();
+  const question = base.questions[0];
+  assert.ok(question);
+  const cases: readonly [string, unknown][] = [
+    ["blocking", { ...base, isBlocking: "yes" }],
+    ["non-blocking", { ...base, isBlocking: false }],
+    [
+      "secret",
+      { ...base, questions: [{ ...question, isSecret: true }] },
+    ],
+    [
+      "details",
+      { ...base, questions: [{ ...question, question: "Gatewayを再起動しますか？" }] },
+    ],
+    [
+      "description",
+      {
+        ...base,
+        questions: [{
+          ...question,
+          options: [
+            { label: "承認して実行", description: "" },
+            { label: "拒否・保留", description: "実行しない" },
+          ],
+        }],
+      },
+    ],
+    ["auto-resolution", { ...base, autoResolutionMs: 1 }],
+    ["item-id", { ...base, itemId: "" }],
+  ];
+
+  for (const [name, params] of cases) {
+    const server = new FakeAppServer();
+    const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 5 });
+    const eventsPromise = collectEvents(adapter.sendMessage(
+      { id: "thr_1" },
+      { text: `外部操作の${name}形式を確認する`, source: { type: "human" } },
+    ));
+    await new Promise((resolve) => setImmediate(resolve));
+    server.request({
+      id: `repair-${name}`,
+      method: "item/tool/requestUserInput",
+      params,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    server.notify("turn/completed", {
+      threadId: "thr_1",
+      turn: { id: "turn_1", status: "completed" },
+    });
+    const events = await eventsPromise;
+
+    assert.equal(server.errorResponses.length, 1, name);
+    assert.match(
+      server.errorResponses[0]?.message ?? "",
+      /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED/u,
+      name,
+    );
+    assert.equal(
+      events.some(
+        (event) => event.type === "error" &&
+          event.code === "UNSUPPORTED_STRUCTURED_INPUT",
+      ),
+      false,
+      name,
+    );
+  }
+});
+
+test("keeps a reserved external-action request in the Git binding grace", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 50 });
+  const eventsPromise = collectEvents(adapter.sendMessage(
+    { id: "thr_1" },
+    { text: "通知順序が逆のGit承認を確認する", source: { type: "human" } },
+  ));
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 912,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  notifyPublicationPlan(server);
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(events.some((event) => event.type === "choice.requested"), false);
+  assert.equal(events.some((event) => event.type === "user_input.requested"), false);
+  assert.ok(events.some(
+    (event) => event.type === "error" &&
+      event.code === "INVALID_GIT_APPROVAL_REQUEST",
+  ));
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /INVALID_GIT_APPROVAL_REQUEST.*unsupported choices/u,
+  );
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("shows a bounded error after a second malformed external-action confirmation", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const eventsPromise = collectEvents(adapter.sendMessage(
+    { id: "thr_1" },
+    { text: "外部操作の最終確認を表示する", source: { type: "human" } },
+  ));
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const params = externalActionQuestion();
+  const question = params.questions[0];
+  assert.ok(question);
+  const malformedParams = {
+    ...params,
+    questions: [{
+      ...question,
+      options: [
+        { label: "再起動する", description: "Gatewayを再起動する" },
+        { label: "今回は保留", description: "変更しない" },
+      ],
+    }],
+  };
+  server.request({
+    id: 909,
+    method: "item/tool/requestUserInput",
+    params: malformedParams,
+  });
+  server.request({
+    id: 910,
+    method: "item/tool/requestUserInput",
+    params: malformedParams,
+  });
+  server.request({
+    id: 911,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{ ...question }],
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(server.errorResponses.length, 3);
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED/u,
+  );
+  assert.match(
+    server.errorResponses[1]?.message ?? "",
+    /UNSUPPORTED_STRUCTURED_INPUT.*fixed approve and reject choices in order/u,
+  );
+  assert.match(
+    server.errorResponses[2]?.message ?? "",
+    /EXTERNAL_ACTION_APPROVAL_REPAIR_EXHAUSTED.*Do not call request_user_input again.*execute the external action/su,
+  );
+  assert.deepEqual(server.errorResponses[2]?.data, {
+    recovery: "stop_external_action_approval",
+    questionId: "external_action_approval",
+  });
+  assert.equal(
+    events.filter(
+      (event) => event.type === "error" &&
+        event.code === "UNSUPPORTED_STRUCTURED_INPUT",
+    ).length,
+    1,
+  );
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("fails closed when reserved Git labels use an arbitrary ID without a plan", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const eventsPromise = collectEvents(
+    adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "main保護を確認する", source: { type: "human" } },
+    ),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  const params = workspaceGitQuestion();
+  const question = params.questions[0];
+  assert.ok(question);
+  server.request({
+    id: 906,
+    method: "item/tool/requestUserInput",
+    params: {
+      ...params,
+      questions: [{
+        ...question,
+        id: "main_protection",
+        options: [
+          { label: "承認\u200Bして実行", description: "実行する" },
+          { label: "拒否\u2060・保留", description: "保留する" },
+        ],
+      }],
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
+
+  assert.ok(events.some(
+    (event) => event.type === "git_approval.reprepare_required",
+  ));
+  assert.equal(events.some((event) => event.type === "choice.requested"), false);
+  assert.equal(events.some((event) => event.type === "user_input.requested"), false);
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /REPREPARE_REQUIRED/u,
+  );
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("rejects an exact Git plan paired with an ordinary question ID", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const eventsPromise = collectEvents(adapter.sendMessage(session, {
+    text: "公開計画を確認する",
+    source: { type: "human" },
+  }));
 
   await new Promise((resolve) => setImmediate(resolve));
   notifyPublicationPlan(server);
@@ -2328,16 +3586,24 @@ test("keeps an exact plan on the Git path with an ordinary question ID", async (
       questions: [{ ...question, id: "publication_confirmation" }],
     },
   });
-  await consuming;
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
 
   assert.equal(events.some((event) => event.type === "choice.requested"), false);
-  assert.ok(events.some((event) => event.type === "user_input.requested"));
-  assert.deepEqual(server.userInputResponses, [{
-    id: 903,
-    response: {
-      answers: { publication_confirmation: { answers: ["拒否・保留"] } },
-    },
-  }]);
+  assert.equal(events.some((event) => event.type === "user_input.requested"), false);
+  assert.ok(events.some(
+    (event) =>
+      event.type === "error" &&
+      event.code === "INVALID_GIT_APPROVAL_REQUEST",
+  ));
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /INVALID_GIT_APPROVAL_REQUEST.*unsupported choices/u,
+  );
+  assert.deepEqual(server.userInputResponses, []);
 });
 
 test("keeps ordinary questions about Git approval on the choice path", async () => {
@@ -2581,26 +3847,17 @@ test("accepts an exact Git approval when App Server omits schema-default fields"
   }]);
 });
 
-test("accepts current Default-mode App Server flags without weakening Git approval", async () => {
+test("rejects a non-blocking Git approval without projecting authority", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
   const session = { id: "thr_1" };
-  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const events: AgentEvent[] = [];
   const consuming = (async () => {
     for await (const event of adapter.sendMessage(session, {
       text: "Publish with current request_user_input normalization",
       source: { type: "human" },
     })) {
-      if (event.type !== "user_input.requested") continue;
-      requested = event;
-      await adapter.respondToUserInput(session, {
-        requestId: event.requestId,
-        optionId: "reject",
-      });
-      server.notify("turn/completed", {
-        threadId: "thr_1",
-        turn: { id: "turn_1", status: "completed" },
-      });
+      events.push(event);
     }
   })();
 
@@ -2619,19 +3876,22 @@ test("accepts current Default-mode App Server flags without weakening Git approv
       })),
     },
   });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
   await consuming;
 
-  assert.deepEqual(requested?.options, [
-    { id: "approve", label: "承認して実行" },
-    { id: "reject", label: "拒否・保留" },
-  ]);
-  assert.equal(server.errorResponses.length, 0);
-  assert.deepEqual(server.userInputResponses, [{
-    id: 922,
-    response: {
-      answers: { git_approval: { answers: ["拒否・保留"] } },
-    },
-  }]);
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    false,
+  );
+  assert.match(
+    server.errorResponses.find(({ id }) => id === 922)?.message ?? "",
+    /INVALID_GIT_APPROVAL_REQUEST.*blocking mode/su,
+  );
+  assert.deepEqual(server.userInputResponses, []);
 });
 
 test("terminates a malformed Git-looking approval without offering recovery", async () => {
@@ -2735,7 +3995,13 @@ test("bridges one exact workspace-git publication choice to the same App Server 
 
   await new Promise((resolve) => setImmediate(resolve));
   notifyPublicationPlan(server);
-  server.request({ id: 81, method: "item/tool/requestUserInput", params: workspaceGitQuestion() });
+  const recommendedQuestion = workspaceGitQuestion();
+  recommendedQuestion.questions[0]!.options[0]!.label = "承認して実行 (Recommended)";
+  server.request({
+    id: 81,
+    method: "item/tool/requestUserInput",
+    params: recommendedQuestion,
+  });
   await requestReady;
   assert.equal(requested?.plan.operationId, "11111111-1111-4111-8111-111111111111");
   assert.equal(requested?.plan.worktreeId, "primary");
@@ -2767,6 +4033,215 @@ test("bridges one exact workspace-git publication choice to the same App Server 
   });
   await consuming;
   assert.equal(server.turnStarts.length, 1);
+});
+
+test("settles a terminal private workspace-git execution without fabricating a human answer", async () => {
+  const server = new FakeAppServer();
+  const inputs: WorkspaceGitAutomationInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    workspaceGitAutomationProvider: automationProvider(async (input) => {
+      inputs.push(input);
+      return {
+        status: "terminal_executed",
+        operation_id: input.plan.operation_id,
+        plan_hash: input.plan.plan_hash,
+        receipt_id: "receipt-terminal-1",
+      };
+    }),
+  });
+  const eventsPromise = collectEvents(
+    adapter.sendMessage({ id: "thr_1" }, automationSlackRequest("Publish automatically")),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 812,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (server.errorResponses.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(inputs.length, 1);
+  assert.deepEqual(inputs[0]?.plan.capabilities, ["commit", "push", "draft_pr"]);
+  assert.equal(inputs[0]?.plan.environment, "development");
+  assert.equal(inputs[0]?.context.koe_id, "implementer");
+  assert.equal(inputs[0]?.context.app_server.rpc_request_id, 812);
+  assert.equal(inputs[0]?.context.slack.team_id, "T0123456789");
+  assert.deepEqual(server.userInputResponses, []);
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /WORKSPACE_GIT_AUTOMATION_TERMINAL_EXECUTED.*Do not call.*public execute.*retry/u,
+  );
+  assert.equal(
+    events.some((event) => event.type === "git_automation.executed"),
+    true,
+  );
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    false,
+  );
+});
+
+test("keeps an uncertain provider result blocked without manual fallback", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    workspaceGitAutomationProvider: automationProvider(async (input) => ({
+      status: "blocked",
+      operation_id: input.plan.operation_id,
+      plan_hash: input.plan.plan_hash,
+      reason: "outcome_unknown",
+    })),
+  });
+  const eventsPromise = collectEvents(
+    adapter.sendMessage({ id: "thr_1" }, automationSlackRequest("Publish fail closed")),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 813,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (server.errorResponses.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+  });
+  const events = await eventsPromise;
+
+  assert.match(
+    server.errorResponses[0]?.message ?? "",
+    /WORKSPACE_GIT_AUTOMATION_BLOCKED: outcome_unknown.*Do not retry.*fall back/u,
+  );
+  assert.deepEqual(server.userInputResponses, []);
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    false,
+  );
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "git_automation.blocked" &&
+        event.reason === "outcome_unknown",
+    ),
+    true,
+  );
+});
+
+test("uses the existing human path when the provider explicitly returns manual", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    workspaceGitAutomationProvider: automationProvider(async (input) => ({
+      status: "manual",
+      operation_id: input.plan.operation_id,
+      plan_hash: input.plan.plan_hash,
+      reason: "human_approval_required",
+    })),
+  });
+  const session = { id: "thr_1" };
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const eventsPromise = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(
+      session,
+      automationSlackRequest("Use manual approval"),
+    )) {
+      events.push(event);
+      if (event.type === "user_input.requested") requested = event;
+    }
+    return events;
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 814,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (requested === undefined) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await adapter.respondToUserInput(session, {
+    requestId: requested.requestId,
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(
+    events.some((event) => event.type === "user_input.requested"),
+    true,
+  );
+  assert.deepEqual(server.userInputResponses, [{
+    id: 814,
+    response: { answers: { git_approval: { answers: ["拒否・保留"] } } },
+  }]);
+});
+
+test("preserves an explicit production environment for provider fail-closed policy", async () => {
+  const server = new FakeAppServer();
+  const inputs: WorkspaceGitAutomationInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    workspaceGitAutomationProvider: automationProvider(async (input) => {
+      inputs.push(input);
+      return {
+        status: "manual",
+        operation_id: input.plan.operation_id,
+        plan_hash: input.plan.plan_hash,
+        reason: "human_approval_required",
+      };
+    }),
+  });
+  const session = { id: "thr_1" };
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const eventsPromise = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(
+      session,
+      automationSlackRequest("Keep production manual"),
+    )) {
+      events.push(event);
+      if (event.type === "user_input.requested") requested = event;
+    }
+    return events;
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server, { environment: "production" });
+  server.request({
+    id: 815,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (requested === undefined) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(inputs[0]?.plan.environment, "production");
+  assert.equal(requested.plan.environment, "production");
+  await adapter.respondToUserInput(session, {
+    requestId: requested.requestId,
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+  });
+  await eventsPromise;
 });
 
 test("rejects a second same-turn Git approval while the first execution is unfinished", async () => {
@@ -2899,6 +4374,87 @@ test("accepts a second same-turn Git approval after the first exact execution su
   assert.equal(requests.length, 2);
   assert.equal(
     server.errorResponses.some((response) => response.id === 814),
+    false,
+  );
+  assert.equal(
+    events.some((event) =>
+      event.type === "error" &&
+      event.code === "CONCURRENT_GIT_APPROVAL_NOT_SUPPORTED"
+    ),
+    false,
+  );
+  assert.equal(
+    requests[1]?.plan.operationId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+});
+
+test("accepts a second same-turn Git approval after a conclusive failed execution", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
+  let releaseSecondRequest!: () => void;
+  const secondRequestReady = new Promise<void>((resolve) => {
+    releaseSecondRequest = resolve;
+  });
+  const consuming = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(session, {
+      text: "Prepare a fresh plan after a conclusive preflight failure",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "user_input.requested") continue;
+      requests.push(event);
+      if (requests.length === 2) releaseSecondRequest();
+    }
+    return events;
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 821,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (requests.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  await adapter.respondToUserInput(session, {
+    requestId: requests[0]?.requestId ?? "",
+    optionId: "approve",
+  });
+  notifyPublicationExecution(server, { outcomeStatus: "failed" });
+
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-2",
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  server.request({
+    id: 822,
+    method: "item/tool/requestUserInput",
+    params: { ...workspaceGitQuestion(), itemId: "request-input-2" },
+  });
+  await secondRequestReady;
+  await adapter.respondToUserInput(session, {
+    requestId: requests[1]?.requestId ?? "",
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem({ outcomeStatus: "failed" })],
+    },
+  });
+  const events = await consuming;
+
+  assert.equal(requests.length, 2);
+  assert.equal(
+    server.errorResponses.some((response) => response.id === 822),
     false,
   );
   assert.equal(
@@ -4526,10 +6082,10 @@ test("does not treat an idle thread aggregate as proof that the owned turn ended
   const server = new FakeAppServer();
   server.startTurnBehavior = async () => {
     server.turnStatuses.set("turn_1", "inProgress");
-    setTimeout(() => {
-      server.turnStatuses.set("turn_1", "completed");
-    }, 20);
     return { id: "turn_1", status: "inProgress" };
+  };
+  server.onListTurns = (callCount) => {
+    if (callCount >= 3) server.turnStatuses.set("turn_1", "completed");
   };
   const adapter = new CodexAdapter(server, { terminalWatchdogMs: 5 });
 
@@ -4555,7 +6111,7 @@ test("does not interrupt a turn announced while turn/start ownership is ambiguou
     });
     throw new Error("turn/start timed out");
   };
-  const adapter = new CodexAdapter(server);
+  const adapter = new CodexAdapter(server, { ambiguousStartRetryMs: 1 });
   await assert.rejects(
     collectEvents(
       adapter.sendMessage(

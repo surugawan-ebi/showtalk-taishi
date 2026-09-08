@@ -5,6 +5,7 @@ import type {
 
 const APPROVE_LABEL = "承認して実行";
 const REJECT_LABEL = "拒否・保留";
+const CODEX_RECOMMENDED_SUFFIX = " (Recommended)";
 const MIN_AUTO_RESOLUTION_MS = 60_000;
 const MAX_AUTO_RESOLUTION_MS = 240_000;
 
@@ -21,8 +22,8 @@ export function validateWorkspaceGitPlanQuestion(
   value: unknown,
 ): ValidatedPlanQuestion {
   const params = requiredRecord(value, "user input request");
-  if (typeof params.isBlocking !== "boolean") {
-    throw new Error("Git plan approval blocking mode is invalid");
+  if (params.isBlocking !== true) {
+    throw new Error("Git plan approval must use blocking mode");
   }
   const questions = params.questions;
   if (!Array.isArray(questions) || questions.length !== 1) {
@@ -30,17 +31,13 @@ export function validateWorkspaceGitPlanQuestion(
   }
   const question = requiredRecord(questions[0], "question") as unknown as
     ToolRequestUserInputQuestion;
-  // Current Codex normalizes request_user_input questions to isOther=true and
-  // marks them non-blocking outside Plan mode. App Server still awaits the
-  // response; ShowTalk owns the bounded timeout and never exposes free-form Git
-  // approval. The exact two labels below remain the only projected and accepted
-  // answers for either wire mode.
+  // Codex can normalize request_user_input questions to isOther=true. ShowTalk
+  // never exposes or accepts free-form Git approval, and the authority-bearing
+  // request itself must remain blocking until Slack returns one fixed answer.
   const isOther = question.isOther ?? false;
   const isSecret = question.isSecret ?? false;
   if (
-    typeof question.id !== "string" ||
-    question.id.length < 1 ||
-    question.id.length > 128 ||
+    question.id !== "git_approval" ||
     typeof question.question !== "string" ||
     question.question.length < 1 ||
     question.question.length > 2_000 ||
@@ -48,7 +45,7 @@ export function validateWorkspaceGitPlanQuestion(
     isSecret !== false ||
     !Array.isArray(question.options) ||
     question.options.length !== 2 ||
-    question.options[0]?.label !== APPROVE_LABEL ||
+    !isApproveLabel(question.options[0]?.label) ||
     question.options[1]?.label !== REJECT_LABEL
   ) {
     throw new Error("Git plan approval question has unsupported choices");
@@ -71,6 +68,11 @@ export function validateWorkspaceGitPlanQuestion(
     rejectLabel: REJECT_LABEL,
     ...(typeof autoResolutionMs === "number" ? { autoResolutionMs } : {}),
   };
+}
+
+function isApproveLabel(value: unknown): value is string {
+  return value === APPROVE_LABEL ||
+    value === `${APPROVE_LABEL}${CODEX_RECOMMENDED_SUFFIX}`;
 }
 
 /** Reads only the App Server turn identity needed by the approval binder. */

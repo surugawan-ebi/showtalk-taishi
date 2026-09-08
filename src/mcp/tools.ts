@@ -9,6 +9,8 @@ import {
   agentSendOutputSchema,
   agentStatusInputSchema,
   agentStatusOutputSchema,
+  appOpsPreToolUseInputSchema,
+  appOpsPreToolUseOutputSchema,
   gatewayRestartInputSchema,
   gatewayRestartOutputSchema,
   publicErrorCodeSchema,
@@ -20,6 +22,7 @@ import {
 import {
   McpServiceError,
   type McpCallerContext,
+  type McpAppOpsPreToolUseResult,
   type McpSlackAttachmentInput,
   type SwitchboardMcpService,
 } from "./types.js";
@@ -33,12 +36,15 @@ export const MCP_SERVER_INSTRUCTIONS =
   "Slack makes the channel visit visible but is never the Koe-to-Koe transport. " +
   "Git approval UI belongs to the Koe that prepared the operation and its originating Slack turn; never use agent.send or Slack write tools to relay, recreate, or move an approval to another Koe or channel. " +
   "slack.post and slack.reply can upload workspace-relative images and audio files from the authenticated Koe's workspace. " +
+  "When the current Slack user asks to receive a screenshot or other workspace file, use slack.reply with attachments and omit channel and thread_ts so the Gateway binds the upload to the current originating thread. " +
+  "That explicit artifact request authorizes an attachment-only call bound to the originating thread, so omit message too and do not request a separate attachment approval. " +
   "gateway.restart is the only safe way to restart the Gateway; never use kill or signal commands, and call it only when a human explicitly requests a restart. " +
   "The authenticated caller identity is bound by the server and must never be supplied as a tool argument.";
 
 export interface CreateAgentMcpServerOptions {
   readonly name?: string;
   readonly version?: string;
+  readonly deferUntilResponseFinished?: (effect: () => void) => void;
 }
 
 /** Builds one request-local MCP server with caller identity fixed in its closure. */
@@ -73,7 +79,13 @@ export function createAgentMcpServer(
     async (_input, extra) =>
       executeTool(agentListOutputSchema, () =>
         service.agentList(
-          context(callerAgentId, extra.signal, "agent.list", extra.requestId),
+          context(
+            callerAgentId,
+            extra.signal,
+            "agent.list",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
         ),
       ),
   );
@@ -95,7 +107,13 @@ export function createAgentMcpServer(
     async ({ target }, extra) =>
       executeTool(agentStatusOutputSchema, () =>
         service.agentStatus(
-          context(callerAgentId, extra.signal, "agent.status", extra.requestId),
+          context(
+            callerAgentId,
+            extra.signal,
+            "agent.status",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
           target,
         ),
       ),
@@ -119,7 +137,13 @@ export function createAgentMcpServer(
     async ({ target, message }, extra) =>
       executeTool(agentSendOutputSchema, () =>
         service.agentSend(
-          context(callerAgentId, extra.signal, "agent.send", extra.requestId),
+          context(
+            callerAgentId,
+            extra.signal,
+            "agent.send",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
           target,
           message,
         ),
@@ -144,7 +168,43 @@ export function createAgentMcpServer(
     async (_input, extra) =>
       executeTool(gatewayRestartOutputSchema, () =>
         service.gatewayRestart(
-          context(callerAgentId, extra.signal, "gateway.restart", extra.requestId),
+          context(
+            callerAgentId,
+            extra.signal,
+            "gateway.restart",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "internal.appops-pre-tool-use",
+    {
+      title: "Bind AppOps Approval Proof",
+      description:
+        "Internal Codex PreToolUse hook endpoint. Do not call directly. It atomically binds one same-turn approved AppOps proof to the matching execute arguments or denies the call.",
+      inputSchema: appOpsPreToolUseInputSchema,
+      outputSchema: appOpsPreToolUseOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input, extra) =>
+      executeAppOpsPreToolUseHook(() =>
+        service.appOpsPreToolUse(
+          context(
+            callerAgentId,
+            extra.signal,
+            "internal.appops-pre-tool-use",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
+          input,
         ),
       ),
   );
@@ -167,7 +227,13 @@ export function createAgentMcpServer(
     async ({ channel, message, attachments }, extra) =>
       executeTool(slackWriteOutputSchema, () =>
         service.slackPost(
-          context(callerAgentId, extra.signal, "slack.post", extra.requestId),
+          context(
+            callerAgentId,
+            extra.signal,
+            "slack.post",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
           channel,
           message,
           normalizeSlackAttachments(attachments),
@@ -180,7 +246,7 @@ export function createAgentMcpServer(
     {
       title: "Reply in Slack",
       description:
-        "Reply in a Slack thread with a message and/or workspace-relative image or audio files through the Gateway permission boundary.",
+        "Reply in a Slack thread with a message and/or workspace-relative image or audio files through the Gateway permission boundary. Omit channel and thread_ts to bind the reply to the current originating Slack thread.",
       inputSchema: slackReplyInputSchema,
       outputSchema: slackWriteOutputSchema,
       annotations: {
@@ -193,7 +259,13 @@ export function createAgentMcpServer(
     async ({ channel, thread_ts: threadTs, message, attachments }, extra) =>
       executeTool(slackWriteOutputSchema, () =>
         service.slackReply(
-          context(callerAgentId, extra.signal, "slack.reply", extra.requestId),
+          context(
+            callerAgentId,
+            extra.signal,
+            "slack.reply",
+            extra.requestId,
+            options.deferUntilResponseFinished,
+          ),
           channel,
           threadTs,
           message,
@@ -226,11 +298,15 @@ function context(
   signal: AbortSignal,
   operation: string,
   requestId: string | number,
+  deferUntilResponseFinished?: (effect: () => void) => void,
 ): McpCallerContext {
   return Object.freeze({
     agentId,
     signal,
     requestId: `${operation}:${typeof requestId}:${String(requestId)}`,
+    ...(deferUntilResponseFinished === undefined
+      ? {}
+      : { deferUntilResponseFinished }),
   });
 }
 
@@ -259,5 +335,32 @@ function toolError(code: string, message: string): CallToolResult {
   return {
     isError: true,
     content: [{ type: "text", text: `${code}: ${message}` }],
+  };
+}
+
+async function executeAppOpsPreToolUseHook(
+  operation: () => McpAppOpsPreToolUseResult | Promise<McpAppOpsPreToolUseResult>,
+): Promise<CallToolResult> {
+  let result: McpAppOpsPreToolUseResult;
+  try {
+    const parsed = appOpsPreToolUseOutputSchema.safeParse(await operation());
+    result = parsed.success
+      ? parsed.data
+      : appOpsHookDenial("The AppOps hook returned an invalid decision");
+  } catch {
+    result = appOpsHookDenial("The AppOps approval proof handoff failed closed");
+  }
+  // Keep the proof out of ordinary MCP text content. Codex's MCP-hook path
+  // consumes structuredContent as the hook result.
+  return { content: [], structuredContent: result };
+}
+
+function appOpsHookDenial(reason: string): McpAppOpsPreToolUseResult {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
   };
 }

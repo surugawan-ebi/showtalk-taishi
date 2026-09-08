@@ -6,6 +6,8 @@ export interface McpCallerContext {
   readonly signal: AbortSignal;
   /** Host transport identity; this is never accepted from tool arguments. */
   readonly requestId: string;
+  /** Registers an effect that may run only after this exact HTTP response finishes. */
+  readonly deferUntilResponseFinished?: (effect: () => void) => void;
 }
 
 export interface McpAgentSummary {
@@ -37,6 +39,28 @@ export interface McpAgentSendResult {
 export interface McpGatewayRestartResult {
   readonly status: "scheduled";
 }
+
+export interface McpAppOpsPreToolUseInput {
+  readonly session_id: string;
+  readonly turn_id: string;
+  readonly tool_name: string;
+  readonly tool_use_id: string;
+  readonly tool_input: Readonly<Record<string, unknown>>;
+}
+
+export type McpAppOpsPreToolUseResult = {
+  readonly hookSpecificOutput:
+    | {
+        readonly hookEventName: "PreToolUse";
+        readonly permissionDecision: "allow";
+        readonly updatedInput: Readonly<Record<string, unknown>>;
+      }
+    | {
+        readonly hookEventName: "PreToolUse";
+        readonly permissionDecision: "deny";
+        readonly permissionDecisionReason: string;
+      };
+};
 
 export interface McpSlackAttachmentInput {
   readonly path: string;
@@ -73,6 +97,10 @@ export interface SwitchboardMcpService {
   gatewayRestart(
     context: McpCallerContext,
   ): MaybePromise<McpGatewayRestartResult>;
+  appOpsPreToolUse(
+    context: McpCallerContext,
+    input: McpAppOpsPreToolUseInput,
+  ): MaybePromise<McpAppOpsPreToolUseResult>;
   slackPost(
     context: McpCallerContext,
     channel: string,
@@ -81,8 +109,8 @@ export interface SwitchboardMcpService {
   ): MaybePromise<McpSlackWriteResult>;
   slackReply(
     context: McpCallerContext,
-    channel: string,
-    threadTs: string,
+    channel?: string,
+    threadTs?: string,
     message?: string,
     attachments?: readonly McpSlackAttachmentInput[],
   ): MaybePromise<McpSlackWriteResult>;

@@ -1,57 +1,59 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
-  PrivateWorkspaceGitDecisionBroker,
-  WorkspaceGitDecisionBrokerError,
-  createWorkspaceGitDecisionDeliveryId,
-  createWorkspaceGitDecisionBrokerFromEnvironment,
-  type WorkspaceGitPrivateBrokerTransport,
-} from "../../src/approvals/workspace-git-decision-broker.js";
+  PrivateWorkspaceGitHumanDecisionBroker,
+  WorkspaceGitHumanDecisionBrokerError,
+  createWorkspaceGitHumanDecisionDeliveryId,
+  workspaceGitHumanDecisionPayload,
+  type WorkspaceGitHumanDecisionInput,
+} from "../../src/approvals/workspace-git-human-decision-broker.js";
+import { createWorkspaceGitHumanDecisionBrokerFromEnvironment } from "../../src/approvals/workspace-git-manual-worker-transport.js";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
 const plan = {
-  operationId: "11111111-1111-4111-8111-111111111111",
-  planHash: "a".repeat(64),
-  approvalTarget: "wt_opaque",
-  approvalAuthorityId: "e".repeat(64),
+  operationId: "22222222-2222-4222-8222-222222222222",
+  planHash: "b".repeat(64),
+  approvalTarget: "primary",
   approvalScope: {
+    branch: "codex/v3",
+    expected_head: "3".repeat(40),
+    expected_snapshot_id: "d".repeat(64),
     kind: "git_publication",
-    repo_id: "showtalk-taishi",
-    mode: "commit_push_and_open_draft_pr",
-    branch: "codex/private-approval",
-    worktree_id: "wt_opaque",
-    expected_head: "b".repeat(40),
-    expected_snapshot_id: "c".repeat(64),
-    paths: ["src/slack/frontend.ts"],
-    commit_message: "Record Slack approval privately",
-    pr: {
-      title: "Record Slack approval privately",
-      body: "Exact private approval test",
-    },
-    pr_base_branch: "release",
+    mode: "commit_only",
+    paths: [],
+    repo_id: "fixture",
+    worktree_id: "primary",
   },
   operation: "git_publication",
-  repoId: "showtalk-taishi",
-  mode: "commit_push_and_open_draft_pr",
-  branch: "codex/private-approval",
-  paths: ["src/slack/frontend.ts"],
-  expectedHead: "b".repeat(40),
-  expectedSnapshotId: "c".repeat(64),
-  worktreeId: "wt_opaque",
-  commitMessage: "Record Slack approval privately",
-  pushTarget: "origin/codex/private-approval",
-  pullRequestTitle: "Record Slack approval privately",
-  pullRequestBody: "Exact private approval test",
-  pullRequestBaseBranch: "release",
-  expiresAt: "2099-08-24T02:30:00+09:00",
+  repoId: "fixture",
+  mode: "commit_only",
+  branch: "codex/v3",
+  paths: [],
+  expectedHead: "3".repeat(40),
+  expectedSnapshotId: "d".repeat(64),
+  worktreeId: "primary",
+  commitMessage: "human v3",
+  expiresAt: "2099-01-01T00:00:00.000Z",
 } satisfies WorkspaceGitApprovalPlan;
-const deliveryId = "d".repeat(64);
 
-test("binds a human decision delivery to one Slack message, request, user, and plan", () => {
+const decision = {
+  decision: "approve",
+  plan,
+  deliveryId: "c".repeat(64),
+  context: {
+    callerId: "caller",
+    koeId: "koe",
+    channelId: "channel",
+    rootThreadTs: "root",
+    sessionId: "session",
+  },
+} satisfies WorkspaceGitHumanDecisionInput;
+
+test("binds a human decision delivery to one Slack action and exact plan", () => {
   const input = {
     channelId: "C0123456789",
     rootThreadTs: "1700000000.000001",
@@ -62,326 +64,153 @@ test("binds a human decision delivery to one Slack message, request, user, and p
     operationId: plan.operationId,
     planHash: plan.planHash,
   };
-  const first = createWorkspaceGitDecisionDeliveryId(input);
+  const first = createWorkspaceGitHumanDecisionDeliveryId(input);
   assert.match(first, /^[0-9a-f]{64}$/u);
-  assert.equal(createWorkspaceGitDecisionDeliveryId(input), first);
+  assert.equal(createWorkspaceGitHumanDecisionDeliveryId(input), first);
   assert.notEqual(
-    createWorkspaceGitDecisionDeliveryId({ ...input, requestId: "request-2" }),
+    createWorkspaceGitHumanDecisionDeliveryId({ ...input, requestId: "request-2" }),
     first,
   );
   assert.notEqual(
-    createWorkspaceGitDecisionDeliveryId({ ...input, messageTs: "1700000000.000003" }),
+    createWorkspaceGitHumanDecisionDeliveryId({ ...input, userId: "U999" }),
     first,
   );
 });
 
-test("sends the complete exact scope to the private transport", async () => {
+test("matches the shared manual v1 human decision body without private scope or authority", async () => {
+  const fixture = JSON.parse(await readFile(
+    new URL("../fixtures/workspace-git-human-decision-v1.json", import.meta.url),
+    "utf8",
+  )) as { body: unknown };
+  const payload = workspaceGitHumanDecisionPayload(decision);
+
+  assert.deepEqual(payload, fixture.body);
+  assert.equal("approval_authority_id" in payload, false);
+  assert.equal("key_id" in payload, false);
+  assert.equal("signature" in payload, false);
+  assert.equal("scope" in payload, false);
+});
+
+test("records manual v1 through an opaque transport before accepting the decision", async () => {
   const calls: unknown[] = [];
-  const transport: WorkspaceGitPrivateBrokerTransport = {
-    recordDecision: async (input) => {
+  const broker = new PrivateWorkspaceGitHumanDecisionBroker({
+    recordHumanDecision: async (input) => {
       calls.push(input);
       return { status: "approved", disposition: "transitioned" };
     },
-  };
-  const broker = new PrivateWorkspaceGitDecisionBroker(transport);
-
-  await broker.recordDecision({
-    decision: "approve",
-    plan,
-    actor: "chat-user-via-showtalk",
-    deliveryId,
   });
 
-  assert.deepEqual(calls, [{
-    version: 1,
-    decision: "approve",
-    actor: "chat-user-via-showtalk",
-    operation_id: plan.operationId,
-    plan_hash: plan.planHash,
-    approval_target: plan.approvalTarget,
-    approval_authority_id: plan.approvalAuthorityId,
-    repo_id: plan.repoId,
-    expires_at: plan.expiresAt,
-    decision_delivery_id: deliveryId,
-    scope: plan.approvalScope,
-  }]);
+  await broker.recordDecision(decision);
+
+  assert.deepEqual(calls, [workspaceGitHumanDecisionPayload(decision)]);
 });
 
-test("does not resume when the private store does not return the expected state", async () => {
-  const broker = new PrivateWorkspaceGitDecisionBroker({
-    recordDecision: async () => ({
+test("accepts only the expected terminal state and same-delivery replay", async () => {
+  const replay = new PrivateWorkspaceGitHumanDecisionBroker({
+    recordHumanDecision: async () => ({
+      status: "approved",
+      disposition: "already_recorded_same_delivery",
+    }),
+  });
+  await replay.recordDecision(decision);
+
+  const conflict = new PrivateWorkspaceGitHumanDecisionBroker({
+    recordHumanDecision: async () => ({
       status: "awaiting_human_approval",
       disposition: "transitioned",
     }),
   });
   await assert.rejects(
-    broker.recordDecision({
-      decision: "approve",
-      plan,
-      actor: "chat-user-via-showtalk",
-      deliveryId,
-    }),
-    /did not record/u,
+    conflict.recordDecision(decision),
+    (error: unknown) =>
+      error instanceof WorkspaceGitHumanDecisionBrokerError &&
+      error.code === "status_conflict",
   );
 });
 
-test("allows only bounded fail-closed system rejection without full scope", async () => {
-  const calls: unknown[] = [];
-  const broker = new PrivateWorkspaceGitDecisionBroker({
-    recordDecision: async (input) => {
-      calls.push(input);
-      return { status: "rejected", disposition: "transitioned" };
-    },
-  });
-  const minimal = {
-    operationId: plan.operationId,
-    planHash: plan.planHash,
-    approvalTarget: plan.approvalTarget,
-    repoId: plan.repoId,
-    expiresAt: plan.expiresAt,
-  };
-  await broker.recordDecision({
-    decision: "reject",
-    plan: minimal,
-    actor: "showtalk:slack-projection-failure",
+test("maps unknown transport failures to outcome unknown", async () => {
+  const broker = new PrivateWorkspaceGitHumanDecisionBroker({
+    recordHumanDecision: async () => Promise.reject(new Error("socket closed")),
   });
   await assert.rejects(
-    broker.recordDecision({
-      decision: "approve",
-      plan: minimal,
-      actor: "chat-user-via-showtalk",
-    }),
-    /require an exact plan/u,
+    broker.recordDecision(decision),
+    (error: unknown) =>
+      error instanceof WorkspaceGitHumanDecisionBrokerError &&
+      error.code === "decision_outcome_unknown",
   );
-  assert.equal(calls.length, 1);
 });
 
-test("loads the private module once in a credential-isolated worker", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showtalk-private-broker-"));
-  let broker: Awaited<ReturnType<typeof createWorkspaceGitDecisionBrokerFromEnvironment>>;
-  try {
-    const modulePath = join(directory, "private-approval-broker.mjs");
-    const capturePath = join(directory, "capture.json");
-    await writeFile(
-      modulePath,
-      [
-        'import { writeFile } from "node:fs/promises";',
-        `const capturePath = ${JSON.stringify(capturePath)};`,
-        "export async function createPrivateWorkspaceGitApprovalBroker() {",
-        "  const environment = {",
-        "    stateRoot: process.env.WORKSPACE_GIT_STATE_ROOT,",
-        "    slack: process.env.SLACK_BOT_TOKEN,",
-        "    mcp: process.env.SHOWTALK_TAISHI_MCP_TOKEN",
-        "  };",
-        "  return { recordDecision: async (input) => {",
-        "    await writeFile(capturePath, JSON.stringify({ environment, input }));",
-        "    return { status: input.decision === 'approve' ? 'approved' : 'rejected', disposition: 'transitioned' };",
-        "  }, inspectDecision: async () => ({ status: 'awaiting_human_approval', disposition: 'pending' }) };",
-        "}",
-      ].join("\n"),
-      { encoding: "utf8", mode: 0o600 },
-    );
-    broker = await createWorkspaceGitDecisionBrokerFromEnvironment({
-      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
-      WORKSPACE_GIT_STATE_ROOT: directory,
-      SLACK_BOT_TOKEN: "xoxb-must-not-leak",
-      SHOWTALK_TAISHI_MCP_TOKEN: "mcp-must-not-leak",
-    });
-    assert.ok(broker);
+test("rejects a decision without the exact public approval scope", () => {
+  const { approvalScope: _approvalScope, ...planWithoutScope } = plan;
+  assert.throws(
+    () => workspaceGitHumanDecisionPayload({
+      ...decision,
+      plan: planWithoutScope as unknown as WorkspaceGitApprovalPlan,
+    }),
+    (error: unknown) =>
+      error instanceof WorkspaceGitHumanDecisionBrokerError &&
+      error.code === "plan_mismatch",
+  );
+});
 
-    // A local-mcp rebuild may replace dist after startup. The already-loaded
-    // private module must continue serving decisions without touching the file.
-    await rm(modulePath);
-    await broker.recordDecision({
-      decision: "approve",
-      plan,
-      actor: "chat-user-via-showtalk",
-      deliveryId,
-    });
-    const captured = JSON.parse(await readFile(capturePath, "utf8")) as {
-      environment: Record<string, string | undefined>;
-      input: Record<string, unknown>;
-    };
-    assert.equal(captured.environment.stateRoot, directory);
-    assert.equal(captured.environment.slack, undefined);
-    assert.equal(captured.environment.mcp, undefined);
-    assert.equal(captured.input.operation_id, plan.operationId);
+test("loads only the configured manual v1 composition in an isolated worker", async () => {
+  const broker = await createWorkspaceGitHumanDecisionBrokerFromEnvironment({
+    SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE:
+      new URL("../fixtures/workspace-git-manual-module.mjs", import.meta.url)
+        .pathname,
+    WORKSPACE_GIT_STATE_ROOT: "/tmp/showtalk-manual-broker-fixture",
+  });
+  assert.ok(broker);
+  try {
+    await broker.recordDecision(decision);
   } finally {
-    await broker?.close?.().catch(() => undefined);
-    await rm(directory, { recursive: true, force: true });
+    await broker.close?.();
   }
 });
 
-test("legacy CLI configuration derives the private module but never executes the CLI", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showtalk-private-broker-legacy-"));
-  let broker: Awaited<ReturnType<typeof createWorkspaceGitDecisionBrokerFromEnvironment>>;
+test("fails closed for an unsupported private composition", async () => {
+  await assert.rejects(
+    createWorkspaceGitHumanDecisionBrokerFromEnvironment({
+      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE:
+        new URL("../fixtures/workspace-git-manual-module-invalid.mjs", import.meta.url)
+          .pathname,
+      WORKSPACE_GIT_STATE_ROOT: "/tmp/showtalk-manual-broker-fixture",
+    }),
+    /manual decision worker failed|manual decision worker exited/u,
+  );
+});
+
+test("does not load a human broker unless an explicit module is configured", async () => {
+  assert.equal(
+    await createWorkspaceGitHumanDecisionBrokerFromEnvironment({}),
+    undefined,
+  );
+  await assert.rejects(
+    createWorkspaceGitHumanDecisionBrokerFromEnvironment({
+      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: "relative/manual.js",
+      WORKSPACE_GIT_STATE_ROOT: "/tmp/showtalk-manual-broker-fixture",
+    }),
+    /absolute file path/u,
+  );
+});
+
+test("rejects a group-writable manual module before importing it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "showtalk-manual-module-"));
+  const modulePath = join(root, "manual.mjs");
   try {
-    const cliPath = join(directory, "dist", "src", "cli", "approval-cli.js");
-    const modulePath = join(
-      directory,
-      "dist",
-      "src",
-      "approval",
-      "private-approval-broker.js",
-    );
-    const cliMarker = join(directory, "cli-ran");
-    await mkdir(dirname(cliPath), { recursive: true });
-    await mkdir(dirname(modulePath), { recursive: true });
-    await writeFile(
-      cliPath,
-      `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(cliMarker)}, "bad");`,
-      { encoding: "utf8", mode: 0o600 },
-    );
-    await writeFile(
+    await copyFile(
+      new URL("../fixtures/workspace-git-manual-module.mjs", import.meta.url),
       modulePath,
-      "export async function createPrivateWorkspaceGitApprovalBroker() { return { recordDecision: async () => ({ status: 'approved', disposition: 'transitioned' }), inspectDecision: async () => ({ status: 'approved', disposition: 'recorded' }) }; }",
-      { encoding: "utf8", mode: 0o600 },
     );
-    broker = await createWorkspaceGitDecisionBrokerFromEnvironment({
-      SHOWTALK_WORKSPACE_GIT_APPROVAL_CLI: cliPath,
-      WORKSPACE_GIT_STATE_ROOT: directory,
-    });
-    assert.ok(broker);
-    await broker.recordDecision({
-      decision: "approve",
-      plan,
-      actor: "chat-user-via-showtalk",
-      deliveryId,
-    });
-    await assert.rejects(readFile(cliMarker), /ENOENT/u);
-  } finally {
-    await broker?.close?.().catch(() => undefined);
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("the isolated worker forwards only bounded error classifications", async () => {
-  for (const scenario of [
-    {
-      source:
-        "const error = new Error('/private/secret/state operation=hidden'); error.code = 'plan_mismatch'; throw error;",
-      expectedCode: "plan_mismatch",
-    },
-    {
-      source: "throw new Error('/private/secret/state write exploded');",
-      expectedCode: "state_write_failed",
-    },
-  ]) {
-    const directory = await mkdtemp(join(tmpdir(), "showtalk-private-broker-error-"));
-    let broker: Awaited<ReturnType<typeof createWorkspaceGitDecisionBrokerFromEnvironment>>;
-    try {
-      const modulePath = join(directory, "private-approval-broker.mjs");
-      await writeFile(
-        modulePath,
-        `export async function createPrivateWorkspaceGitApprovalBroker() { return { recordDecision: async () => { ${scenario.source} }, inspectDecision: async () => ({ status: 'awaiting_human_approval', disposition: 'pending' }) }; }`,
-        { encoding: "utf8", mode: 0o600 },
-      );
-      broker = await createWorkspaceGitDecisionBrokerFromEnvironment({
-        SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
-        WORKSPACE_GIT_STATE_ROOT: directory,
-      });
-      assert.ok(broker);
-      await assert.rejects(
-        broker.recordDecision({
-          decision: "approve",
-          plan,
-          actor: "chat-user-via-showtalk",
-          deliveryId,
-        }),
-        (error: unknown) => {
-          assert.ok(error instanceof WorkspaceGitDecisionBrokerError);
-          assert.equal(error.code, scenario.expectedCode);
-          assert.doesNotMatch(
-            error.message,
-            /\/private\/secret|hidden|exploded/u,
-          );
-          return true;
-        },
-      );
-    } finally {
-      await broker?.close?.().catch(() => undefined);
-      await rm(directory, { recursive: true, force: true });
-    }
-  }
-});
-
-test("a hung private decision is bounded and does not leave the Slack handler waiting forever", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showtalk-private-broker-hang-"));
-  let broker: Awaited<ReturnType<typeof createWorkspaceGitDecisionBrokerFromEnvironment>>;
-  try {
-    const modulePath = join(directory, "private-approval-broker.mjs");
-    await writeFile(
-      modulePath,
-      "export async function createPrivateWorkspaceGitApprovalBroker() { return { recordDecision: async () => new Promise(() => {}), inspectDecision: async () => ({ status: 'awaiting_human_approval', disposition: 'pending' }) }; }",
-      { encoding: "utf8", mode: 0o600 },
-    );
-    broker = await createWorkspaceGitDecisionBrokerFromEnvironment(
-      {
-        SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
-        WORKSPACE_GIT_STATE_ROOT: directory,
-      },
-      { requestTimeoutMs: 50 },
-    );
-    assert.ok(broker);
-    const startedAt = Date.now();
+    await chmod(modulePath, 0o620);
     await assert.rejects(
-      broker.recordDecision({
-        decision: "approve",
-        plan,
-        actor: "chat-user-via-showtalk",
-        deliveryId,
-      }),
-      (error: unknown) =>
-        error instanceof WorkspaceGitDecisionBrokerError &&
-        error.code === "decision_outcome_unknown",
-    );
-    assert.ok(Date.now() - startedAt < 1_000);
-  } finally {
-    await broker?.close?.().catch(() => undefined);
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("reconciles a durable decision when the worker response arrives after timeout", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "showtalk-private-broker-late-"));
-  let broker: Awaited<ReturnType<typeof createWorkspaceGitDecisionBrokerFromEnvironment>>;
-  try {
-    const modulePath = join(directory, "private-approval-broker.mjs");
-    await writeFile(
-      modulePath,
-      [
-        "let recorded;",
-        "export async function createPrivateWorkspaceGitApprovalBroker() {",
-        "  return {",
-        "    recordDecision: async (input) => {",
-        "      recorded = input;",
-        "      await new Promise((resolve) => setTimeout(resolve, 100));",
-        "      return { status: 'approved', disposition: 'transitioned' };",
-        "    },",
-        "    inspectDecision: async (input) => recorded?.decision_delivery_id === input.decision_delivery_id",
-        "      ? { status: 'approved', disposition: 'recorded' }",
-        "      : { status: 'awaiting_human_approval', disposition: 'pending' }",
-        "  };",
-        "}",
-      ].join("\n"),
-      { encoding: "utf8", mode: 0o600 },
-    );
-    broker = await createWorkspaceGitDecisionBrokerFromEnvironment(
-      {
+      createWorkspaceGitHumanDecisionBrokerFromEnvironment({
         SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
-        WORKSPACE_GIT_STATE_ROOT: directory,
-      },
-      { requestTimeoutMs: 50 },
+        WORKSPACE_GIT_STATE_ROOT: root,
+      }),
+      /must not be group\/world writable/u,
     );
-    assert.ok(broker);
-    await broker.recordDecision({
-      decision: "approve",
-      plan,
-      actor: "chat-user-via-showtalk",
-      deliveryId,
-    });
   } finally {
-    await broker?.close?.().catch(() => undefined);
-    await rm(directory, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   }
 });

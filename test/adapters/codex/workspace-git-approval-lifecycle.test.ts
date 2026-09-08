@@ -30,6 +30,7 @@ function executionItem(
   id: string,
   status: "inProgress" | "completed" | "failed",
   outcome?: string,
+  operationId = plan().operationId,
 ): Record<string, unknown> {
   return {
     type: "mcpToolCall",
@@ -37,13 +38,13 @@ function executionItem(
     server: "workspace-git",
     tool: "execute_approved_git_publication",
     status,
-    arguments: { operation_id: plan().operationId },
+    arguments: { operation_id: operationId },
     ...(outcome === undefined
       ? {}
       : {
           result: {
             structuredContent: {
-              operation_id: plan().operationId,
+              operation_id: operationId,
               status: outcome,
             },
           },
@@ -137,7 +138,7 @@ test("does not overwrite an active approved execution", () => {
   assert.equal(lifecycle.approvedPlan("session")?.operationId, plan().operationId);
 });
 
-test("allows a second approval only after the first exact execution succeeds", () => {
+test("allows sequential approvals after each exact execution succeeds", () => {
   const lifecycle = new WorkspaceGitApprovalLifecycle();
   const first = plan();
   const second = plan({
@@ -158,6 +159,17 @@ test("allows a second approval only after the first exact execution succeeds", (
   lifecycle.beginApprovedExecution("session", second);
   assert.equal(lifecycle.approvedPlan("session")?.operationId, second.operationId);
 
+  lifecycle.observeItem(
+    "session",
+    executionItem("execute-second", "completed", "applied", second.operationId),
+  );
+  const third = plan({
+    operationId: "33333333-3333-4333-8333-333333333333",
+    planHash: "e".repeat(64),
+  });
+  lifecycle.beginApprovedExecution("session", third);
+  assert.equal(lifecycle.approvedPlan("session")?.operationId, third.operationId);
+
   assert.equal(
     lifecycle.observeItem(
       "session",
@@ -167,6 +179,47 @@ test("allows a second approval only after the first exact execution succeeds", (
     ).duplicateExecutionDetected,
     true,
   );
+});
+
+test("allows the next approval after an exact execution reaches terminal failed", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  const first = plan();
+  const second = plan({
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  lifecycle.beginApprovedExecution("session", first);
+  lifecycle.observeItem(
+    "session",
+    executionItem("execute-first", "completed", "failed"),
+  );
+
+  assert.equal(lifecycle.approvedPlan("session"), undefined);
+  assert.equal(lifecycle.isCompletedOperation("session", first.operationId), true);
+  lifecycle.beginApprovedExecution("session", second);
+  assert.equal(lifecycle.approvedPlan("session")?.operationId, second.operationId);
+});
+
+test("keeps outcome-uncertain and transport-failed executions fail closed", () => {
+  for (const item of [
+    executionItem("execute-uncertain", "completed", "outcome_uncertain"),
+    executionItem("execute-transport-failed", "failed"),
+  ]) {
+    const lifecycle = new WorkspaceGitApprovalLifecycle();
+    const first = plan();
+    const second = plan({
+      operationId: "22222222-2222-4222-8222-222222222222",
+      planHash: "d".repeat(64),
+    });
+    lifecycle.beginApprovedExecution("session", first);
+    lifecycle.observeItem("session", item);
+
+    assert.equal(lifecycle.approvedPlan("session")?.operationId, first.operationId);
+    assert.throws(
+      () => lifecycle.beginApprovedExecution("session", second),
+      /already active/u,
+    );
+  }
 });
 
 test("does not treat one success plus another unfinished execute as completed", () => {

@@ -144,6 +144,23 @@ class ImmediateFailureAdapter extends GatewayAdapter {
   }
 }
 
+class CapacityFailureOnceAdapter extends GatewayAdapter {
+  #failed = false;
+
+  override async *sendMessage(
+    session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    this.sent.push({ session, request });
+    if (!this.#failed) {
+      this.#failed = true;
+      throw new Error("Selected model is at capacity. Please try a different model.");
+    }
+    yield { type: "message.delta", text: "continued" };
+    yield { type: "status.changed", status: "idle" };
+  }
+}
+
 test("keeps one session across every Slack thread in a channel and resumes it", async () => {
   const registry = new InMemoryAgentRegistry();
   registry.registerAgent({ id: "implementer", adapter: "fake", channelId: "C123" });
@@ -252,6 +269,54 @@ test("isolates and resumes one backend session per Slack root for a thread-scope
   assert.equal(restoredAdapter.created, 0);
   assert.equal(restoredAdapter.resumed, 1);
   assert.equal(restoredAdapter.sent[0]?.session.id, "backend-thread-1");
+});
+
+test("keeps the same Slack conversation binding after a model capacity failure", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({
+    id: "implementer",
+    adapter: "fake",
+    channelId: "C123",
+    conversationScope: "slack_thread",
+  });
+  const adapter = new CapacityFailureOnceAdapter();
+  const gateway = new Gateway(registry, [adapter], { idFactory: () => "session-1" });
+  const message = {
+    channelId: "C123",
+    rootThreadTs: "100.1",
+  } as const;
+
+  await assert.rejects(
+    () => collect(gateway.handleHumanMessage({
+      ...message,
+      text: "Use the selected model",
+    })),
+    /Selected model is at capacity/u,
+  );
+  const bindingAfterFailure = registry.getConversation(
+    message.channelId,
+    message.rootThreadTs,
+  );
+  assert.equal(bindingAfterFailure?.sessionId, "session-1");
+  assert.equal(
+    registry.requireSession("session-1").adapterSession.id,
+    "backend-thread-1",
+  );
+
+  await collect(gateway.handleHumanMessage({
+    ...message,
+    text: "Continue in the same Slack thread",
+  }));
+
+  assert.equal(adapter.created, 1);
+  assert.equal(adapter.sent.length, 2);
+  assert.equal(adapter.sent[0]?.session.id, "backend-thread-1");
+  assert.equal(adapter.sent[1]?.session.id, "backend-thread-1");
+  assert.deepEqual(
+    registry.getConversation(message.channelId, message.rootThreadTs),
+    bindingAfterFailure,
+  );
+  assert.equal(registry.requireSession("session-1").status, "idle");
 });
 
 test("falls back from a missing declared thread to Slack-thread mode", async () => {
@@ -457,6 +522,8 @@ test("continues a delayed Koe result on the same persistent source session", asy
       messageTs: "100.2",
       text: "レビューを依頼して",
       slackUserId: "U123",
+      slackTeamId: "T123",
+      slackAppId: "A123",
     }),
   );
   await collect(
@@ -478,6 +545,15 @@ test("continues a delayed Koe result on the same persistent source session", asy
   assert.equal(adapter.created, 1);
   assert.equal(adapter.sent.length, 2);
   assert.equal(adapter.sent[0]?.session.id, adapter.sent[1]?.session.id);
+  assert.deepEqual(adapter.sent[0]?.request.metadata, {
+    showtalkAgentId: "implementer",
+    showtalkChannelId: "C123",
+    showtalkRootThreadTs: "100.1",
+    showtalkMessageTs: "100.2",
+    showtalkSlackUserId: "U123",
+    showtalkSlackTeamId: "T123",
+    showtalkSlackAppId: "A123",
+  });
   assert.deepEqual(adapter.sent[1]?.request.source, {
     type: "agent",
     agentId: "reviewer",

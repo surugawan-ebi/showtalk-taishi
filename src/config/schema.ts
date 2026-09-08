@@ -45,6 +45,10 @@ const environmentVariableNameSchema = z
   .refine(
     (name) =>
       name.toUpperCase() !== "SHOWTALK_TAISHI_MCP_TOKEN" &&
+      name.toUpperCase() !== "SHOWTALK_APPOPS_APPROVAL_PRIVATE_KEY_FILE" &&
+      name.toUpperCase() !== "SHOWTALK_APPOPS_APPROVAL_KEY_ID" &&
+      name.toUpperCase() !== "APP_OPS_SHOWTALK_APPROVAL_PUBLIC_KEY" &&
+      name.toUpperCase() !== "APP_OPS_SHOWTALK_APPROVAL_KEY_ID" &&
       !/^SLACK_.*TOKEN$/iu.test(name),
     "Gateway or Slack token variables cannot be passed through to a Koe",
   );
@@ -146,6 +150,21 @@ const koeCallNameSchema = z
     (value) => !/[\u0000-\u001f\u007f]/u.test(value),
     "Koe call name must not contain control characters",
   );
+
+const workspaceGitAutonomyCandidateSchema = z
+  .object({
+    profile_id: z.string().uuid(),
+    profile_revision: z.number().int().min(1),
+    requested_ttl_minutes: z.number().int().min(1).max(24 * 60).default(60),
+    label: z
+      .string()
+      .min(1)
+      .max(80)
+      .refine((value) => value === value.trim(), "Profile label must not have surrounding whitespace")
+      .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "Profile label must not contain control characters")
+      .optional(),
+  })
+  .strict();
 
 const slackPresentationSchema = z
   .object({
@@ -249,6 +268,10 @@ export const taishiConfigSchema = z
             adapter_session_id: adapterSessionIdSchema.optional(),
             model: modelIdSchema.optional(),
             reasoning_effort: reasoningEffortSchema.optional(),
+            automatic_choice_mode: z
+              .enum(["off", "ordinary_top_choice"])
+              .default("off"),
+            workspace_git_autonomy: workspaceGitAutonomyCandidateSchema.optional(),
             workspace: z.object({ path: z.string().min(1) }).strict(),
             slack: slackPresentationSchema,
             role: z.string().min(1),

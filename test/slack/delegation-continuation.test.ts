@@ -148,12 +148,15 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
   const client = {
     chat: {
       postMessage: async (input: Record<string, unknown>) => {
+        if (String(input.text).includes("Git操作の承認待ち")) {
+          throw new Error("Slack post failed");
+        }
         posts.push(input);
         return { ok: true, ts: `${100 + posts.length}.1` };
       },
       update: async (input: Record<string, unknown>) => {
         updates.push(input);
-        throw new Error("Slack update failed");
+        return { ok: true };
       },
     },
   } as unknown as WebClient;
@@ -197,7 +200,7 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
         rejected.push(failure);
       },
     ),
-    /Slack update failed/u,
+    /Slack post failed/u,
   );
 
   assert.equal(rejected.length, 1);
@@ -229,8 +232,8 @@ test("rejects a delayed structured request when its Slack buttons cannot be proj
     failure.plan.operationId,
     "22222222-2222-4222-8222-222222222222",
   );
-  assert.ok(posts.length >= 2);
-  assert.ok(updates.length >= 1);
+  assert.equal(posts.filter((post) => post.blocks !== undefined).length, 0);
+  assert.equal(updates.length, 1);
 });
 
 test("settles an externally resolved delayed Git request even when terminal Slack projection fails", async () => {

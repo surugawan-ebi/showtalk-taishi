@@ -143,13 +143,18 @@ export class PermissionApprovalCoordinator {
       resolveDecision = resolve;
     });
     const timer = setTimeout(
-      () => this.#settle(requestId, "deny", "expired"),
+      () => void this.#settle(requestId, "deny", "expired").catch(() => undefined),
       this.#timeoutMs,
     );
     const abortListener =
       signal === undefined
         ? undefined
-        : () => this.#settle(requestId, "deny", "caller_cancelled");
+        : () =>
+            void this.#settle(
+              requestId,
+              "deny",
+              "caller_cancelled",
+            ).catch(() => undefined);
     this.#pending.set(requestId, {
       request,
       expiresAtMs,
@@ -162,7 +167,9 @@ export class PermissionApprovalCoordinator {
       once: true,
     });
     if (isAborted(signal)) {
-      this.#settle(requestId, "deny", "caller_cancelled");
+      void this.#settle(requestId, "deny", "caller_cancelled").catch(
+        () => undefined,
+      );
       return result;
     }
 
@@ -185,18 +192,24 @@ export class PermissionApprovalCoordinator {
         allowSessionGrant: request.allowSessionGrant !== false,
       });
     } catch (error) {
-      this.#settle(requestId, "deny", "caller_cancelled", undefined, false);
+      await this.#settle(
+        requestId,
+        "deny",
+        "caller_cancelled",
+        undefined,
+        false,
+      );
       if (isAborted(signal)) return result;
       throw error;
     }
     return result;
   }
 
-  resolve(
+  async resolve(
     requestId: string,
     decision: PermissionApprovalDecision,
     context: PermissionApprovalResolutionContext = {},
-  ): void {
+  ): Promise<void> {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) {
       throw new CoreError(
@@ -205,7 +218,7 @@ export class PermissionApprovalCoordinator {
       );
     }
     if (this.#now().getTime() >= pending.expiresAtMs) {
-      this.#settle(requestId, "deny", "expired");
+      await this.#settle(requestId, "deny", "expired");
       throw new CoreError(
         "UNKNOWN_APPROVAL_REQUEST",
         `Permission approval has expired: ${requestId}`,
@@ -218,13 +231,18 @@ export class PermissionApprovalCoordinator {
           `Session approval is not allowed for ${pending.request.operation}`,
         );
       }
-      this.#sessionGrants.add(pending.request.grantKey);
     }
-    this.#settle(
+    await this.#settle(
       requestId,
-      decision === "allow_once" || decision === "allow_session" ? "allow" : "deny",
+      decision === "allow_once" || decision === "allow_session"
+        ? "allow"
+        : "deny",
       decision,
       context.resolvedBySlackUserId,
+      true,
+      decision === "allow_session"
+        ? () => this.#sessionGrants.add(pending.request.grantKey)
+        : undefined,
     );
   }
 
@@ -232,20 +250,23 @@ export class PermissionApprovalCoordinator {
     if (!this.#closed) {
       this.#closed = true;
       for (const requestId of [...this.#pending.keys()]) {
-        this.#settle(requestId, "deny", "coordinator_closed");
+        void this.#settle(requestId, "deny", "coordinator_closed").catch(
+          () => undefined,
+        );
       }
       this.#sessionGrants.clear();
     }
     await Promise.allSettled([...this.#settlementTasks]);
   }
 
-  #settle(
+  async #settle(
     requestId: string,
     result: "allow" | "deny",
     reason: PermissionApprovalSettlementReason,
     resolvedBySlackUserId?: string,
     notify = true,
-  ): void {
+    beforeResolve?: () => void,
+  ): Promise<void> {
     const pending = this.#pending.get(requestId);
     if (pending === undefined) return;
     clearTimeout(pending.timer);
@@ -253,23 +274,36 @@ export class PermissionApprovalCoordinator {
       pending.signal.removeEventListener("abort", pending.abortListener);
     }
     this.#pending.delete(requestId);
-    pending.resolve(result);
     if (notify) {
-      this.#notifySettlement({
-        requestId,
-        reason,
-        ...(resolvedBySlackUserId === undefined ? {} : { resolvedBySlackUserId }),
-      });
+      try {
+        await this.#notifySettlement({
+          requestId,
+          reason,
+          ...(resolvedBySlackUserId === undefined
+            ? {}
+            : { resolvedBySlackUserId }),
+        });
+      } catch {
+        // A visible approval must not authorize work until its terminal state
+        // is durably finalized by the configured presenter.
+        pending.resolve("deny");
+        throw new CoreError(
+          "PERMISSION_DENIED",
+          "The permission decision could not be safely finalized",
+        );
+      }
     }
+    beforeResolve?.();
+    pending.resolve(result);
   }
 
-  #notifySettlement(settlement: PermissionApprovalSettlement): void {
+  #notifySettlement(settlement: PermissionApprovalSettlement): Promise<void> {
     const presenter = this.#settlementPresenter;
-    if (presenter === undefined) return;
+    if (presenter === undefined) return Promise.resolve();
     const task = presenter(settlement)
-      .catch(() => undefined)
       .finally(() => this.#settlementTasks.delete(task));
     this.#settlementTasks.add(task);
+    return task;
   }
 }
 

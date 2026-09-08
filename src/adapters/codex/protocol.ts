@@ -157,6 +157,21 @@ export interface TurnStartParams {
   approvalsReviewer?: ApprovalsReviewer;
   model?: string;
   effort?: string;
+  /**
+   * ShowTalk uses Codex's blocking-capable collaboration profile while
+   * supplying execution-oriented instructions of its own. App Server 0.149
+   * derives request_user_input blocking semantics from this mode kind.
+   */
+  collaborationMode?: CodexCollaborationMode;
+}
+
+export interface CodexCollaborationMode {
+  readonly mode: "plan" | "default";
+  readonly settings: {
+    readonly model: string;
+    readonly reasoning_effort: string | null;
+    readonly developer_instructions: string | null;
+  };
 }
 
 export interface CodexAdditionalContextEntry {

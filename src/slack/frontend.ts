@@ -17,10 +17,19 @@ import type {
   PermissionApprovalSettlement,
 } from "../permissions/approval-coordinator.js";
 import {
-  createWorkspaceGitDecisionDeliveryId,
-  isWorkspaceGitDecisionBrokerError,
-  type WorkspaceGitDecisionBroker,
-} from "../approvals/workspace-git-decision-broker.js";
+  createWorkspaceGitHumanDecisionDeliveryId,
+  isWorkspaceGitHumanDecisionBrokerError,
+  type WorkspaceGitHumanDecisionBroker,
+} from "../approvals/workspace-git-human-decision-broker.js";
+import {
+  validateWorkspaceGitAutonomyDisableResult,
+  validateWorkspaceGitAutonomyEnableResult,
+  workspaceGitAutonomyDecisionId,
+  type PersistedWorkspaceGitAutonomyActivation,
+  type WorkspaceGitAutonomyControlBrokerV4,
+  type WorkspaceGitAutonomyRuntimeSettings,
+  type WorkspaceGitAutonomyStatus,
+} from "../approvals/workspace-git-autonomy-control.js";
 import type {
   WorkspaceGitSystemRejectionActor,
   WorkspaceGitSystemRejectionRecorder,
@@ -67,6 +76,7 @@ import {
   buildExpiredWorkspaceGitApprovalBlocks,
   buildUnavailableWorkspaceGitApprovalBlocks,
   buildWorkspaceGitApprovalBlocks,
+  parseUserInputActionToken,
   parseUserInputActionValue,
   parseUserInputBodyVisibility,
   parseUserInputDecision,
@@ -92,7 +102,22 @@ import {
   parseChoiceContinuationOtherSubmission,
   type StructuredChoiceContinuation,
 } from "./choice-continuation.js";
-import { PermissionApprovalCardTracker } from "./permission-card-tracker.js";
+import {
+  PermissionApprovalCardTracker,
+  type PersistedPermissionApprovalCard,
+} from "./permission-card-tracker.js";
+import {
+  createInteractionAudit,
+  type InteractionAudit,
+} from "./interaction-audit.js";
+import {
+  WORKSPACE_GIT_AUTONOMY_ACTION_PREFIX,
+  WorkspaceGitAutonomyCardStore,
+  buildWorkspaceGitAutonomyBlocks,
+  parseWorkspaceGitAutonomyAction,
+  parseWorkspaceGitAutonomyToken,
+  type WorkspaceGitAutonomyCardOperation,
+} from "./workspace-git-autonomy-blocks.js";
 
 export interface SlackFrontendOptions {
   readonly appToken: string;
@@ -105,12 +130,25 @@ export interface SlackFrontendOptions {
     has(eventId: string): boolean;
     record(eventId: string): Promise<void>;
   };
+  readonly permissionApprovalCardOutbox?: {
+    readonly initialCards: readonly PersistedPermissionApprovalCard[];
+    persist(cards: readonly PersistedPermissionApprovalCard[]): Promise<void>;
+  };
   readonly attachmentRoot: string;
   readonly permissionApprovals?: PermissionApprovalCoordinator;
-  readonly workspaceGitDecisionBroker?: WorkspaceGitDecisionBroker;
+  readonly workspaceGitDecisionBroker?: WorkspaceGitHumanDecisionBroker;
+  readonly workspaceGitAutonomyControl?: {
+    readonly broker: WorkspaceGitAutonomyControlBrokerV4;
+    readonly settings: readonly WorkspaceGitAutonomyRuntimeSettings[];
+    readonly initialActivations?: readonly PersistedWorkspaceGitAutonomyActivation[];
+    persist(
+      activations: readonly PersistedWorkspaceGitAutonomyActivation[],
+    ): Promise<void>;
+  };
   readonly workspaceGitSystemRejectionRecorder?: WorkspaceGitSystemRejectionRecorder;
   readonly requestRestart?: () => void;
   readonly now?: () => number;
+  readonly interactionAudit?: InteractionAudit;
 }
 
 export interface HumanSlackMessage {
@@ -120,6 +158,37 @@ export interface HumanSlackMessage {
   readonly thread_ts?: string;
   readonly user?: string;
   readonly fileIds: readonly string[];
+}
+
+export function workspaceGitAutonomyStatus(
+  setting: WorkspaceGitAutonomyRuntimeSettings,
+  activation: PersistedWorkspaceGitAutonomyActivation | undefined,
+  brokerAvailable: boolean,
+  now: number,
+): WorkspaceGitAutonomyStatus {
+  if (!brokerAvailable) {
+    return { koeId: setting.koeId, available: false, state: "unconfigured" };
+  }
+  if (activation !== undefined && activation.state === "enabled") {
+    return {
+      koeId: setting.koeId,
+      available: true,
+      state: Date.parse(activation.expiresAt) <= now ? "expired" : "enabled",
+      profileId: activation.profileId,
+      profileRevision: activation.profileRevision,
+      expiresAt: activation.expiresAt,
+    };
+  }
+  if (setting.candidate === undefined) {
+    return { koeId: setting.koeId, available: false, state: "unconfigured" };
+  }
+  return {
+    koeId: setting.koeId,
+    available: true,
+    state: "disabled",
+    profileId: setting.candidate.profileId,
+    profileRevision: setting.candidate.profileRevision,
+  };
 }
 
 export interface PermissionApprovalMessageRoute {
@@ -133,7 +202,7 @@ const GIT_APPROVAL_REPREPARE_PROMPT = [
   "The Slack approver explicitly requested a fresh Git approval UI.",
   "The previous workspace-git operation is unbound, expired, or otherwise not approvable in this turn.",
   "Do not approve, execute, or reuse the old operation.",
-  "Inspect the current repository/worktree status, re-run the matching workspace-git prepare_* operation with the current exact state in this turn, then immediately call request_user_input with exactly `承認して実行` and `拒否・保留`.",
+  "Inspect the current repository/worktree status, re-run the matching workspace-git prepare_* operation with the current exact state in this turn, then immediately call request_user_input with question ID `git_approval` and exactly `承認して実行` and `拒否・保留`.",
   "If a fresh exact plan cannot be prepared, explain the current blocker without claiming that approval controls were displayed.",
 ].join("\n");
 
@@ -146,7 +215,24 @@ export class SlackFrontend {
   readonly #deduplicator = new SlackEventDeduplicator();
   readonly #fileTransport: SlackFileTransport;
   readonly #permissionApprovals: PermissionApprovalCoordinator | undefined;
-  readonly #workspaceGitDecisionBroker: WorkspaceGitDecisionBroker | undefined;
+  readonly #workspaceGitDecisionBroker:
+    | WorkspaceGitHumanDecisionBroker
+    | undefined;
+  readonly #workspaceGitAutonomyBroker:
+    | WorkspaceGitAutonomyControlBrokerV4
+    | undefined;
+  readonly #workspaceGitAutonomyCards = new WorkspaceGitAutonomyCardStore();
+  readonly #workspaceGitAutonomySettings = new Map<
+    string,
+    WorkspaceGitAutonomyRuntimeSettings
+  >();
+  readonly #workspaceGitAutonomyActivations = new Map<
+    string,
+    PersistedWorkspaceGitAutonomyActivation
+  >();
+  readonly #persistWorkspaceGitAutonomy:
+    | ((activations: readonly PersistedWorkspaceGitAutonomyActivation[]) => Promise<void>)
+    | undefined;
   readonly #workspaceGitSystemRejectionRecorder:
     | WorkspaceGitSystemRejectionRecorder
     | undefined;
@@ -159,8 +245,9 @@ export class SlackFrontend {
   readonly #gitApprovalRecoveryActions = new GitApprovalRecoveryActionTracker();
   readonly #gitApprovalDetails = new WorkspaceGitApprovalDetailsStore();
   readonly #choiceContinuations: StructuredChoiceContinuationStore;
-  readonly #permissionApprovalCards = new PermissionApprovalCardTracker();
+  readonly #permissionApprovalCards: PermissionApprovalCardTracker;
   readonly #now: () => number;
+  readonly #interactionAudit: InteractionAudit;
   #activeMessageHandlers = 0;
   #restartPending = false;
   #stopPromise: Promise<void> | undefined;
@@ -176,13 +263,31 @@ export class SlackFrontend {
     });
     this.#permissionApprovals = options.permissionApprovals;
     this.#workspaceGitDecisionBroker = options.workspaceGitDecisionBroker;
+    this.#workspaceGitAutonomyBroker = options.workspaceGitAutonomyControl?.broker;
+    this.#persistWorkspaceGitAutonomy = options.workspaceGitAutonomyControl?.persist;
+    for (const setting of options.workspaceGitAutonomyControl?.settings ?? []) {
+      this.#workspaceGitAutonomySettings.set(setting.koeId, setting);
+    }
+    for (const activation of options.workspaceGitAutonomyControl?.initialActivations ?? []) {
+      this.#workspaceGitAutonomyActivations.set(activation.koeId, activation);
+    }
     this.#workspaceGitSystemRejectionRecorder =
       options.workspaceGitSystemRejectionRecorder;
     this.#requestRestart = options.requestRestart;
     this.#now = options.now ?? Date.now;
+    this.#interactionAudit = options.interactionAudit ??
+      createInteractionAudit(console.info, this.#now);
     this.#choiceContinuations = new StructuredChoiceContinuationStore(this.#now);
     this.#presentationsByChannel = options.presentationsByChannel ?? {};
     this.#durableEventLedger = options.durableEventLedger;
+    this.#permissionApprovalCards = new PermissionApprovalCardTracker({
+      ...(options.permissionApprovalCardOutbox === undefined
+        ? {}
+        : {
+            initialCards: options.permissionApprovalCardOutbox.initialCards,
+            persist: options.permissionApprovalCardOutbox.persist,
+          }),
+    });
     this.#defaultNotificationUserId = options.approverUserIds[0];
     this.#app = new App({
       token: options.botToken,
@@ -193,12 +298,14 @@ export class SlackFrontend {
     this.#delegationProjector = new SlackDelegationProjector(
       this.#app.client,
       this.#presentationsByChannel,
+      this.#gitApprovalDetails,
     );
     this.#registerListeners();
   }
 
   async start(): Promise<void> {
     await this.#app.start();
+    await this.#recoverPermissionApprovalCards();
   }
 
   async stop(): Promise<void> {
@@ -389,6 +496,104 @@ export class SlackFrontend {
     );
   }
 
+  updateWorkspaceGitAutonomySettings(
+    settings: readonly WorkspaceGitAutonomyRuntimeSettings[],
+  ): void {
+    this.#workspaceGitAutonomySettings.clear();
+    for (const setting of settings) {
+      this.#workspaceGitAutonomySettings.set(setting.koeId, setting);
+    }
+  }
+
+  workspaceGitAutonomyStatuses(): readonly WorkspaceGitAutonomyStatus[] {
+    return [...this.#workspaceGitAutonomySettings.values()].map((setting) =>
+      workspaceGitAutonomyStatus(
+        setting,
+        this.#workspaceGitAutonomyActivations.get(setting.koeId),
+        this.#workspaceGitAutonomyBroker !== undefined,
+        this.#now(),
+      )
+    );
+  }
+
+  async presentWorkspaceGitAutonomyControl(
+    koeId: string,
+    operation: WorkspaceGitAutonomyCardOperation,
+  ): Promise<void> {
+    if (this.#restartPending) {
+      throw new Error("Gateway restart is in progress");
+    }
+    if (this.#workspaceGitAutonomyBroker === undefined) {
+      throw new Error("Workspace Git autonomy is not configured");
+    }
+    const setting = this.#workspaceGitAutonomySettings.get(koeId);
+    if (setting === undefined) throw new Error("Unknown Koe");
+    const activation = this.#workspaceGitAutonomyActivations.get(koeId);
+    if (operation === "enable" && setting.candidate === undefined) {
+      throw new Error("Workspace Git autonomy profile candidate is not configured");
+    }
+    if (operation === "enable" && activation?.state === "enabled" && Date.parse(activation.expiresAt) > this.#now()) {
+      throw new Error("Workspace Git autonomy is already enabled for this Koe");
+    }
+    if (operation === "disable" && activation?.state !== "enabled") {
+      throw new Error("Workspace Git autonomy is not currently enabled for this Koe");
+    }
+    const candidate = setting.candidate ?? {
+      profileId: activation!.profileId,
+      profileRevision: activation!.profileRevision,
+      requestedTtlMinutes: 1,
+    };
+    const token = this.#workspaceGitAutonomyCards.createToken();
+    const posted = await this.#app.client.chat.postMessage({
+      channel: setting.channelId,
+      text: operation === "enable"
+        ? `Workspace Git自動運転の有効化確認: ${koeId}`
+        : `Workspace Git自動運転の無効化確認: ${koeId}`,
+      ...this.#presentation(setting.channelId),
+    });
+    if (typeof posted.ts !== "string") {
+      throw new Error("Slack did not return an autonomy control message timestamp");
+    }
+    const route = {
+      token,
+      operation,
+      koeId,
+      channelId: setting.channelId,
+      rootThreadTs: posted.ts,
+      messageTs: posted.ts,
+      candidate,
+      koeBindingRevision: setting.koeBindingRevision,
+      principalPolicyRevision: setting.principalPolicyRevision,
+      requestedExpiresAt: new Date(
+        this.#now() + candidate.requestedTtlMinutes * 60_000,
+      ).toISOString(),
+      ...(operation === "disable" && activation !== undefined
+        ? { activationHandle: activation.activationHandle }
+        : {}),
+    };
+    this.#workspaceGitAutonomyCards.remember(route);
+    try {
+      await this.#app.client.chat.update({
+        channel: setting.channelId,
+        ts: posted.ts,
+        text: operation === "enable"
+          ? `Workspace Git自動運転の有効化確認: ${koeId}`
+          : `Workspace Git自動運転の無効化確認: ${koeId}`,
+        blocks: buildWorkspaceGitAutonomyBlocks(route),
+      });
+    } catch (error) {
+      this.#workspaceGitAutonomyCards.forget(token);
+      await this.#app.client.chat.delete({ channel: setting.channelId, ts: posted.ts }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #persistWorkspaceGitAutonomyActivations(): Promise<void> {
+    await this.#persistWorkspaceGitAutonomy?.(
+      [...this.#workspaceGitAutonomyActivations.values()],
+    );
+  }
+
   async presentPermissionApproval(
     request: PermissionApprovalPresentation,
   ): Promise<void> {
@@ -412,16 +617,26 @@ export class SlackFrontend {
           : { rootThreadTs: request.sourceRootThreadTs }),
         operation: request.operation,
       };
-      this.#permissionApprovalCards.rememberRoute(request.requestId, route);
+      await this.#permissionApprovalCards.rememberRoute(request.requestId, route);
     } catch (error) {
-      this.#permissionApprovalCards.discardUnroutedSettlement(request.requestId);
+      await this.#permissionApprovalCards
+        .discardUnroutedSettlement(request.requestId)
+        .catch(() => undefined);
+      if (route !== undefined) {
+        await this.#app.client.chat
+          .update(
+            permissionApprovalSettlementUpdateArguments(route, {
+              requestId: request.requestId,
+              reason: "caller_cancelled",
+            }),
+          )
+          .catch(() => undefined);
+      }
       throw error;
     }
     if (this.#permissionApprovalCards.settlementFor(request.requestId) !== undefined) {
-      // The operation has already settled. A cosmetic update failure must not
-      // reverse that decision; retain both records so a click can retry it.
       await this.#applyPermissionApprovalSettlement(request.requestId).catch(
-        () => undefined,
+        reportPermissionApprovalUpdateError,
       );
     }
   }
@@ -429,8 +644,19 @@ export class SlackFrontend {
   async settlePermissionApproval(
     settlement: PermissionApprovalSettlement,
   ): Promise<void> {
-    this.#permissionApprovalCards.rememberSettlement(settlement);
-    await this.#applyPermissionApprovalSettlement(settlement.requestId);
+    await this.#permissionApprovalCards.rememberSettlement(settlement);
+    await this.#applyPermissionApprovalSettlement(settlement.requestId).catch(
+      reportPermissionApprovalUpdateError,
+    );
+  }
+
+  async #recoverPermissionApprovalCards(): Promise<void> {
+    await this.#permissionApprovalCards.closeUnsettled();
+    for (const card of this.#permissionApprovalCards.list()) {
+      await this.#applyPermissionApprovalSettlement(card.requestId).catch(
+        () => undefined,
+      );
+    }
   }
 
   async #applyPermissionApprovalSettlement(
@@ -677,6 +903,7 @@ export class SlackFrontend {
           presentation: this.#presentation(continuation.channelId),
           gitApprovalDetailsStore: this.#gitApprovalDetails,
           choiceContinuationStore: this.#choiceContinuations,
+          interactionAudit: this.#interactionAudit,
         },
       );
       const results = this.#gateway.handleHumanMessage({
@@ -692,7 +919,11 @@ export class SlackFrontend {
           await client.chat.update({
             channel: continuation.channelId,
             ts: continuation.messageTs,
-            text: `回答を新しいターンとして受け付けました（<@${userId}>）。`,
+            text: choiceReceiptText(
+              userId,
+              continuation.question.purpose,
+              true,
+            ),
             blocks: [],
           });
         },
@@ -759,6 +990,7 @@ export class SlackFrontend {
       if (!this.#deduplicator.accept(body.event_id)) return;
       const message = parseHumanSlackMessage(event);
       if (message === undefined) return;
+      const slackEnvelopeIdentity = parseSlackEventEnvelopeIdentity(body);
       if (!this.#agentChannels.has(message.channel)) return;
       if (message.text.trim().length === 0 && message.fileIds.length === 0) return;
       const agentId = this.#agentIdsByChannel.get(message.channel);
@@ -788,6 +1020,7 @@ export class SlackFrontend {
               presentation: this.#presentation(message.channel),
               gitApprovalDetailsStore: this.#gitApprovalDetails,
               choiceContinuationStore: this.#choiceContinuations,
+              interactionAudit: this.#interactionAudit,
           },
         );
         let projectionStarted = false;
@@ -865,6 +1098,12 @@ export class SlackFrontend {
             ...(typeof message.user === "string"
               ? { slackUserId: message.user }
               : {}),
+            ...(slackEnvelopeIdentity === undefined
+              ? {}
+              : {
+                  slackTeamId: slackEnvelopeIdentity.teamId,
+                  slackAppId: slackEnvelopeIdentity.appId,
+                }),
           })) {
             projector.setSessionId(result.sessionId);
             if (result.event.type === "git_approval.resolved_externally") {
@@ -1057,12 +1296,24 @@ export class SlackFrontend {
         const bodyRecord = asRecord(body);
         const userId = asString(asRecord(bodyRecord?.user)?.id);
         const channelId = asString(asRecord(bodyRecord?.channel)?.id);
+        let auditRoute: {
+          readonly requestId: string;
+          readonly channelId: string;
+          readonly rootThreadTs: string;
+          readonly messageTs: string;
+        } | undefined;
         try {
           const { kind, routing, source } = parseTrustedChoiceAction(
             body,
             action,
             this.#approvers,
           );
+          auditRoute = routing;
+          this.#interactionAudit({
+            event: "choice.action_received",
+            ...routing,
+            outcome: kind,
+          });
           const continuation =
             this.#choiceContinuations.getForOriginalRequest(routing.requestId);
           if (continuation !== undefined) {
@@ -1122,6 +1373,10 @@ export class SlackFrontend {
               },
             },
           );
+          this.#interactionAudit({
+            event: "choice.answer_applied",
+            ...routing,
+          });
           this.#choiceContinuations.forgetDisplayed(
             routing.requestId,
             routing.messageTs,
@@ -1129,10 +1384,19 @@ export class SlackFrontend {
           await client.chat.update({
             channel: source.channelId,
             ts: source.messageTs,
-            text: `回答を受け付けました（<@${source.userId}>）。`,
+            text: choiceReceiptText(source.userId, routing.purpose),
             blocks: [],
-          }).catch((error) => logger.error(error));
+          }).then(() => this.#interactionAudit({
+            event: "choice.card_terminalized",
+            ...routing,
+            outcome: "answered",
+          })).catch((error) => logger.error(error));
         } catch (error) {
+          this.#interactionAudit({
+            event: "choice.action_failed",
+            ...auditRoute,
+            outcome: error instanceof Error ? error.name : "unknown_error",
+          });
           logger.error(error);
           if (userId !== undefined && channelId !== undefined) {
             await client.chat.postEphemeral({
@@ -1316,6 +1580,168 @@ export class SlackFrontend {
     );
 
     this.#app.action(
+      new RegExp(`^${escapeRegExp(WORKSPACE_GIT_AUTONOMY_ACTION_PREFIX)}`),
+      async ({ ack, body, action, client, logger }) => {
+        await ack();
+        const finishHandler = this.#beginSlackHandler();
+        const bodyRecord = asRecord(body);
+        const userId = asString(asRecord(bodyRecord?.user)?.id);
+        const channelId = asString(asRecord(bodyRecord?.channel)?.id);
+        try {
+          const actionRecord = asRecord(action);
+          const operation = parseWorkspaceGitAutonomyAction(
+            asString(actionRecord?.action_id) ?? "",
+          );
+          if (operation === undefined) {
+            throw new Error("Unsupported Workspace Git autonomy action");
+          }
+          const token = parseWorkspaceGitAutonomyToken(actionRecord?.value);
+          const route = this.#workspaceGitAutonomyCards.get(token);
+          if (route === undefined) {
+            throw new Error("This Workspace Git autonomy control is unavailable or expired");
+          }
+          const source = validateSlackActionSource(
+            body,
+            {
+              channelId: route.channelId,
+              rootThreadTs: route.rootThreadTs,
+              messageTs: route.messageTs,
+            },
+            this.#approvers,
+          );
+          if (operation === "hold") {
+            this.#workspaceGitAutonomyCards.forget(token);
+            await client.chat.update({
+              channel: source.channelId,
+              ts: source.messageTs,
+              text: `Workspace Git自動運転の変更を保留しました（<@${source.userId}>）。`,
+              blocks: [],
+            });
+            return;
+          }
+          if (operation !== route.operation) {
+            throw new Error("Workspace Git autonomy action does not match its card");
+          }
+          const current = this.#workspaceGitAutonomySettings.get(route.koeId);
+          const currentActivation =
+            this.#workspaceGitAutonomyActivations.get(route.koeId);
+          const settingsChanged = current === undefined ||
+            current.channelId !== route.channelId ||
+            (operation === "enable" &&
+              (current.candidate === undefined ||
+                current.koeBindingRevision !== route.koeBindingRevision ||
+                current.principalPolicyRevision !== route.principalPolicyRevision ||
+                current.candidate.profileId !== route.candidate.profileId ||
+                current.candidate.profileRevision !== route.candidate.profileRevision)) ||
+            (operation === "disable" &&
+              (route.activationHandle === undefined ||
+                currentActivation?.state !== "enabled" ||
+                currentActivation.activationHandle !== route.activationHandle));
+          if (settingsChanged) {
+            throw new Error("Workspace Git autonomy settings changed after this card was posted");
+          }
+          if (this.#workspaceGitAutonomyBroker === undefined) {
+            throw new Error("Workspace Git autonomy control is unavailable");
+          }
+          const decisionId = workspaceGitAutonomyDecisionId({
+            operation,
+            token,
+            teamId: source.teamId,
+            appId: source.apiAppId,
+            channelId: source.channelId,
+            rootThreadTs: route.rootThreadTs,
+            messageTs: source.messageTs,
+            userId: source.userId,
+            koeId: route.koeId,
+            profileId: route.candidate.profileId,
+            profileRevision: route.candidate.profileRevision,
+            koeBindingRevision: route.koeBindingRevision,
+            principalPolicyRevision: route.principalPolicyRevision,
+          });
+          if (operation === "enable") {
+            const result = validateWorkspaceGitAutonomyEnableResult(
+              await this.#workspaceGitAutonomyBroker.enable({
+                version: 4,
+                decision_id: decisionId,
+                profile_id: route.candidate.profileId,
+                profile_revision: route.candidate.profileRevision,
+                team_id: source.teamId,
+                app_id: source.apiAppId,
+                koe_id: route.koeId,
+                koe_binding_revision: route.koeBindingRevision,
+                principal_policy_revision: route.principalPolicyRevision,
+                activated_by_user_id: source.userId,
+                requested_expires_at: route.requestedExpiresAt,
+                issued_from: {
+                  channel_id: source.channelId,
+                  root_thread_ts: route.rootThreadTs,
+                  source_message_ts: source.messageTs,
+                },
+              }),
+            );
+            this.#workspaceGitAutonomyActivations.set(route.koeId, {
+              koeId: route.koeId,
+              profileId: route.candidate.profileId,
+              profileRevision: route.candidate.profileRevision,
+              activationHandle: result.activation_handle,
+              expiresAt: result.expires_at,
+              state: "enabled",
+              updatedAt: new Date(this.#now()).toISOString(),
+            });
+            await this.#persistWorkspaceGitAutonomyActivations();
+            await client.chat.update({
+              channel: source.channelId,
+              ts: source.messageTs,
+              text: `Workspace Git自動運転を有効化しました（<@${source.userId}>）。`,
+              blocks: [],
+            });
+          } else {
+            if (route.activationHandle === undefined) {
+              throw new Error("Workspace Git autonomy activation handle is unavailable");
+            }
+            validateWorkspaceGitAutonomyDisableResult(
+              await this.#workspaceGitAutonomyBroker.disable({
+                version: 4,
+                activation_handle: route.activationHandle,
+                decision_id: decisionId,
+                disabled_by_user_id: source.userId,
+              }),
+              route.activationHandle,
+            );
+            const previous = this.#workspaceGitAutonomyActivations.get(route.koeId);
+            if (previous !== undefined) {
+              this.#workspaceGitAutonomyActivations.set(route.koeId, {
+                ...previous,
+                state: "disabled",
+                updatedAt: new Date(this.#now()).toISOString(),
+              });
+            }
+            await this.#persistWorkspaceGitAutonomyActivations();
+            await client.chat.update({
+              channel: source.channelId,
+              ts: source.messageTs,
+              text: `Workspace Git自動運転を無効化しました（<@${source.userId}>）。`,
+              blocks: [],
+            });
+          }
+          this.#workspaceGitAutonomyCards.forget(token);
+        } catch (error) {
+          logger.error("Workspace Git autonomy control failed");
+          if (userId !== undefined && channelId !== undefined) {
+            await client.chat.postEphemeral({
+              channel: channelId,
+              user: userId,
+              text: "Workspace Git自動運転を変更できませんでした。設定・期限・権限を確認して、新しい確認カードからやり直してください。",
+              ...this.#presentation(channelId),
+            }).catch((postError) => logger.error(postError));
+          }
+        } finally {
+          finishHandler();
+        }
+      },
+    );
+
+    this.#app.action(
       new RegExp(`^${escapeRegExp(USER_INPUT_ACTION_PREFIX)}`),
       async ({ ack, body, action, client, logger }) => {
         await ack();
@@ -1326,6 +1752,7 @@ export class SlackFrontend {
         const actionId = asString(asRecord(action)?.action_id) ?? "";
         const pathVisibility = parseUserInputPathVisibility(actionId);
         const bodyVisibility = parseUserInputBodyVisibility(actionId);
+        let auditRoute: UserInputActionValue | undefined;
         try {
           if (pathVisibility !== undefined || bodyVisibility !== undefined) {
             const { routing, source } = pathVisibility !== undefined
@@ -1387,6 +1814,12 @@ export class SlackFrontend {
             action,
             this.#approvers,
           );
+          auditRoute = routing;
+          this.#interactionAudit({
+            event: "git_approval.action_received",
+            ...routing,
+            outcome: decision,
+          });
           await this.#gitApprovalDetails.serialize(routing, async () => {
             const details = this.#gitApprovalDetails.get(routing);
             if (details === undefined) {
@@ -1397,11 +1830,17 @@ export class SlackFrontend {
               return;
             }
             try {
+              const koeId = this.#agentIdsByChannel.get(routing.channelId);
+              if (koeId === undefined || details.sessionId === undefined) {
+                throw new Error(
+                  "The authenticated workspace-git decision context is unavailable",
+                );
+              }
               await recordGitDecisionBeforeAppServerResume(
                 this.#workspaceGitDecisionBroker,
                 details.plan,
                 decision,
-                createWorkspaceGitDecisionDeliveryId({
+                createWorkspaceGitHumanDecisionDeliveryId({
                   channelId: routing.channelId,
                   rootThreadTs: routing.rootThreadTs,
                   messageTs: routing.messageTs,
@@ -1411,6 +1850,13 @@ export class SlackFrontend {
                   operationId: details.plan.operationId,
                   planHash: details.plan.planHash,
                 }),
+                {
+                  callerId: source.userId,
+                  koeId,
+                  channelId: routing.channelId,
+                  rootThreadTs: routing.rootThreadTs,
+                  sessionId: details.sessionId,
+                },
                 () => this.#gateway.resolveUserInput(
                   routing.channelId,
                   routing.rootThreadTs,
@@ -1421,6 +1867,11 @@ export class SlackFrontend {
                   },
                 ),
               );
+              this.#interactionAudit({
+                event: "git_approval.answer_applied",
+                ...routing,
+                outcome: decision,
+              });
             } catch (error) {
               logger.error(error);
               if (!canSafelyRejectAfterPrivateGitDecisionFailure(error)) {
@@ -1444,6 +1895,11 @@ export class SlackFrontend {
                     : `Git plan rejected or held by <@${source.userId}>.`,
                 blocks: [],
               });
+              this.#interactionAudit({
+                event: "git_approval.card_terminalized",
+                ...routing,
+                outcome: decision,
+              });
             } catch (error) {
               // The App Server response is already single-use. A cosmetic Slack
               // update failure must never cause a second approval attempt.
@@ -1451,6 +1907,11 @@ export class SlackFrontend {
             }
           });
         } catch (error) {
+          this.#interactionAudit({
+            event: "git_approval.action_failed",
+            ...auditRoute,
+            outcome: error instanceof Error ? error.name : "unknown_error",
+          });
           logger.error(error);
           if (userId !== undefined && channelId !== undefined) {
             await client.chat.postEphemeral({
@@ -1529,6 +1990,7 @@ export class SlackFrontend {
               presentation: this.#presentation(routing.channelId),
               gitApprovalDetailsStore: this.#gitApprovalDetails,
               choiceContinuationStore: this.#choiceContinuations,
+              interactionAudit: this.#interactionAudit,
             },
           );
           try {
@@ -1674,6 +2136,22 @@ export class SlackFrontend {
           const route = this.#permissionApprovalCards.routeFor(
             preliminary.requestId,
           );
+          if (route === undefined) {
+            const orphaned = parseOrphanedPermissionActionSource(
+              body,
+              action,
+              this.#approvers,
+            );
+            await client.chat.update({
+              channel: orphaned.channelId,
+              ts: orphaned.messageTs,
+              text:
+                "These permission controls are no longer active after the Gateway state changed. " +
+                "This click did not authorize any new action; check later operation status separately.",
+              blocks: [],
+            });
+            return;
+          }
           const { decision, approval } = parseTrustedPermissionAction(
             body,
             action,
@@ -1687,7 +2165,7 @@ export class SlackFrontend {
             await this.#applyPermissionApprovalSettlement(approval.requestId);
             return;
           }
-          this.#permissionApprovals.resolve(approval.requestId, decision, {
+          await this.#permissionApprovals.resolve(approval.requestId, decision, {
             resolvedBySlackUserId: userId,
           });
         } catch (error) {
@@ -1860,6 +2338,14 @@ function permissionApprovalSettlementText(
   }
 }
 
+function reportPermissionApprovalUpdateError(error: unknown): void {
+  console.error(
+    `ShowTalk Taishi could not close a permission approval card: ${
+      error instanceof Error ? error.message : "unknown error"
+    }`,
+  );
+}
+
 export function parseHumanSlackMessage(
   value: unknown,
 ): HumanSlackMessage | undefined {
@@ -1897,6 +2383,23 @@ export function parseHumanSlackMessage(
   };
 }
 
+function parseSlackEventEnvelopeIdentity(
+  value: unknown,
+): { readonly teamId: string; readonly appId: string } | undefined {
+  const body = asRecord(value);
+  const teamId = asString(body?.team_id);
+  const appId = asString(body?.api_app_id);
+  if (
+    teamId === undefined ||
+    appId === undefined ||
+    !/^T[A-Z0-9]{1,127}$/u.test(teamId) ||
+    !/^A[A-Z0-9]{1,127}$/u.test(appId)
+  ) {
+    return undefined;
+  }
+  return { teamId, appId };
+}
+
 export function parseTrustedGitPlanAction(
   body: unknown,
   action: unknown,
@@ -1909,10 +2412,11 @@ export function parseTrustedGitPlanAction(
   if (decision === undefined) {
     throw new Error("Unsupported Git plan action ID");
   }
-  const routing = parseUserInputActionValue(
-    asString(actionRecord?.value) ?? "",
+  const { routing, source } = parseTrustedGitPlanRouting(
+    body,
+    action,
+    approvers,
   );
-  const source = validateSlackActionSource(body, routing, approvers);
   return { decision, routing, source };
 }
 
@@ -1945,6 +2449,40 @@ export function parseTrustedPermissionAction(
     approvers,
   );
   return { decision, approval, route, source };
+}
+
+/** Fail-closed recovery for cards whose process-owned route was lost on restart. */
+export function parseOrphanedPermissionActionSource(
+  body: unknown,
+  action: unknown,
+  approvers: ReadonlySet<string>,
+) {
+  const actionRecord = asRecord(action);
+  if (
+    parsePermissionDecision(asString(actionRecord?.action_id) ?? "") === undefined
+  ) {
+    throw new Error("Unsupported permission approval action ID");
+  }
+  const approval = parsePermissionActionValue(
+    asString(actionRecord?.value) ?? "",
+  );
+  const bodyRecord = asRecord(body);
+  const message = asRecord(bodyRecord?.message);
+  const messageTs = asString(message?.ts);
+  const rootThreadTs = asString(message?.thread_ts) ?? messageTs;
+  if (messageTs === undefined || rootThreadTs === undefined) {
+    throw new Error("Permission approval source is incomplete");
+  }
+  const source = validateSlackActionSource(
+    body,
+    {
+      channelId: approval.channelId,
+      rootThreadTs,
+      messageTs,
+    },
+    approvers,
+  );
+  return { ...source, requestId: approval.requestId };
 }
 
 export function parseTrustedConversationControlAction(
@@ -1997,10 +2535,11 @@ export function parseTrustedGitPlanPathAction(
   if (visibility === undefined) {
     throw new Error("Unsupported Git file-list action ID");
   }
-  const routing = parseUserInputActionValue(
-    asString(actionRecord?.value) ?? "",
+  const { routing, source } = parseTrustedGitPlanRouting(
+    body,
+    action,
+    approvers,
   );
-  const source = validateSlackActionSource(body, routing, approvers);
   return { visibility, routing, source };
 }
 
@@ -2016,11 +2555,41 @@ export function parseTrustedGitPlanBodyAction(
   if (visibility === undefined) {
     throw new Error("Unsupported Git PR-body action ID");
   }
-  const routing = parseUserInputActionValue(
-    asString(actionRecord?.value) ?? "",
+  const { routing, source } = parseTrustedGitPlanRouting(
+    body,
+    action,
+    approvers,
   );
-  const source = validateSlackActionSource(body, routing, approvers);
   return { visibility, routing, source };
+}
+
+function parseTrustedGitPlanRouting(
+  body: unknown,
+  action: unknown,
+  approvers: ReadonlySet<string>,
+) {
+  const actionRecord = asRecord(action);
+  const rawValue = asString(actionRecord?.value) ?? "";
+  let token: ReturnType<typeof parseUserInputActionToken> | undefined;
+  try {
+    token = parseUserInputActionToken(rawValue);
+  } catch {
+    // Older cards carried the message timestamp in the action payload.
+    // Continue below and accept that format for cards already in Slack.
+  }
+  if (token !== undefined) {
+    const source = validateSlackActionSource(body, token, approvers);
+    return {
+      routing: {
+        ...token,
+        messageTs: source.messageTs,
+      },
+      source,
+    };
+  }
+  const routing = parseUserInputActionValue(rawValue);
+  const source = validateSlackActionSource(body, routing, approvers);
+  return { routing, source };
 }
 
 /**
@@ -2028,10 +2597,17 @@ export function parseTrustedGitPlanBodyAction(
  * Server response. A broker failure must leave the structured request pending.
  */
 export async function recordGitDecisionBeforeAppServerResume(
-  broker: WorkspaceGitDecisionBroker | undefined,
+  broker: WorkspaceGitHumanDecisionBroker | undefined,
   plan: WorkspaceGitApprovalPlan,
   decision: "approve" | "reject",
   deliveryId: string,
+  context: {
+    readonly callerId: string;
+    readonly koeId: string;
+    readonly channelId: string;
+    readonly rootThreadTs: string;
+    readonly sessionId: string;
+  },
   resume: () => Promise<void>,
 ): Promise<void> {
   if (broker === undefined) {
@@ -2040,8 +2616,8 @@ export async function recordGitDecisionBeforeAppServerResume(
   await broker.recordDecision({
     decision,
     plan,
-    actor: "chat-user-via-showtalk",
     deliveryId,
+    context,
   });
   await resume();
 }
@@ -2049,7 +2625,7 @@ export async function recordGitDecisionBeforeAppServerResume(
 export function canSafelyRejectAfterPrivateGitDecisionFailure(
   error: unknown,
 ): boolean {
-  if (!isWorkspaceGitDecisionBrokerError(error)) return false;
+  if (!isWorkspaceGitHumanDecisionBrokerError(error)) return false;
   switch (error.code) {
     case "invalid_decision":
     case "operation_not_found":
@@ -2185,6 +2761,22 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function publicErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unexpected gateway error";
+}
+
+export function choiceReceiptText(
+  userId: string,
+  purpose: "ordinary" | "external_action_confirmation" | undefined,
+  continued = false,
+): string {
+  if (purpose === "external_action_confirmation") {
+    const accepted = continued
+      ? "外部操作への回答を新しいターンとして受け付けました"
+      : "外部操作への回答を受け付けました";
+    return `${accepted}（<@${userId}>）。workspace-gitのGit操作は承認されていません。`;
+  }
+  return continued
+    ? `回答を新しいターンとして受け付けました（<@${userId}>）。`
+    : `回答を受け付けました（<@${userId}>）。`;
 }
 
 function structuredChoiceContinuationPrompt(

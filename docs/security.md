@@ -262,29 +262,30 @@ reported as errors and are not retried. Already rejected, executing, applied,
 partial, failed, outcome-uncertain, or expired operations are terminal and are
 not replayed.
 
-The private broker is opt-in and fail-closed. It is enabled only when the
-Gateway process has an absolute `SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE` path
-and the same absolute `WORKSPACE_GIT_STATE_ROOT` used by workspace-git. Gateway
-loads that owner-controlled module once in a dedicated Worker whose environment
-contains only the private state root; Slack, MCP, admin, and other
-parent-process credentials are not inherited. Human decisions carry the full
-exact public plan scope and opaque authority ID. workspace-git compares them and atomically transitions
-the private state under one lock. Under that same lock it recomputes the hash of
-the persisted plan and requires it to equal both the stored and submitted full
-plan hash. A delivery ID binds the decision to the exact Slack message,
-structured request, approver, choice, operation, and plan: the same callback is
-idempotent, but a different delivery cannot replay it after a restart. The
-module is not an MCP tool, and no approval CLI is invoked. Worker replies expose
-only bounded error classifications and each write has a timeout. On timeout the
-Worker re-inspects the same authority, operation, scope, and delivery ID. A
-confirmed late write resumes the bound App Server request; a pending or unreadable
-result remains outcome-unknown, leaves both the request and Slack controls pending,
-and can be reconciled idempotently by the same button. It is never converted into
-a contradictory rejection. Permanent stale, missing, mismatched, or expired plans
-can be rejected safely and replaced with a fresh-plan recovery card. Permanent
-rejection intents are not retried forever; transient or outcome-unknown intents
+The private human-decision broker is opt-in and fail-closed. The OSS runtime
+accepts only a version-1 human-only structural composition from an explicitly
+configured isolated-worker module. It has no compile-time local-mcp dependency
+and receives no socket paths, signature keys, response-MAC keys, profiles, or
+authority records. Human decisions carry public exact-plan correlation plus
+authenticated caller, Koe, channel, root-thread, and session identities; scope
+is re-read inside workspace-git. Public prepare output containing
+`approval_authority_id` is rejected before Slack projection. A delivery ID
+binds the decision to the exact Slack message, structured request, approver,
+choice, operation, and plan. The module path must be absolute, same-owner,
+regular, non-symlink, and non-group/world-writable; the worker environment
+contains only `WORKSPACE_GIT_STATE_ROOT`. Unknown transport outcomes leave both
+the request and Slack controls pending and can be reconciled idempotently by the
+same button. They are never converted into a contradictory rejection. Permanent
+stale, missing, mismatched, or expired plans can be rejected safely and replaced
+with a fresh-plan recovery card.
+Permanent rejection intents are not retried forever; transient or outcome-unknown intents
 remain bounded and fail closed. No Git write is authorized from an uncertain
 transport result.
+
+Autonomous workspace-git execution is retired. Production runtime and Gateway
+composition reject automation-provider and autonomy-control factories. Stored
+legacy candidates or activations are not authority and cannot bypass the
+human-only manual broker.
 
 Ordinary structured questions are classified only after the bounded
 same-turn Git-plan race window. They use a separate Slack action namespace and
@@ -369,9 +370,13 @@ provide the approver identity or bypass the parent Supervisor with a supported
 tool. The Worker drains accepted work, flushes state, and releases the exclusive
 lock before its parent starts a replacement. Draining closes admission before
 the idle check and waits until accepted MCP HTTP responses and Slack handlers
-have completed. Duplicate restart requests are
-coalesced, and unexpected Worker exits are not placed in an automatic crash
-loop.
+have completed. A Koe restart is not scheduled until its exact MCP HTTP
+response finishes. Before that response, Taishi atomically stores a bounded,
+TTL-scoped hash of the authenticated caller and host request ID; a replacement
+Worker returns the recorded result without asking again or scheduling another
+replacement. Duplicate restart requests are therefore coalesced across the
+Worker boundary, and unexpected Worker exits are not placed in an automatic
+crash loop.
 
 The state file contains Agent definitions, local workspace paths, canonical
 session IDs, backend thread IDs, statuses, and Slack reply-location mappings. It does not
@@ -381,9 +386,12 @@ with owner-only modes. Writes are serialized and atomically renamed. Taishi
 holds an exclusive adjacent lock for the runtime lifetime and rejects a second
 live process that targets the same state file; a dead-PID lock can be recovered.
 
-Pending approvals, structured Git choices, and ordinary structured questions
-are bound to live RPC/tool requests and remain in memory. They are single-use,
-expire, and resolve to denial, rejection, or cancellation during shutdown.
+Approval authority, structured Git choices, and ordinary structured questions
+remain bound to live RPC/tool requests. Permission-card routes and terminal
+settlements alone use a bounded durable outbox so a replacement Worker can
+remove stale buttons; an unsettled recovered card is closed without granting
+authority. Requests are single-use, expire, and resolve to denial, rejection,
+or cancellation during shutdown.
 After a restart, stale `starting`, `running`, `waiting_for_approval`, and
 `waiting_for_input` statuses become
 `interrupted`; the persistent Codex thread can then be resumed by the next

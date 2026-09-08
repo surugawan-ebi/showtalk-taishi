@@ -11,6 +11,8 @@ import {
 } from "../core/index.js";
 import type { PermissionApprovalCoordinator } from "../permissions/approval-coordinator.js";
 import type { PermissionEngine } from "../permissions/engine.js";
+import type { AppOpsApprovalProofBroker } from "../approvals/appops-approval-proof.js";
+import type { GatewayRestartReplayGuard } from "../state/gateway-restart-replay-guard.js";
 import { MAX_LISTED_AGENTS, MAX_RESULT_MESSAGE_LENGTH } from "./schemas.js";
 import {
   withResolvedWorkspaceAttachments,
@@ -21,6 +23,8 @@ import {
   type McpAgentListResult,
   type McpAgentSendResult,
   type McpAgentStatusResult,
+  type McpAppOpsPreToolUseInput,
+  type McpAppOpsPreToolUseResult,
   type McpCallerContext,
   type McpGatewayRestartResult,
   type McpSlackAttachmentInput,
@@ -31,6 +35,12 @@ import {
 export interface RuntimeMcpServiceOptions {
   readonly onProjectionError?: (error: unknown) => void;
   readonly onRestartRequested?: () => void;
+  readonly gatewayRestartReplayGuard?: Pick<
+    GatewayRestartReplayGuard,
+    "record" | "consume"
+  >;
+  readonly runtimeInstanceId?: string;
+  readonly appOpsApprovalProofBroker?: AppOpsApprovalProofBroker;
 }
 
 export interface RuntimeSlackPort {
@@ -80,6 +90,11 @@ export class RuntimeMcpService implements SwitchboardMcpService {
   readonly #approvals: PermissionApprovalCoordinator;
   readonly #onProjectionError: (error: unknown) => void;
   readonly #onRestartRequested: (() => void) | undefined;
+  readonly #gatewayRestartReplayGuard:
+    | Pick<GatewayRestartReplayGuard, "record" | "consume">
+    | undefined;
+  readonly #runtimeInstanceId: string | undefined;
+  readonly #appOpsApprovalProofBroker: AppOpsApprovalProofBroker | undefined;
   readonly #idempotency = new Map<string, IdempotencyEntry>();
   readonly #shutdown = new AbortController();
   readonly #idleWaiters = new Set<() => void>();
@@ -101,6 +116,17 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     this.#approvals = approvals;
     this.#onProjectionError = options.onProjectionError ?? (() => undefined);
     this.#onRestartRequested = options.onRestartRequested;
+    this.#gatewayRestartReplayGuard = options.gatewayRestartReplayGuard;
+    this.#runtimeInstanceId = options.runtimeInstanceId;
+    this.#appOpsApprovalProofBroker = options.appOpsApprovalProofBroker;
+    if (
+      this.#gatewayRestartReplayGuard !== undefined &&
+      this.#runtimeInstanceId === undefined
+    ) {
+      throw new TypeError(
+        "A runtime instance ID is required for durable Gateway restart receipts",
+      );
+    }
   }
 
   attach(router: AgentRouter, gateway: Gateway, slack: RuntimeSlackPort): void {
@@ -211,6 +237,39 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     );
   }
 
+  appOpsPreToolUse(
+    context: McpCallerContext,
+    input: McpAppOpsPreToolUseInput,
+  ): McpAppOpsPreToolUseResult {
+    context = this.#liveContext(context);
+    const caller = this.#requireCaller(context);
+    const decision = this.#appOpsApprovalProofBroker?.consume(caller.id, {
+      sessionId: input.session_id,
+      turnId: input.turn_id,
+      toolName: input.tool_name,
+      toolUseId: input.tool_use_id,
+      toolInput: input.tool_input,
+    });
+    if (decision?.kind === "allow") {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: decision.updatedInput,
+        },
+      };
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason:
+          decision?.reason ??
+          "The AppOps approval proof handoff is unavailable",
+      },
+    };
+  }
+
   async #executeGatewayRestart(
     context: McpCallerContext,
   ): Promise<McpGatewayRestartResult> {
@@ -221,6 +280,19 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       );
     }
     const caller = this.#requireCaller(context);
+    const replayKey = restartReplayKey(caller.id, context.requestId);
+    if (this.#gatewayRestartReplayGuard !== undefined) {
+      let replayed: boolean;
+      try {
+        replayed = await this.#gatewayRestartReplayGuard.consume(replayKey);
+      } catch {
+        throw new McpServiceError(
+          "SERVICE_UNAVAILABLE",
+          "The Gateway restart replay receipt could not be consumed safely",
+        );
+      }
+      if (replayed) return { status: "scheduled" };
+    }
     const sourceTurn = this.#captureSourceSlackTurn(caller.id, caller.channelId);
     const result = await this.#approvals.authorize(
       "approval",
@@ -252,14 +324,33 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       );
     }
 
-    if (!this.#restartRequested) {
+    if (this.#gatewayRestartReplayGuard !== undefined) {
+      try {
+        await this.#gatewayRestartReplayGuard.record(
+          replayKey,
+          this.#runtimeInstanceId!,
+        );
+      } catch (error) {
+        throw new McpServiceError(
+          "SERVICE_UNAVAILABLE",
+          "The Gateway restart receipt could not be recorded safely",
+        );
+      }
+    }
+    const requestRestartOnce = () => {
+      if (this.#restartRequested) return;
       this.#restartRequested = true;
       try {
-        this.#onRestartRequested();
+        this.#onRestartRequested?.();
       } catch (error) {
         this.#restartRequested = false;
         throw error;
       }
+    };
+    if (context.deferUntilResponseFinished === undefined) {
+      requestRestartOnce();
+    } else {
+      context.deferUntilResponseFinished(requestRestartOnce);
     }
     return { status: "scheduled" };
   }
@@ -540,19 +631,42 @@ export class RuntimeMcpService implements SwitchboardMcpService {
 
   async slackReply(
     context: McpCallerContext,
-    channel: string,
-    threadTs: string,
+    channel?: string,
+    threadTs?: string,
     message?: string,
     attachments: readonly McpSlackAttachmentInput[] = [],
   ): Promise<McpSlackWriteResult> {
     context = this.#liveContext(context);
-    this.#requireCaller(context);
-    const channelId = this.#resolveChannel(channel);
+    const caller = this.#requireCaller(context);
+    if ((channel === undefined) !== (threadTs === undefined)) {
+      throw new McpServiceError(
+        "INVALID_SLACK_TARGET",
+        "channel and thread_ts must either both be supplied or both be omitted",
+      );
+    }
+    const sourceTurn = channel === undefined
+      ? this.#captureSourceSlackTurn(caller.id, caller.channelId)
+      : undefined;
+    if (channel === undefined && sourceTurn === undefined) {
+      throw new McpServiceError(
+        "NO_ACTIVE_SLACK_TURN",
+        "The authenticated Koe has no active originating Slack thread",
+      );
+    }
+    const channelId = sourceTurn?.channelId ?? this.#resolveChannel(channel!);
+    const rootThreadTs = sourceTurn?.rootThreadTs ?? threadTs!;
     return this.#once(
       context,
       "slack.reply",
-      [channelId, threadTs, message ?? null, attachments],
-      () => this.#executeSlackReply(context, channelId, threadTs, message, attachments),
+      [channelId, rootThreadTs, message ?? null, attachments],
+      () => this.#executeSlackReply(
+        context,
+        channelId,
+        rootThreadTs,
+        message,
+        attachments,
+        sourceTurn,
+      ),
     );
   }
 
@@ -562,6 +676,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     threadTs: string,
     message: string | undefined,
     attachments: readonly McpSlackAttachmentInput[],
+    sourceTurn?: SourceSlackTurn,
   ): Promise<McpSlackWriteResult> {
     const caller = this.#requireCaller(context);
     await this.#authorizeSlackWrite(
@@ -569,9 +684,28 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       caller.channelId,
       channelId,
       slackWriteSummary(message, attachments),
+      {
+        allowBoundSourceAttachmentOnlyWithoutApproval:
+          sourceTurn !== undefined &&
+          message === undefined &&
+          attachments.length > 0,
+      },
     );
+    const assertSourceTurnStillLive = () => {
+      if (
+        sourceTurn !== undefined &&
+        !this.#isSourceTurnStillLive(caller.id, sourceTurn)
+      ) {
+        throw new McpServiceError(
+          "SOURCE_TURN_ENDED",
+          "The originating Slack turn ended before its attachment reply was sent",
+        );
+      }
+    };
+    assertSourceTurnStillLive();
     if (attachments.length === 0) {
       this.#throwIfCancelled(context);
+      assertSourceTurnStillLive();
       const ts = await this.#requireSlack().reply(channelId, threadTs, message);
       return { channel: channelId, ts, thread_ts: threadTs };
     }
@@ -580,6 +714,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       attachments,
       async (files) => {
         this.#throwIfCancelled(context);
+        assertSourceTurnStillLive();
         const ts = await this.#requireSlack().reply(
           channelId,
           threadTs,
@@ -597,6 +732,9 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     sourceChannelId: string,
     targetChannelId: string,
     message: string,
+    options: {
+      readonly allowBoundSourceAttachmentOnlyWithoutApproval?: boolean;
+    } = {},
   ): Promise<void> {
     const sourceAgentId = context.agentId;
     const sourceAgent = this.#registry.requireAgent(sourceAgentId);
@@ -604,11 +742,20 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       sourceAgentId,
       sourceAgent.channelId,
     );
-    const policy = this.#permissions.slackAccess(
+    const configuredPolicy = this.#permissions.slackAccess(
       sourceAgentId,
       "write",
       targetChannelId,
     );
+    // A routing-free, attachment-only reply is already constrained to the
+    // caller's exact, process-owned active Slack turn. Do not add a second
+    // human prompt when the configured policy is `approval`; an explicit
+    // `deny` remains fail-closed, as do replies with text and explicit routes.
+    const policy =
+      options.allowBoundSourceAttachmentOnlyWithoutApproval === true &&
+      configuredPolicy === "approval"
+        ? "allow"
+        : configuredPolicy;
     const result = await this.#approvals.authorize(policy, {
       sourceAgentId,
       sourceChannelId,
@@ -958,6 +1105,12 @@ function digest(values: readonly unknown[]): string {
   return createHash("sha256")
     .update(JSON.stringify(values), "utf8")
     .digest("base64url");
+}
+
+function restartReplayKey(agentId: string, requestId: string): string {
+  return createHash("sha256")
+    .update(JSON.stringify([agentId, requestId]), "utf8")
+    .digest("hex");
 }
 
 function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {

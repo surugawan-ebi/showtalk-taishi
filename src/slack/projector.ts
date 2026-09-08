@@ -17,6 +17,7 @@ import {
 } from "./user-input-blocks.js";
 import { uploadSlackAttachments } from "./file-upload.js";
 import type { SlackMessagePresentation } from "./presentation.js";
+import type { InteractionAudit } from "./interaction-audit.js";
 import {
   formatAgentTextForSlack,
   splitSlackText,
@@ -66,6 +67,7 @@ export interface SlackThreadProjectorOptions {
   readonly gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
   readonly choiceContinuationStore?: StructuredChoiceContinuationStore;
   readonly attachmentUploader?: AttachmentUploader;
+  readonly interactionAudit?: InteractionAudit;
 }
 
 export class SlackThreadProjector {
@@ -81,6 +83,7 @@ export class SlackThreadProjector {
   readonly #gitApprovalDetailsStore: WorkspaceGitApprovalDetailsStore | undefined;
   readonly #choiceContinuationStore: StructuredChoiceContinuationStore | undefined;
   readonly #attachmentUploader: AttachmentUploader;
+  readonly #interactionAudit: InteractionAudit | undefined;
   readonly #startedAtMs: number;
   #messageTs: string | undefined;
   #text = "";
@@ -139,6 +142,7 @@ export class SlackThreadProjector {
       options.attachmentUploader ??
       ((client, channelId, rootThreadTs, attachments) =>
         uploadSlackAttachments(client, channelId, rootThreadTs, attachments));
+    this.#interactionAudit = options.interactionAudit;
     if (
       !Number.isSafeInteger(this.#maxFinalChunks) ||
       this.#maxFinalChunks < 1 ||
@@ -224,6 +228,30 @@ export class SlackThreadProjector {
       case "choice.resolved_externally":
         await this.#resolveChoiceExternally(event.requestId);
         break;
+      case "choice.auto_selected":
+        this.#turnActivityStarted = true;
+        await this.#post(
+          `:fast_forward: *通常の選択肢を自動選択しました*\n${formatAgentTextForSlack(event.header, 150, 600)}: ${formatAgentTextForSlack(event.optionLabel, 75, 300)}`,
+          undefined,
+          true,
+        );
+        break;
+      case "git_automation.executed":
+        this.#turnActivityStarted = true;
+        await this.#post(
+          `:white_check_mark: *Git自動運転が完了しました*\n${formatAgentTextForSlack(event.plan.repoId, 100, 300)} / ${formatAgentTextForSlack(event.plan.mode, 100, 300)}`,
+          undefined,
+          true,
+        );
+        break;
+      case "git_automation.blocked":
+        this.#turnActivityStarted = true;
+        await this.#post(
+          `:no_entry: *Git自動運転を安全停止しました*\n${formatAgentTextForSlack(event.plan.repoId, 100, 300)} / ${formatAgentTextForSlack(event.plan.mode, 100, 300)}\n理由: ${formatAgentTextForSlack(event.reason, 100, 300)}\n同じ操作を自動再実行せず、manual承認にも切り替えていません。`,
+          undefined,
+          true,
+        );
+        break;
       case "git_approval.reprepare_required":
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
@@ -258,6 +286,15 @@ export class SlackThreadProjector {
         break;
       }
       case "error":
+        if (event.code === "UNSUPPORTED_STRUCTURED_INPUT") {
+          this.#interactionAudit?.({
+            event: "structured_input.rejected_before_display",
+            channelId: this.#channelId,
+            rootThreadTs: this.#rootThreadTs,
+            ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+            outcome: event.code,
+          });
+        }
         this.#terminalErrorPosted = true;
         await this.#upsertAgentMessage();
         await this.#post(`:warning: ${event.message}`, undefined, true);
@@ -792,27 +829,23 @@ export class SlackThreadProjector {
   async #postUserInput(
     event: Extract<AgentEvent, { type: "user_input.requested" }>,
   ): Promise<void> {
+    this.#interactionAudit?.({
+      event: "git_approval.request_received",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+    });
+    const actionToken = {
+      version: 1 as const,
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+    };
     const fallback = this.#formatActionableMessage(
       `Git操作の承認待ち: ${event.plan.repoId} / ${event.plan.mode}`,
       this.#sourceUserMention !== undefined,
     );
-    const posted = await this.#client.chat.postMessage({
-      channel: this.#channelId,
-      thread_ts: this.#rootThreadTs,
-      text: fallback,
-      mrkdwn: this.#sourceUserMention !== undefined,
-      ...this.#presentation,
-    });
-    if (typeof posted.ts !== "string") {
-      throw new Error("Slack did not return a timestamp for Git approval UI");
-    }
-    const routing = {
-      version: 1,
-      requestId: event.requestId,
-      channelId: this.#channelId,
-      rootThreadTs: this.#rootThreadTs,
-      messageTs: posted.ts,
-    } as const;
     const canToggleDetails = this.#gitApprovalDetailsStore !== undefined;
     const expiresAt = Date.parse(event.expiresAt);
     if (!Number.isFinite(expiresAt)) {
@@ -821,7 +854,7 @@ export class SlackThreadProjector {
     const blocks = buildWorkspaceGitApprovalBlocks(
       event.prompt,
       event.plan,
-      routing,
+      actionToken,
       {
         pathsExpanded: !canToggleDetails,
         allowPathToggle: canToggleDetails,
@@ -830,12 +863,39 @@ export class SlackThreadProjector {
         expiresAt: event.expiresAt,
       },
     );
+    const posted = await this.#client.chat.postMessage({
+      channel: this.#channelId,
+      thread_ts: this.#rootThreadTs,
+      text: fallback,
+      mrkdwn: this.#sourceUserMention !== undefined,
+      blocks:
+        this.#sourceUserMention === undefined
+          ? blocks
+          : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+      ...this.#presentation,
+    });
+    if (typeof posted.ts !== "string") {
+      throw new Error("Slack did not return a timestamp for Git approval UI");
+    }
+    this.#interactionAudit?.({
+      event: "git_approval.card_posted",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      messageTs: posted.ts,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+    });
+    const routing = {
+      ...actionToken,
+      messageTs: posted.ts,
+    } as const;
     this.#gitApprovalDetailsStore?.remember({
       prompt: event.prompt,
       plan: event.plan,
       routing,
       expiresAt,
       fallbackText: fallback,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
       display: {
         pathsExpanded: !canToggleDetails,
         bodyExpanded: !canToggleDetails,
@@ -844,21 +904,6 @@ export class SlackThreadProjector {
         ? {}
         : { sourceUserMention: this.#sourceUserMention }),
     });
-    try {
-      await this.#client.chat.update({
-        channel: this.#channelId,
-        ts: posted.ts,
-        text: fallback,
-        blocks:
-          this.#sourceUserMention === undefined
-            ? blocks
-            : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
-      });
-    } catch (error) {
-      // Keep the exact message route so the frontend can compensate by
-      // terminalizing the placeholder after it records a private rejection.
-      throw error;
-    }
   }
 
   async #resolveGitApprovalExternally(requestId: string): Promise<void> {
@@ -885,7 +930,15 @@ export class SlackThreadProjector {
               : [sourceMentionBlock(details.sourceUserMention), ...blocks],
         }).then(() => undefined)
       );
-      if (updated) this.#gitApprovalDetailsStore?.forget(initial.routing);
+      if (updated) {
+        this.#interactionAudit?.({
+          event: "git_approval.resolved_externally",
+          ...details.routing,
+          ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+          outcome: "unavailable",
+        });
+        this.#gitApprovalDetailsStore?.forget(initial.routing);
+      }
     });
   }
 
@@ -918,7 +971,15 @@ export class SlackThreadProjector {
               : [sourceMentionBlock(details.sourceUserMention), ...blocks],
         }).then(() => undefined)
       );
-      if (updated) this.#gitApprovalDetailsStore?.forget(details.routing);
+      if (updated) {
+        this.#interactionAudit?.({
+          event: "git_approval.expired",
+          ...details.routing,
+          ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+          outcome: "expired",
+        });
+        this.#gitApprovalDetailsStore?.forget(details.routing);
+      }
       // If every bounded update attempt fails, retain the exact route. A stale
       // click can then retry the same cosmetic terminal update without ever
       // resolving or reconstructing the expired App Server request.
@@ -961,6 +1022,43 @@ export class SlackThreadProjector {
   }
 
   async #resolveChoiceExternally(requestId: string): Promise<void> {
+    const displayed = this.#choiceContinuationStore?.getDisplayed(requestId);
+    const auditSessionId = displayed?.sessionId ?? this.#sessionId;
+    this.#interactionAudit?.({
+      event: "choice.resolved_externally",
+      requestId,
+      channelId: displayed?.channelId ?? this.#channelId,
+      rootThreadTs: displayed?.rootThreadTs ?? this.#rootThreadTs,
+      ...(displayed?.messageTs === undefined
+        ? {}
+        : { messageTs: displayed.messageTs }),
+      ...(auditSessionId === undefined ? {} : { sessionId: auditSessionId }),
+    });
+    if (displayed?.question.purpose === "external_action_confirmation") {
+      this.#choiceContinuationStore?.forgetDisplayed(
+        requestId,
+        displayed.messageTs,
+      );
+      await this.#client.chat.update({
+        channel: displayed.channelId,
+        ts: displayed.messageTs,
+        text:
+          "Codex側の外部操作承認は回答前に終了したため、" +
+          "未承認として閉じました。このカードは操作を承認しません。" +
+          "実行するには新しい最終承認が必要です。",
+        blocks: [],
+      });
+      this.#interactionAudit?.({
+        event: "choice.card_terminalized",
+        requestId,
+        channelId: displayed.channelId,
+        rootThreadTs: displayed.rootThreadTs,
+        messageTs: displayed.messageTs,
+        sessionId: displayed.sessionId,
+        outcome: "external_unapproved",
+      });
+      return;
+    }
     const continuation = this.#choiceContinuationStore?.resolveExternally(requestId);
     if (continuation === undefined) return;
     const blocks = buildChoiceContinuationBlocks(continuation);
@@ -969,7 +1067,10 @@ export class SlackThreadProjector {
       ts: continuation.messageTs,
       text:
         "Codex側の元の質問は先に終了しました。" +
-        "この選択を通常の新しいターンとして送信できます。",
+        "この選択を通常の新しいターンとして送信できます。" +
+        (continuation.question.purpose === "external_action_confirmation"
+          ? " workspace-gitのGit承認ではありません。"
+          : ""),
       blocks:
         continuation.responderUserId === undefined
           ? blocks
@@ -980,8 +1081,17 @@ export class SlackThreadProjector {
   async #postChoice(
     event: Extract<AgentEvent, { type: "choice.requested" }>,
   ): Promise<void> {
+    this.#interactionAudit?.({
+      event: "choice.request_received",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+    });
     const fallback = this.#formatActionableMessage(
-      `選択してください: ${event.question.header}`,
+      event.question.purpose === "external_action_confirmation"
+        ? `外部操作の確認（Git承認ではありません）: ${event.question.header}`
+        : `選択してください: ${event.question.header}`,
       this.#sourceUserMention !== undefined,
     );
     const posted = await this.#client.chat.postMessage({
@@ -994,10 +1104,21 @@ export class SlackThreadProjector {
     if (typeof posted.ts !== "string") {
       throw new Error("Slack did not return a timestamp for structured choice UI");
     }
+    this.#interactionAudit?.({
+      event: "choice.card_posted",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      messageTs: posted.ts,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+    });
     const blocks = buildChoiceBlocks(event.question, {
       version: 1,
       requestId: event.requestId,
       questionId: event.question.id,
+      ...(event.question.purpose === "external_action_confirmation"
+        ? { purpose: event.question.purpose }
+        : {}),
       channelId: this.#channelId,
       rootThreadTs: this.#rootThreadTs,
       messageTs: posted.ts,
@@ -1013,6 +1134,14 @@ export class SlackThreadProjector {
         this.#sourceUserMention === undefined
           ? blocks
           : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+    });
+    this.#interactionAudit?.({
+      event: "choice.controls_attached",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      messageTs: posted.ts,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
     });
     if (this.#sessionId !== undefined) {
       this.#choiceContinuationStore?.rememberDisplayed({

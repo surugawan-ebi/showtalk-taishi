@@ -38,6 +38,13 @@ export interface AdminAgentConfig {
   readonly adapter_reasoning_effort?: string | undefined;
   readonly model?: string | undefined;
   readonly reasoning_effort?: string | undefined;
+  readonly automatic_choice_mode?: "off" | "ordinary_top_choice";
+  readonly workspace_git_autonomy?: {
+    readonly profile_id: string;
+    readonly profile_revision: number;
+    readonly requested_ttl_minutes: number;
+    readonly label?: string | undefined;
+  } | undefined;
   readonly workspace_path: string;
   readonly slack: AdminSlackConfig;
   readonly role: string;
@@ -263,6 +270,20 @@ function snapshotFromConfig(
               agent.reasoning_effort,
             ),
           }),
+      automatic_choice_mode: agent.automatic_choice_mode,
+      ...(agent.workspace_git_autonomy === undefined
+        ? {}
+        : {
+            workspace_git_autonomy: {
+              profile_id: agent.workspace_git_autonomy.profile_id,
+              profile_revision: agent.workspace_git_autonomy.profile_revision,
+              requested_ttl_minutes:
+                agent.workspace_git_autonomy.requested_ttl_minutes,
+              ...(agent.workspace_git_autonomy.label === undefined
+                ? {}
+                : { label: agent.workspace_git_autonomy.label }),
+            },
+          }),
       workspace_path: rawString(
         document,
         ["agents", id, "workspace", "path"],
@@ -385,6 +406,21 @@ function applyAgentUpdate(
     cleanOptional(incoming.reasoning_effort),
     current.reasoning_effort,
   );
+  setWhenChanged(
+    document,
+    [...root, "automatic_choice_mode"],
+    incoming.automatic_choice_mode ?? "off",
+    current.automatic_choice_mode,
+  );
+  const nextAutonomy = incoming.workspace_git_autonomy;
+  const previousAutonomy = current.workspace_git_autonomy;
+  if (JSON.stringify(nextAutonomy) !== JSON.stringify(previousAutonomy)) {
+    if (nextAutonomy === undefined) {
+      document.deleteIn([...root, "workspace_git_autonomy"]);
+    } else {
+      document.setIn([...root, "workspace_git_autonomy"], nextAutonomy);
+    }
+  }
   setWhenChanged(
     document,
     [...root, "workspace", "path"],
