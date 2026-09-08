@@ -694,6 +694,7 @@ function notifyPublicationExecution(
     readonly turnId?: string;
     readonly operationId?: string;
     readonly status?: "completed" | "failed";
+    readonly outcomeStatus?: string;
   } = {},
 ): void {
   const turnId = overrides.turnId ?? "turn_1";
@@ -713,7 +714,7 @@ function notifyPublicationExecution(
         structuredContent: {
           operation_id:
             overrides.operationId ?? "11111111-1111-4111-8111-111111111111",
-          status: "executed",
+          status: overrides.outcomeStatus ?? "executed",
         },
       },
     },
@@ -4373,6 +4374,87 @@ test("accepts a second same-turn Git approval after the first exact execution su
   assert.equal(requests.length, 2);
   assert.equal(
     server.errorResponses.some((response) => response.id === 814),
+    false,
+  );
+  assert.equal(
+    events.some((event) =>
+      event.type === "error" &&
+      event.code === "CONCURRENT_GIT_APPROVAL_NOT_SUPPORTED"
+    ),
+    false,
+  );
+  assert.equal(
+    requests[1]?.plan.operationId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+});
+
+test("accepts a second same-turn Git approval after a conclusive failed execution", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
+  let releaseSecondRequest!: () => void;
+  const secondRequestReady = new Promise<void>((resolve) => {
+    releaseSecondRequest = resolve;
+  });
+  const consuming = (async () => {
+    const events: AgentEvent[] = [];
+    for await (const event of adapter.sendMessage(session, {
+      text: "Prepare a fresh plan after a conclusive preflight failure",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type !== "user_input.requested") continue;
+      requests.push(event);
+      if (requests.length === 2) releaseSecondRequest();
+    }
+    return events;
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 821,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (requests.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  await adapter.respondToUserInput(session, {
+    requestId: requests[0]?.requestId ?? "",
+    optionId: "approve",
+  });
+  notifyPublicationExecution(server, { outcomeStatus: "failed" });
+
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-2",
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+  });
+  server.request({
+    id: 822,
+    method: "item/tool/requestUserInput",
+    params: { ...workspaceGitQuestion(), itemId: "request-input-2" },
+  });
+  await secondRequestReady;
+  await adapter.respondToUserInput(session, {
+    requestId: requests[1]?.requestId ?? "",
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [publicationExecutionItem({ outcomeStatus: "failed" })],
+    },
+  });
+  const events = await consuming;
+
+  assert.equal(requests.length, 2);
+  assert.equal(
+    server.errorResponses.some((response) => response.id === 822),
     false,
   );
   assert.equal(

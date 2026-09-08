@@ -18,6 +18,7 @@ interface ApprovedExecutionWatch {
   readonly executeStartedItemIds: Set<string>;
   readonly executeCompletedItemIds: Set<string>;
   readonly executeFailedItemIds: Set<string>;
+  readonly executeTerminalFailureItemIds: Set<string>;
   readonly operationStatuses: Set<string>;
   continuationStarted: boolean;
   duplicateExecutionReported: boolean;
@@ -155,7 +156,7 @@ export class WorkspaceGitApprovalLifecycle {
   ): void {
     const current = this.#approvedExecutionsBySession.get(sessionId);
     if (current !== undefined) {
-      if (!executionSucceeded(current)) {
+      if (!executionSettled(current)) {
         throw new Error("workspace-git approved execution is already active");
       }
       const completed = this.#completedExecutionsBySession.get(sessionId) ??
@@ -175,6 +176,7 @@ export class WorkspaceGitApprovalLifecycle {
       executeStartedItemIds: new Set(),
       executeCompletedItemIds: new Set(),
       executeFailedItemIds: new Set(),
+      executeTerminalFailureItemIds: new Set(),
       operationStatuses: new Set(),
       continuationStarted: false,
       duplicateExecutionReported: false,
@@ -183,7 +185,7 @@ export class WorkspaceGitApprovalLifecycle {
 
   approvedPlan(sessionId: string): WorkspaceGitApprovalPlan | undefined {
     const watch = this.#approvedExecutionsBySession.get(sessionId);
-    return watch === undefined || executionSucceeded(watch)
+    return watch === undefined || executionSettled(watch)
       ? undefined
       : watch.plan;
   }
@@ -197,7 +199,7 @@ export class WorkspaceGitApprovalLifecycle {
     const active = this.#approvedExecutionsBySession.get(sessionId);
     if (
       active?.plan.operationId === operationId &&
-      executionSucceeded(active)
+      executionSettled(active)
     ) {
       return true;
     }
@@ -347,11 +349,18 @@ function observeApprovedItem(
     ) {
       watch.executeCompletedItemIds.add(item.id);
     } else if (
+      item.status === "completed" &&
+      item.error == null &&
+      completedResultMatches &&
+      outcome.status === "failed"
+    ) {
+      watch.executeFailedItemIds.add(item.id);
+      watch.executeTerminalFailureItemIds.add(item.id);
+    } else if (
       item.status === "failed" ||
       item.error != null ||
       !completedResultMatches ||
       outcome.status === "partial" ||
-      outcome.status === "failed" ||
       outcome.status === "outcome_uncertain"
     ) {
       watch.executeFailedItemIds.add(item.id);
@@ -563,6 +572,22 @@ function executionSucceeded(watch: ApprovedExecutionWatch): boolean {
     [...watch.executeStartedItemIds].every((itemId) =>
       watch.executeCompletedItemIds.has(itemId)
     );
+}
+
+function executionSettled(watch: ApprovedExecutionWatch): boolean {
+  if (executionSucceeded(watch)) return true;
+  if (watch.executeTerminalFailureItemIds.size === 0) return false;
+  if (
+    [...watch.executeFailedItemIds].some(
+      (itemId) => !watch.executeTerminalFailureItemIds.has(itemId),
+    )
+  ) {
+    return false;
+  }
+  return [...watch.executeStartedItemIds].every((itemId) =>
+    watch.executeCompletedItemIds.has(itemId) ||
+    watch.executeTerminalFailureItemIds.has(itemId)
+  );
 }
 
 function sameRepositorySettingsState(
