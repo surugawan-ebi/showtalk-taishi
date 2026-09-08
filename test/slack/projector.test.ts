@@ -1038,6 +1038,11 @@ test("projects Git approvals with the file list collapsed when toggle state is a
     bodyExpanded: false,
   });
 
+  // An external resolution can be detected before its durable private
+  // rejection retry reaches expiry. Keep the route inert but project expiry.
+  detailsStore.invalidateRequest(routing.requestId);
+  assert.equal(detailsStore.get(routing), undefined);
+
   await projector.project({
     type: "git_approval.expired",
     requestId: routing.requestId,
@@ -1146,6 +1151,10 @@ test("terminalizes a Git approval card resolved by another App Server client", a
     expiresAt: "2099-08-14T11:00:00.000Z",
   };
 
+  // Simulate serverRequest/resolved arriving while Slack postMessage is still
+  // in flight. The eventual remember must stay inert but retain its route.
+  detailsStore.invalidateRequest(requestId);
+
   await projector.project({
     type: "user_input.requested",
     requestId,
@@ -1164,7 +1173,8 @@ test("terminalizes a Git approval card resolved by another App Server client", a
     rootThreadTs: "100.0",
     messageTs: "102.1",
   };
-  assert.ok(detailsStore.get(routing));
+  assert.equal(detailsStore.get(routing), undefined);
+  assert.ok(detailsStore.getForTerminalProjection(requestId, "C1", "100.0"));
 
   await projector.project({
     type: "git_approval.resolved_externally",
@@ -1181,7 +1191,7 @@ test("terminalizes a Git approval card resolved by another App Server client", a
   assert.equal(detailsStore.get(routing), undefined);
 });
 
-test("keeps an externally resolved Git card retryable after terminal Slack update failure", async () => {
+test("forgets an externally resolved Git card after terminal Slack update failure", async () => {
   let postCount = 0;
   let terminalFailures = 3;
   const client = {
@@ -1241,7 +1251,7 @@ test("keeps an externally resolved Git card retryable after terminal Slack updat
     requestId,
     plan,
   });
-  assert.ok(detailsStore.get(routing));
+  assert.equal(detailsStore.get(routing), undefined);
   await projector.project({
     type: "git_approval.resolved_externally",
     requestId,
@@ -1268,7 +1278,7 @@ test("projects one safe recovery choice when an exact Git plan is unavailable", 
   assert.match(String(recoveryPost?.text), /<@U123>$/u);
   const recoveryUpdate = updates.find((update) => update.ts === "102.1");
   const blocks = JSON.stringify(recoveryUpdate?.blocks);
-  assert.match(blocks, /承認画面を再作成/u);
+  assert.match(blocks, /新しい依頼方法を確認/u);
   assert.match(blocks, /保留/u);
   assert.doesNotMatch(blocks, /承認して実行/u);
 });

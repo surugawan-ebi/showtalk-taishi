@@ -114,7 +114,7 @@ export type WorkspaceGitPublicationMode =
 interface WorkspaceGitApprovalPlanBase {
   readonly operationId: string;
   readonly planHash: string;
-  /** Exact private approval target emitted by workspace-git prepare_*. */
+  /** Exact private approval target emitted by a workspace-git plan operation. */
   readonly approvalTarget: string;
   /**
    * Exact, bounded approval projection emitted by workspace-git itself.
@@ -123,6 +123,8 @@ interface WorkspaceGitApprovalPlanBase {
    */
   readonly approvalScope?: Readonly<Record<string, unknown>>;
   readonly repoId: string;
+  /** Present only for main-update plans; null records a detached HEAD. */
+  readonly currentBranch?: string | null;
   /** Exact prepare input; omitted only for operations without an environment. */
   readonly environment?: string;
   readonly expiresAt: string;
@@ -279,6 +281,27 @@ interface WorkspaceGitRepositorySettingsApprovalPlan
   readonly repositorySettingsResultingState: WorkspaceGitRepositorySettingsState;
 }
 
+interface WorkspaceGitMainUpdateApprovalPlan extends WorkspaceGitApprovalPlanBase {
+  readonly operation: "main_update";
+  readonly mode: "main_update";
+  readonly paths: readonly [];
+  /** Branch checked when the plan was prepared; null means detached HEAD. */
+  readonly currentBranch: string | null;
+  readonly branch?: never;
+  readonly expectedHead: string;
+  readonly expectedSnapshotId: string;
+  readonly worktreeId: "primary";
+  readonly commitMessage?: never;
+  readonly pushTarget?: never;
+  readonly pullRequestTitle?: never;
+  readonly pullRequestBody?: never;
+  readonly pullRequestBaseBranch?: never;
+  readonly pullRequestNumber?: never;
+  readonly pullRequestUrl?: never;
+  readonly baseBranch?: never;
+  readonly mergeMethod?: never;
+}
+
 /** Exact workspace-git plan that is safe to project onto the Slack approval UI. */
 export type WorkspaceGitApprovalPlan =
   | WorkspaceGitInitialCommitApprovalPlan
@@ -286,7 +309,8 @@ export type WorkspaceGitApprovalPlan =
   | WorkspaceGitEstablishedPublicationApprovalPlan
   | WorkspaceGitPullRequestApprovalPlan
   | WorkspaceGitExistingPullRequestUpdateApprovalPlan
-  | WorkspaceGitRepositorySettingsApprovalPlan;
+  | WorkspaceGitRepositorySettingsApprovalPlan
+  | WorkspaceGitMainUpdateApprovalPlan;
 
 export interface AgentGitApprovalInputResponse {
   readonly requestId: string;
@@ -475,8 +499,8 @@ export type AgentEvent =
   | {
       /**
        * The model requested Git approval without a fresh exact plan in this
-       * turn. Slack may offer a safe new-turn recovery action, but must never
-       * present the stale operation as approvable.
+       * turn. Slack may explain how to send a new explicit request, but must
+       * never restart a turn or present the stale operation as approvable.
        */
       readonly type: "git_approval.reprepare_required";
       readonly message: string;

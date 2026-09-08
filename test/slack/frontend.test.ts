@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   canSafelyRejectAfterPrivateGitDecisionFailure,
+  assertContinuationStartAllowed,
+  assertOriginalChoiceMatchesContinuation,
   cancelUnprojectedNativeApproval,
   choiceReceiptText,
   closeFailedPrivateGitDecisionBeforeRecovery,
@@ -52,6 +54,14 @@ const exactGitPlan = {
   commitMessage: "Record private approval",
   expiresAt: "2099-08-24T02:30:00+09:00",
 } satisfies WorkspaceGitApprovalPlan;
+
+test("blocks structured-choice continuation while Gateway restart is pending", () => {
+  assert.doesNotThrow(() => assertContinuationStartAllowed(false));
+  assert.throws(
+    () => assertContinuationStartAllowed(true),
+    /Gateway restart is in progress/u,
+  );
+});
 
 test("distinguishes non-Git external-action receipts from ordinary answers", () => {
   assert.equal(
@@ -342,6 +352,59 @@ test("records externally resolved App Server Git requests as private rejections"
     plan: exactGitPlan,
     actor: "showtalk:external-app-server-resolution",
   }]);
+});
+
+test("closes an unprojected Git request safely when the optional private system recorder is absent", async () => {
+  let resumed = false;
+  await recordGitProjectionFailureBeforeAppServerResume(
+    undefined,
+    exactGitPlan,
+    async () => {
+      resumed = true;
+    },
+  );
+  assert.equal(resumed, true);
+});
+
+test("rejects an old original choice card after the request advanced to another question", () => {
+  const continuation = {
+    continuationId: "choice-continuation:11111111-1111-4111-8111-111111111111",
+    state: "pending" as const,
+    requestId: "codex-choice:11111111-1111-4111-8111-111111111111",
+    sessionId: "session-1",
+    question: {
+      id: "question_2",
+      header: "Second",
+      prompt: "Choose the second answer",
+      options: [{ id: "option_1", label: "A", description: "A" }],
+      allowsOther: true,
+    },
+    completedAnswers: [],
+    channelId: "C0123456789",
+    rootThreadTs: "1700000000.000001",
+    messageTs: "1700000001.000001",
+    responderUserId: "U0123456789",
+    expiresAt: Date.now() + 60_000,
+  };
+  assert.throws(
+    () => assertOriginalChoiceMatchesContinuation({
+      requestId: continuation.requestId,
+      questionId: "question_1",
+      channelId: continuation.channelId,
+      rootThreadTs: continuation.rootThreadTs,
+      messageTs: continuation.messageTs,
+      responderUserId: continuation.responderUserId,
+    }, continuation),
+    /older question/u,
+  );
+  assert.doesNotThrow(() => assertOriginalChoiceMatchesContinuation({
+    requestId: continuation.requestId,
+    questionId: "question_2",
+    channelId: continuation.channelId,
+    rootThreadTs: continuation.rootThreadTs,
+    messageTs: continuation.messageTs,
+    responderUserId: continuation.responderUserId,
+  }, continuation));
 });
 
 test("accepts permission and control actions only from their exact Slack message", () => {

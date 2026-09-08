@@ -345,7 +345,9 @@ function observeApprovedItem(
       completedResultMatches &&
       (outcome.status === "succeeded" ||
         outcome.status === "applied" ||
-        outcome.status === "executed")
+        outcome.status === "executed" ||
+        outcome.status === "updated" ||
+        outcome.status === "skipped")
     ) {
       watch.executeCompletedItemIds.add(item.id);
     } else if (
@@ -454,8 +456,10 @@ export function sameExactWorkspaceGitApprovalPlan(
     left.approvalTarget === right.approvalTarget &&
     left.operation === right.operation &&
     left.repoId === right.repoId &&
+    left.environment === right.environment &&
     left.mode === right.mode &&
     left.branch === right.branch &&
+    left.currentBranch === right.currentBranch &&
     sameStrings(left.paths, right.paths) &&
     left.expectedHead === right.expectedHead &&
     left.expectedSnapshotId === right.expectedSnapshotId &&
@@ -531,6 +535,7 @@ function sameExistingPullRequestUpdatePlan(
     isDeepStrictEqual(left.approvalScope, right.approvalScope) &&
     left.approvalTarget === right.approvalTarget &&
     left.repoId === right.repoId &&
+    left.environment === right.environment &&
     left.mode === right.mode &&
     left.branch === right.branch &&
     sameStrings(left.paths, right.paths) &&
@@ -563,6 +568,8 @@ function exactExecutionTool(plan: WorkspaceGitApprovalPlan): string {
       return "execute_approved_existing_pull_request_update";
     case "github_repository_settings":
       return "execute_approved_github_repository_settings";
+    case "main_update":
+      return "execute_approved_main_update";
   }
 }
 

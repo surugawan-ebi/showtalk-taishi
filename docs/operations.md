@@ -23,7 +23,8 @@ turn. A protected request can offer Allow once, Allow session, Deny, or Cancel
 according to the adapter capability and policy.
 
 Git publication approvals are stricter. The Koe that called the matching
-workspace-git `prepare_*` operation must immediately issue structured choices
+workspace-git plan-producing operation (`prepare_*` or
+`update_repository_main`) must immediately issue structured choices
 under question ID `git_approval`, named exactly `承認して実行` and `拒否・保留`,
 in that same turn. Taishi binds one
 immutable plan to the originating Koe, Slack channel, root thread, Block

@@ -37,7 +37,7 @@ export interface WorkspaceGitPlanCapture {
 }
 
 /**
- * Reads only the bounded, public prepare result plus its original MCP inputs.
+ * Reads only the bounded, public plan result plus its original MCP inputs.
  * Absolute repository paths and private workspace-git state are never copied.
  */
 export function normalizeWorkspaceGitPrepareCompletion(
@@ -53,7 +53,8 @@ export function normalizeWorkspaceGitPrepareCompletion(
     (item.tool !== "prepare_git_publication" &&
       item.tool !== "prepare_pull_request_operation" &&
       item.tool !== "prepare_existing_pull_request_update" &&
-      item.tool !== "prepare_github_repository_settings")
+      item.tool !== "prepare_github_repository_settings" &&
+      item.tool !== "update_repository_main")
   ) {
     return undefined;
   }
@@ -76,7 +77,9 @@ export function normalizeWorkspaceGitPrepareCompletion(
       ? "execute_approved_pull_request_operation"
       : item.tool === "prepare_existing_pull_request_update"
         ? "execute_approved_existing_pull_request_update"
-      : "execute_approved_github_repository_settings";
+        : item.tool === "prepare_github_repository_settings"
+          ? "execute_approved_github_repository_settings"
+          : "execute_approved_main_update";
   if (output.execute_tool !== expectedExecuteTool || output.external_write !== false) {
     throw new Error("workspace-git returned an invalid approval execution boundary");
   }
@@ -103,6 +106,80 @@ export function normalizeWorkspaceGitPrepareCompletion(
   const repoId = boundedString(scope.repo_id, 128, "repository ID");
   if (repoId !== boundedString(argumentsRecord.repo_id, 128, "repository input")) {
     throw new Error("workspace-git pending plan repository does not match its input");
+  }
+
+  if (item.tool === "update_repository_main") {
+    if (!hasOnlyKeys(argumentsRecord, [
+      "repo_id",
+      "worktree_id",
+      "expected_head",
+      "expected_snapshot_id",
+      "environment",
+    ])) {
+      throw new Error("workspace-git main update input is invalid");
+    }
+    if (!hasExactKeys(scope, [
+      "repo_id",
+      "worktree_id",
+      "current_branch",
+      "expected_head",
+      "expected_snapshot_id",
+    ])) {
+      throw new Error("workspace-git main update scope is invalid");
+    }
+    const worktreeId = boundedString(scope.worktree_id, 256, "worktree ID");
+    const inputWorktreeId = optionalBoundedString(argumentsRecord.worktree_id, 256);
+    if (worktreeId !== "primary" || (inputWorktreeId ?? "primary") !== worktreeId) {
+      throw new Error("workspace-git main update is not bound to the primary checkout");
+    }
+    const expectedHead = boundedString(scope.expected_head, 40, "expected HEAD");
+    const expectedSnapshotId = boundedString(
+      scope.expected_snapshot_id,
+      64,
+      "expected snapshot",
+    );
+    if (
+      !GIT_SHA.test(expectedHead) ||
+      !SNAPSHOT.test(expectedSnapshotId) ||
+      expectedHead !== boundedString(argumentsRecord.expected_head, 40, "expected HEAD input") ||
+      expectedSnapshotId !== boundedString(
+        argumentsRecord.expected_snapshot_id,
+        64,
+        "expected snapshot input",
+      )
+    ) {
+      throw new Error("workspace-git main update state does not match its input");
+    }
+    const currentBranch = scope.current_branch === null
+      ? null
+      : boundedString(scope.current_branch, 256, "current branch");
+    const approvalTarget = boundedString(
+      output.approval_target,
+      256,
+      "approval target",
+    );
+    if (approvalTarget !== `main_update_${repoId}`) {
+      throw new Error("workspace-git approval target does not match its main update");
+    }
+    return {
+      turnId,
+      plan: bindApprovalScope({
+        operationId,
+        planHash,
+        approvalTarget,
+        operation: "main_update",
+        repoId,
+        environment: optionalBoundedString(argumentsRecord.environment, 64) ??
+          "development",
+        mode: "main_update",
+        paths: [] as const,
+        currentBranch,
+        expectedHead,
+        expectedSnapshotId,
+        worktreeId: "primary",
+        expiresAt,
+      }, approvalScope),
+    };
   }
 
   if (item.tool === "prepare_existing_pull_request_update") {
@@ -903,6 +980,15 @@ function approvalScopeForPlan(
         repo_id: plan.repoId,
         before: approvalSettingsState(plan.repositorySettingsBefore),
         desired: approvalSettingsDesired(plan.repositorySettingsDesired),
+      };
+    case "main_update":
+      return {
+        kind: "main_update",
+        repo_id: plan.repoId,
+        worktree_id: plan.worktreeId,
+        current_branch: plan.currentBranch,
+        expected_head: plan.expectedHead,
+        expected_snapshot_id: plan.expectedSnapshotId,
       };
   }
 }

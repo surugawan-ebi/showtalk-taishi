@@ -68,6 +68,22 @@ const repositorySettingsPlan = {
   expiresAt: "2026-08-26T20:00:00+09:00",
 } satisfies WorkspaceGitApprovalPlan;
 
+const mainUpdatePlan = {
+  operationId: "44444444-4444-4444-8444-444444444444",
+  planHash: "d".repeat(64),
+  approvalTarget: "main_update_showtalk-taishi",
+  operation: "main_update",
+  repoId: "showtalk-taishi",
+  environment: "development",
+  mode: "main_update",
+  paths: [],
+  currentBranch: "agent/fix-approval-recovery-v2",
+  expectedHead: "b".repeat(40),
+  expectedSnapshotId: "c".repeat(64),
+  worktreeId: "primary",
+  expiresAt: "2026-09-09T01:00:00+09:00",
+} satisfies WorkspaceGitApprovalPlan;
+
 test("renders an exact Git plan while keeping it out of the action value", () => {
   const blocks = buildWorkspaceGitApprovalBlocks("この計画を承認しますか？", plan, routing);
   const rendered = JSON.stringify(blocks);
@@ -122,6 +138,18 @@ test("renders exact GitHub repository settings without inventing file or branch 
   ));
   assert.match(expired, /GitHub Repository設定を変更/u);
   assert.doesNotMatch(expired, /承認して実行|拒否・保留|Branch/u);
+});
+
+test("renders a main-update plan as a local fast-forward without a push target", () => {
+  const rendered = JSON.stringify(buildWorkspaceGitApprovalBlocks(
+    "main更新を承認しますか？",
+    mainUpdatePlan,
+    routing,
+  ));
+  assert.match(rendered, /ローカルmainをfast-forward更新/u);
+  assert.match(rendered, /agent\/fix-approval-recovery-v2/u);
+  assert.match(rendered, /primary/u);
+  assert.doesNotMatch(rendered, /Push target/u);
 });
 
 test("collapses changed files and PR body independently without changing approval actions", () => {
@@ -225,6 +253,33 @@ test("stores exact approval display details only for their bound Slack message",
   );
   store.forget(routing);
   assert.equal(store.get(routing), undefined);
+});
+
+test("keeps a request terminal when invalidation arrives before Slack post completes", () => {
+  const store = new WorkspaceGitApprovalDetailsStore();
+  store.invalidateRequest(routing.requestId);
+  store.remember({
+    prompt: "Review",
+    plan,
+    routing,
+    expiresAt: Date.parse("2099-08-14T11:00:00.000Z"),
+    fallbackText: "Git approval pending",
+    display: { pathsExpanded: false, bodyExpanded: false },
+  });
+
+  assert.equal(store.get(routing), undefined);
+  assert.equal(
+    store.getForRequest(routing.requestId, routing.channelId, routing.rootThreadTs),
+    undefined,
+  );
+  assert.equal(
+    store.getForTerminalProjection(
+      routing.requestId,
+      routing.channelId,
+      routing.rootThreadTs,
+    )?.routing.messageTs,
+    routing.messageTs,
+  );
 });
 
 test("serializes display and terminal writes for one exact Git approval card", async () => {

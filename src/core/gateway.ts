@@ -25,6 +25,10 @@ export interface HumanMessage {
   /** Authenticated Socket Mode envelope identities; adapter-private context only. */
   readonly slackTeamId?: string;
   readonly slackAppId?: string;
+  /** Internal continuation fence, revalidated after this Koe's turn lease is acquired. */
+  readonly expectedSessionId?: string;
+  /** Internal continuation deadline, revalidated after queue admission. */
+  readonly notAfterMs?: number;
 }
 
 /** A completed routed turn that must be delivered after its caller turn ended. */
@@ -101,6 +105,9 @@ export class Gateway {
           ? "The Slack user attached files without a text message. Inspect the attachments and respond appropriately."
           : message.text,
       ...(attachments.length === 0 ? {} : { attachments }),
+      ...(message.notAfterMs === undefined
+        ? {}
+        : { startNotAfterMs: message.notAfterMs }),
       source: {
         type: "human",
         ...(message.slackUserId === undefined
@@ -122,7 +129,7 @@ export class Gateway {
           ? {}
           : { showtalkSlackAppId: message.slackAppId }),
       },
-    });
+    }, undefined, message.expectedSessionId, message.notAfterMs);
   }
 
   /** Reopens the exact source conversation after a routed result arrives late. */
@@ -204,6 +211,8 @@ export class Gateway {
       readonly continuationDelegationId: string;
       readonly continuationDepth: number;
     },
+    expectedSessionId?: string,
+    notAfterMs?: number,
   ): AsyncIterable<GatewayAgentEvent> {
     const attachments = request.attachments ?? [];
 
@@ -213,6 +222,25 @@ export class Gateway {
     try {
       const agent = this.#registry.requireAgentByChannel(message.channelId);
       releaseAgentTurn = await this.#registry.waitForAgentTurn(agent.id);
+      if (notAfterMs !== undefined && this.#now().getTime() >= notAfterMs) {
+        throw new CoreError(
+          "SESSION_AGENT_MISMATCH",
+          "The structured answer expired while waiting for the Koe turn lease",
+        );
+      }
+      if (expectedSessionId !== undefined) {
+        const current = this.#sessionForSlackRoot(
+          agent,
+          message.channelId,
+          message.rootThreadTs,
+        );
+        if (current?.id !== expectedSessionId) {
+          throw new CoreError(
+            "SESSION_AGENT_MISMATCH",
+            `Koe ${agent.id} changed its canonical session before the structured answer could be delivered`,
+          );
+        }
+      }
       if (expected !== undefined) {
         const current = this.#sessionForSlackRoot(
           agent,
@@ -236,6 +264,18 @@ export class Gateway {
         message.rootThreadTs,
         adapter,
       );
+      if (notAfterMs !== undefined && this.#now().getTime() >= notAfterMs) {
+        throw new CoreError(
+          "SESSION_AGENT_MISMATCH",
+          "The structured answer expired while restoring its Koe session",
+        );
+      }
+      if (expectedSessionId !== undefined && ensured.session.id !== expectedSessionId) {
+        throw new CoreError(
+          "SESSION_AGENT_MISMATCH",
+          `Koe ${agent.id} activated a different session before the structured answer could be delivered`,
+        );
+      }
       session = ensured.session;
       const startedAt = this.#timestamp();
       this.#registry.beginSessionTurn(session.id, {

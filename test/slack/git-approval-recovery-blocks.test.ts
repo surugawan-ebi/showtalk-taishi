@@ -15,16 +15,17 @@ const routing = {
   messageTs: "1786654846.000100",
 } as const;
 
-test("renders a bounded fresh-plan recovery choice without stale plan authority", () => {
+test("renders bounded recovery guidance without stale plan authority or auto-resume wording", () => {
   const blocks = buildGitApprovalRecoveryBlocks(
     "期限切れです。<@UATTACKER>",
     routing,
   );
   const encoded = JSON.stringify(blocks);
 
-  assert.match(encoded, /承認画面を再作成/u);
+  assert.match(encoded, /新しい依頼方法を確認/u);
   assert.match(encoded, /保留/u);
   assert.doesNotMatch(encoded, /承認して実行/u);
+  assert.doesNotMatch(encoded, /再作成する/u);
   assert.doesNotMatch(encoded, /<@UATTACKER>/u);
   assert.match(encoded, /&lt;@UATTACKER&gt;/u);
   assert.match(encoded, /taishi\.git_recovery\.reprepare/u);
@@ -43,14 +44,12 @@ test("bounds oversized recovery text to Slack's section limit", () => {
   assert.match(section.text.text, /…$/u);
 });
 
-test("allows a failed recovery action to be retried without replaying a success", () => {
+test("never reopens a consumed recovery action", () => {
   const tracker = new GitApprovalRecoveryActionTracker();
   const key = `${routing.channelId}\u0000${routing.messageTs}`;
 
   assert.equal(tracker.tryStart(key), true);
   assert.equal(tracker.tryStart(key), false);
-  tracker.releaseAfterFailure(key);
-  assert.equal(tracker.tryStart(key), true);
   assert.equal(tracker.tryStart(key), false);
 });
 

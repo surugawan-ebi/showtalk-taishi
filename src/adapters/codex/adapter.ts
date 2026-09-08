@@ -136,15 +136,14 @@ const SHOWTALK_KOE_CONSULTATION_INSTRUCTIONS = [
 ].join("\n");
 const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "ShowTalk Taishi Git approval routing rules:",
-  "- A Git approval belongs to the Koe that called workspace-git prepare_* and to the Slack thread that started that same turn.",
-  "- Call workspace-git prepare_* and execute_approved_* only as direct MCP tools. Never invoke them through functions.exec, another dynamic/code-mode wrapper, shell, or a relaying agent: ShowTalk cannot bind nested or model-forwarded output as approval authority.",
+  "- A Git approval belongs to the Koe that called a workspace-git plan-producing operation (`prepare_*` or `update_repository_main`) and to the Slack thread that started that same turn.",
+  "- Call workspace-git plan-producing operations and execute_approved_* only as direct MCP tools. Never invoke them through functions.exec, another dynamic/code-mode wrapper, shell, or a relaying agent: ShowTalk cannot bind nested or model-forwarded output as approval authority.",
   "- When workspace-git returns awaiting_human_approval, immediately call request_user_input in that same turn with question ID `git_approval` and exactly two options named `承認して実行` and `拒否・保留`.",
   "- Keep ordinary decisions flexible: use an ordinary question ID and two or three task-specific options. If that decision selects a non-Git external write, ask a separate final confirmation before executing it.",
   "- For that non-Git final confirmation, call request_user_input as a direct tool call, never from functions.exec, code mode, another dynamic tool, shell, or a relaying agent. Nested request_user_input calls cannot preserve the blocking Slack answer and may return `answers: {}` even after the button is clicked.",
   "- The direct request_user_input call must contain exactly one blocking question whose ID is `external_action_approval` and exactly two options in this order: `承認して実行` (or `承認して実行 (Recommended)` when the client requires its recommended suffix), then `拒否・保留`. Do not otherwise rename or reorder them, or add a third option. The Gateway canonicalizes the optional suffix and returns `承認して実行`. Give both options non-empty descriptions and put the exact details in three separate question lines named `Target:`, `Scope:`, and `Impact:`. A non-blocking request or `answers: {}` is not approval. That answer never approves Git.",
   "- A turn may contain multiple sequential external-action confirmations. Each distinct external write requires its own blocking confirmation with its current Target, Scope, and Impact; an earlier approval never grants blanket authority for later writes. Do not open a second confirmation while another is still awaiting its Slack answer.",
-  "- After an AppOps prepare tool returns `approval_prompt`, copy those exact three lines into the direct `external_action_approval` question. Do not alter the operation ID, plan hash, target, scope, or impact.",
-  "- After a bound AppOps confirmation is approved, continue with the exact matching AppOps execute call without supplying or requesting `approval_proof`; ShowTalk's trusted Codex PreToolUse hook privately injects it once. Never print, summarize, reuse, or send an approval proof anywhere. A missing or rejected hook binding blocks the execute call.",
+  "- Store release operations do not use AppOps MCP, Store MCP tools, or proof-injection hooks. Present the exact repo-local fastlane command and its target app, platform, working directory, version/build, track, metadata scope, and automatic-release setting in the blocking external-action confirmation, then run only that command after approval.",
   "- If App Server returns `EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED`, retry request_user_input exactly once in the same turn with that fixed shape. Do not execute the external action unless the corrected structured input returns `承認して実行`.",
   "- If that retry is malformed or App Server returns `EXTERNAL_ACTION_APPROVAL_REPAIR_EXHAUSTED`, stop requesting approval and do not execute the external action in that turn.",
   "- Never use another question ID with either fixed Git approval label. Never redisplay or reconstruct a workspace-git approval as an ordinary structured choice; prepare a fresh exact plan in the current turn first.",
@@ -155,9 +154,9 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "- If request_user_input returns WORKSPACE_GIT_AUTOMATION_BLOCKED, do not retry, switch to manual approval, or use another Git path in that turn. Report the fail-closed reason.",
   "- If the answer is `拒否・保留`, or revalidation is stale, mismatched, expired, rejected, already executed, or inconclusive, do not approve or execute and report the exact blocker.",
   "- Never use agent.send, slack.post, or slack.reply to ask another Koe or channel to display, relay, approve, or reconstruct a Git approval.",
-  "- If the exact plan is unbound, expired, or invalidated by a Gateway restart, inspect status and re-run the matching workspace-git prepare_* operation in this Koe's current turn before requesting approval. Never reconstruct authority from IDs or prose.",
-  "- get_git_operation_status never binds an approval plan, even when it reports awaiting_human_approval. Only a fresh prepare_* completion observed in this same turn can be approved.",
-  "- If request_user_input reports REPREPARE_REQUIRED, do not call request_user_input again in that turn. Do not claim that approval is still available. End the turn so Slack can offer the human a safe fresh-plan recovery action.",
+  "- If the exact plan is unbound, expired, or invalidated by a Gateway restart, inspect status and re-run the matching workspace-git plan-producing operation in this Koe's current turn before requesting approval. Never reconstruct authority from IDs or prose.",
+  "- get_git_operation_status never binds an approval plan, even when it reports awaiting_human_approval. Only a fresh plan-producing operation completion observed in this same turn can be approved.",
+  "- If request_user_input reports REPREPARE_REQUIRED, do not call request_user_input again in that turn. Do not claim that approval is still available. End the turn; Slack may explain how the human can send a new explicit Git request, but must not restart one automatically.",
   "- Never claim that approval controls were displayed unless request_user_input is currently waiting for the human response. If a prepared plan is still awaiting approval, do not finish the turn with prose instead of opening that structured request.",
 ].join("\n");
 const SHOWTALK_TURN_DEVELOPER_INSTRUCTIONS = [
@@ -303,6 +302,12 @@ export interface CodexAdapterOptions {
   recordExternallyResolvedGitPlan?: (
     plan: WorkspaceGitApprovalPlan,
   ) => Promise<void>;
+  /** Synchronously invalidates the Slack card when its App Server RPC disappears. */
+  onGitUserInputResolvedExternally?: (
+    requestId: string,
+    sessionId: string,
+    plan: WorkspaceGitApprovalPlan,
+  ) => void;
   /** Optional opaque provider; manual approval remains the default. */
   workspaceGitAutomationProvider?: WorkspaceGitAutomationProviderAny;
   workspaceGitAutomationRevisions?: {
@@ -383,6 +388,9 @@ export class CodexAdapter implements AgentAdapter {
   readonly #recordExternallyResolvedGitPlan:
     | ((plan: WorkspaceGitApprovalPlan) => Promise<void>)
     | undefined;
+  readonly #onGitUserInputResolvedExternally:
+    | ((requestId: string, sessionId: string, plan: WorkspaceGitApprovalPlan) => void)
+    | undefined;
   readonly #workspaceGitAutomationProvider:
     | WorkspaceGitAutomationProviderAny
     | undefined;
@@ -430,6 +438,8 @@ export class CodexAdapter implements AgentAdapter {
     this.kind = options.kind ?? "codex";
     this.#recordExternallyResolvedGitPlan =
       options.recordExternallyResolvedGitPlan;
+    this.#onGitUserInputResolvedExternally =
+      options.onGitUserInputResolvedExternally;
     this.#workspaceGitAutomationProvider =
       options.workspaceGitAutomationProvider;
     this.#workspaceGitAutomationRevisions = options.workspaceGitAutomationRevisions;
@@ -677,8 +687,11 @@ export class CodexAdapter implements AgentAdapter {
     }
     let collaborationMode: TurnStartParams["collaborationMode"];
     try {
+      assertTurnStartDeadline(request);
       await this.#prepareSessionForTurn(session.id);
+      assertTurnStartDeadline(request);
       collaborationMode = await this.#buildInteractiveCollaborationMode();
+      assertTurnStartDeadline(request);
     } catch (error) {
       this.#runningSessions.delete(session.id);
       this.#workspaceGitAutomationOrigins.delete(session.id);
@@ -2655,7 +2668,7 @@ export class CodexAdapter implements AgentAdapter {
       type: "git_approval.reprepare_required",
       message:
         "このGit計画は現在のターンに紐づいていないか、すでに期限切れです。" +
-        "古い計画を承認せず、最新状態から承認画面を安全に再作成できます。",
+        "古い計画は承認できません。対象のGit操作を新しいメッセージとして明記してください。",
     });
   }
 
@@ -2749,6 +2762,16 @@ export class CodexAdapter implements AgentAdapter {
     for (const [requestId, pending] of this.#pendingUserInputs) {
       if (pending.rpcId === rpcId) {
         clearTimeout(pending.expirationTimer);
+        if (pending.kind === "git_approval") {
+          // This callback is synchronous so a queued Slack click cannot reach
+          // the private broker after the App Server request disappeared but
+          // before the terminal projection is consumed.
+          this.#onGitUserInputResolvedExternally?.(
+            requestId,
+            pending.sessionId,
+            pending.plan,
+          );
+        }
         this.#pendingUserInputs.delete(requestId);
         if (pending.kind === "git_approval") {
           this.#enqueueExternalGitRejection({
@@ -3443,7 +3466,7 @@ function gitApprovalBindingErrorMessage(error: unknown): string {
     "get_git_operation_status does not bind an approval plan. " +
     "Do not use agent.send or another Slack channel to recover this approval. " +
     "In the Koe that owns the Git operation, inspect workspace-git status, " +
-    "re-run the matching prepare_* operation in the current turn, and then " +
+    "re-run the matching workspace-git plan operation in the current turn, and then " +
     "request the fixed structured approval again."
   );
 }
@@ -3502,6 +3525,17 @@ function buildTurnInput(request: SendMessageRequest): TurnStartParams["input"] {
         path: attachment.path,
       })),
   ];
+}
+
+function assertTurnStartDeadline(request: SendMessageRequest): void {
+  const deadline = request.startNotAfterMs;
+  if (deadline === undefined) return;
+  if (!Number.isSafeInteger(deadline) || deadline < 0 || Date.now() >= deadline) {
+    throw new CoreError(
+      "SESSION_AGENT_MISMATCH",
+      "The structured answer expired before Codex turn/start",
+    );
+  }
 }
 
 function toAdapterSession(thread: CodexThread): AdapterSession {

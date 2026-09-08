@@ -146,6 +146,8 @@ export interface SlackFrontendOptions {
     ): Promise<void>;
   };
   readonly workspaceGitSystemRejectionRecorder?: WorkspaceGitSystemRejectionRecorder;
+  /** Shared with the adapter so terminal RPC notifications invalidate cards synchronously. */
+  readonly workspaceGitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
   readonly requestRestart?: () => void;
   readonly now?: () => number;
   readonly interactionAudit?: InteractionAudit;
@@ -198,14 +200,6 @@ export interface PermissionApprovalMessageRoute {
   readonly operation: string;
 }
 
-const GIT_APPROVAL_REPREPARE_PROMPT = [
-  "The Slack approver explicitly requested a fresh Git approval UI.",
-  "The previous workspace-git operation is unbound, expired, or otherwise not approvable in this turn.",
-  "Do not approve, execute, or reuse the old operation.",
-  "Inspect the current repository/worktree status, re-run the matching workspace-git prepare_* operation with the current exact state in this turn, then immediately call request_user_input with question ID `git_approval` and exactly `承認して実行` and `拒否・保留`.",
-  "If a fresh exact plan cannot be prepared, explain the current blocker without claiming that approval controls were displayed.",
-].join("\n");
-
 export class SlackFrontend {
   readonly #app: App;
   readonly #gateway: Gateway;
@@ -243,7 +237,7 @@ export class SlackFrontend {
   readonly #durableEventLedger: SlackFrontendOptions["durableEventLedger"];
   readonly #idleWaiters = new Set<() => void>();
   readonly #gitApprovalRecoveryActions = new GitApprovalRecoveryActionTracker();
-  readonly #gitApprovalDetails = new WorkspaceGitApprovalDetailsStore();
+  readonly #gitApprovalDetails: WorkspaceGitApprovalDetailsStore;
   readonly #choiceContinuations: StructuredChoiceContinuationStore;
   readonly #permissionApprovalCards: PermissionApprovalCardTracker;
   readonly #now: () => number;
@@ -273,6 +267,8 @@ export class SlackFrontend {
     }
     this.#workspaceGitSystemRejectionRecorder =
       options.workspaceGitSystemRejectionRecorder;
+    this.#gitApprovalDetails = options.workspaceGitApprovalDetailsStore ??
+      new WorkspaceGitApprovalDetailsStore();
     this.#requestRestart = options.requestRestart;
     this.#now = options.now ?? Date.now;
     this.#interactionAudit = options.interactionAudit ??
@@ -299,6 +295,7 @@ export class SlackFrontend {
       this.#app.client,
       this.#presentationsByChannel,
       this.#gitApprovalDetails,
+      this.#choiceContinuations,
     );
     this.#registerListeners();
   }
@@ -315,6 +312,11 @@ export class SlackFrontend {
 
   beginRestart(): void {
     this.#restartPending = true;
+  }
+
+  /** Adapter-side terminal notification fence; never performs a Slack write. */
+  invalidateWorkspaceGitApproval(requestId: string): void {
+    this.#gitApprovalDetails.invalidateRequest(requestId);
   }
 
   isIdle(): boolean {
@@ -715,7 +717,7 @@ export class SlackFrontend {
     // A failed human decision write must not leave Codex blocked indefinitely.
     // Persist a fail-closed rejection intent first, then answer the single-use
     // App Server request as reject and replace the stale approval buttons with
-    // a fresh-plan recovery action carrying no old Git authority.
+    // inert guidance that cannot restart a turn or carry Git authority.
     await closeFailedPrivateGitDecisionBeforeRecovery(
       this.#workspaceGitSystemRejectionRecorder,
       details.plan,
@@ -732,8 +734,8 @@ export class SlackFrontend {
         this.#gitApprovalDetails.forget(details.routing);
         const reason = publicErrorMessage(failure);
         const message =
-          `Git承認をprivate stateへ記録できなかったため、この計画は安全に拒否されました。${reason}` +
-          " 最新状態から承認画面を再作成してください。";
+          `Git承認をprivate stateへ記録できなかったため、このSlack承認要求を終了しました。${reason}` +
+          " Git操作は承認されていません。必要なら最新状態で新しく依頼してください。";
         const blocks = buildGitApprovalRecoveryBlocks(message, {
           version: 1,
           channelId: details.routing.channelId,
@@ -789,7 +791,8 @@ export class SlackFrontend {
           ts: details.routing.messageTs,
           text:
             resolutionError === undefined
-              ? "Git承認UIを表示できなかったため、この計画は安全に拒否されました。"
+              ? "Git承認UIを表示できなかったため、このSlack承認要求を終了しました。" +
+                "Git操作は承認されていません。"
               : "Git承認UIを表示できませんでした。Git操作は実行されていません。" +
                 "この画面は使用できません。状態確認後に再作成してください。",
           blocks:
@@ -815,8 +818,9 @@ export class SlackFrontend {
       }
     }
     if (resolutionError !== undefined) throw resolutionError;
-    // A terminal Slack update is cosmetic once the durable reject intent and
-    // App Server response both succeeded. Do not interrupt the coding turn.
+    // A terminal Slack update is cosmetic once the configured private reject
+    // recorder (when present) and App Server response both succeeded. In the
+    // OSS runtime the local reject still leaves the Git plan unapproved.
   }
 
   async #settleExternallyResolvedGitApproval(
@@ -848,8 +852,9 @@ export class SlackFrontend {
       );
     }
     if (settlementError !== undefined) throw settlementError;
-    // The exact rejection intent is durable. A cosmetic card update failure
-    // remains retryable through the retained route and must not abort Codex.
+    // With a configured private recorder the exact rejection intent is
+    // durable. Without one, the resolved App Server request still cannot grant
+    // Git authority. A cosmetic card failure must not abort Codex.
   }
 
   #requireTrustedChoiceContinuation(
@@ -882,6 +887,7 @@ export class SlackFrontend {
       available.responderUserId,
       this.#approvers,
     );
+    assertContinuationStartAllowed(this.#restartPending);
     const continuation = this.#choiceContinuations.begin(
       available.continuationId,
     );
@@ -911,6 +917,8 @@ export class SlackFrontend {
         rootThreadTs: continuation.rootThreadTs,
         messageTs: continuation.messageTs,
         slackUserId: userId,
+        expectedSessionId: continuation.sessionId,
+        notAfterMs: continuation.expiresAt,
         text: structuredChoiceContinuationPrompt(continuation, answer),
       })[Symbol.asyncIterator]();
       await consumeContinuationIterator(
@@ -1317,6 +1325,7 @@ export class SlackFrontend {
           const continuation =
             this.#choiceContinuations.getForOriginalRequest(routing.requestId);
           if (continuation !== undefined) {
+            assertOriginalChoiceMatchesContinuation(routing, continuation);
             if (kind === "other") {
               if (!continuation.question.allowsOther) {
                 throw new Error("This structured choice does not allow free text");
@@ -1427,6 +1436,10 @@ export class SlackFrontend {
           const continuation =
             this.#choiceContinuations.getForOriginalRequest(routing.requestId);
           if (continuation !== undefined) {
+            assertOriginalChoiceMatchesContinuation(routing, continuation);
+            if (!continuation.question.allowsOther) {
+              throw new Error("This structured choice does not allow free text");
+            }
             await this.#continueStructuredChoice(
               client,
               continuation,
@@ -1937,29 +1950,16 @@ export class SlackFrontend {
         const bodyRecord = asRecord(body);
         const userId = asString(asRecord(bodyRecord?.user)?.id);
         const channelId = asString(asRecord(bodyRecord?.channel)?.id);
-        let recoveryKey: string | undefined;
-        let recoveryAttemptStarted = false;
-        let recoveryCardCleared = false;
-        let recoveryRouting:
-          | ReturnType<typeof parseGitApprovalRecoveryActionValue>
-          | undefined;
         try {
           const { decision, routing, source } = parseTrustedGitApprovalRecoveryAction(
             body,
             action,
             this.#approvers,
           );
-          recoveryRouting = routing;
-          recoveryKey = `${source.channelId}\u0000${source.messageTs}`;
-          if (decision === "reprepare" && this.#restartPending) {
-            throw new Error(
-              "Gateway restart is in progress. Retry after Taishi reconnects.",
-            );
-          }
+          const recoveryKey = `${source.channelId}\u0000${source.messageTs}`;
           if (!this.#gitApprovalRecoveryActions.tryStart(recoveryKey)) {
             throw new Error("This Git approval recovery action was already handled");
           }
-          recoveryAttemptStarted = true;
 
           if (decision === "hold") {
             await client.chat.update({
@@ -1975,115 +1975,21 @@ export class SlackFrontend {
             channel: source.channelId,
             ts: source.messageTs,
             text:
-              `Fresh Git approval preparation requested by <@${source.userId}>. ` +
-              "The previous operation remains unapproved.",
+              `Git approval recovery instructions requested by <@${source.userId}>. ` +
+              "The previous operation remains unapproved and no turn was started.",
             blocks: [],
           });
-          recoveryCardCleared = true;
-
-          const projector = new SlackThreadProjector(
-            client,
-            routing.channelId,
-            routing.rootThreadTs,
-            {
-              sourceUserId: source.userId,
-              presentation: this.#presentation(routing.channelId),
-              gitApprovalDetailsStore: this.#gitApprovalDetails,
-              choiceContinuationStore: this.#choiceContinuations,
-              interactionAudit: this.#interactionAudit,
-            },
-          );
-          try {
-            for await (const result of this.#gateway.handleHumanMessage({
-              channelId: routing.channelId,
-              rootThreadTs: routing.rootThreadTs,
-              messageTs: source.messageTs,
-              text: GIT_APPROVAL_REPREPARE_PROMPT,
-              slackUserId: source.userId,
-            })) {
-              projector.setSessionId(result.sessionId);
-              if (result.event.type === "git_approval.resolved_externally") {
-                await this.#settleExternallyResolvedGitApproval(
-                  projector,
-                  result.event,
-                );
-                continue;
-              }
-              try {
-                await projector.project(result.event);
-              } catch (error) {
-                logger.error(error);
-                if (result.event.type === "choice.requested") {
-                  await this.#gateway.resolveSessionUserInput(result.sessionId, {
-                    requestId: result.event.requestId,
-                    cancelled: true,
-                  });
-                  throw new Error(
-                    "Structured choice controls could not be displayed and were cancelled",
-                  );
-                }
-                if (result.event.type === "user_input.requested") {
-                  await this.#rejectUnprojectedGitApproval(
-                    client,
-                    result.sessionId,
-                    routing.channelId,
-                    routing.rootThreadTs,
-                    result.event.requestId,
-                    result.event.plan,
-                  );
-                  await client.chat
-                    .postMessage({
-                      channel: routing.channelId,
-                      thread_ts: routing.rootThreadTs,
-                      text:
-                        ":warning: Fresh Git approval controls could not be displayed, " +
-                        "so this request was rejected safely. Ask this Koe to " +
-                        "re-prepare the operation in a new turn.",
-                      ...this.#presentation(routing.channelId),
-                    })
-                    .catch((projectionError) => logger.error(projectionError));
-                  // The private rejection intent is durable and the App Server
-                  // request has been answered. Keep consuming the turn so the
-                  // adapter is not interrupted merely because Slack rejected
-                  // the approval blocks.
-                  continue;
-                }
-                if (result.event.type === "approval.requested") {
-                  await cancelUnprojectedNativeApproval(
-                    this.#gateway,
-                    result.sessionId,
-                    result.event,
-                  );
-                  throw new Error(
-                    "Native approval controls could not be displayed and were cancelled safely",
-                  );
-                }
-              }
-            }
-          } finally {
-            await projector.complete().catch((error) => logger.error(error));
-          }
+          await client.chat.postEphemeral({
+            channel: routing.channelId,
+            user: source.userId,
+            text:
+              "古い承認カードからはターンを再開しません。対象のGit操作を" +
+              "このスレッドへ新しいメッセージとして明記してください。Koeは最新状態を確認し、" +
+              "新しいexact planを作成してから承認画面を表示します。",
+            ...this.#presentation(routing.channelId),
+          });
         } catch (error) {
           logger.error(error);
-          if (recoveryAttemptStarted && recoveryKey !== undefined) {
-            this.#gitApprovalRecoveryActions.releaseAfterFailure(recoveryKey);
-          }
-          if (
-            recoveryCardCleared &&
-            recoveryRouting !== undefined &&
-            channelId !== undefined
-          ) {
-            const retryMessage =
-              "承認画面の再作成に失敗しました。前のoperationは未承認です。もう一度再作成できます。";
-            await client.chat
-              .update({
-                channel: channelId,
-                ts: recoveryRouting.messageTs,
-                text: retryMessage,
-                blocks: buildGitApprovalRecoveryBlocks(retryMessage, recoveryRouting),
-              })
-              .catch((restoreError) => logger.error(restoreError));
-          }
           if (userId !== undefined && channelId !== undefined) {
             await client.chat.postEphemeral({
               channel: channelId,
@@ -2659,11 +2565,11 @@ export async function recordSystemGitRejection(
   plan: WorkspaceGitApprovalPlan,
   actor: WorkspaceGitSystemRejectionActor,
 ): Promise<void> {
-  if (recorder === undefined) {
-    throw new Error(
-      "The durable workspace-git system rejection recorder is not configured",
-    );
-  }
+  // The OSS manual-only runtime intentionally has no private system-decision
+  // transport. Rejecting the App Server request still fails closed: no human
+  // approval is recorded and the pending workspace-git plan cannot execute.
+  // Private hosts may additionally persist a terminal rejection here.
+  if (recorder === undefined) return;
   await recorder.recordRejection(plan, actor);
 }
 
@@ -2732,6 +2638,38 @@ export function parseTrustedChoiceAction(
     : new Set([routing.responderUserId]);
   const source = validateSlackActionSource(body, routing, allowedUsers);
   return { kind: parsedAction.kind, routing, source };
+}
+
+export function assertOriginalChoiceMatchesContinuation(
+  routing: {
+    readonly requestId: string;
+    readonly questionId: string;
+    readonly purpose?: "external_action_confirmation";
+    readonly channelId: string;
+    readonly rootThreadTs: string;
+    readonly messageTs: string;
+    readonly responderUserId?: string;
+  },
+  continuation: StructuredChoiceContinuation,
+): void {
+  if (
+    routing.requestId !== continuation.requestId ||
+    routing.questionId !== continuation.question.id ||
+    routing.purpose !== continuation.question.purpose ||
+    routing.channelId !== continuation.channelId ||
+    routing.rootThreadTs !== continuation.rootThreadTs ||
+    routing.messageTs !== continuation.messageTs ||
+    routing.responderUserId !== continuation.responderUserId
+  ) {
+    throw new Error("This structured choice belongs to an older question");
+  }
+}
+
+export function assertContinuationStartAllowed(restartPending: boolean): void {
+  if (!restartPending) return;
+  throw new Error(
+    "Gateway restart is in progress. Send a new message after Taishi reconnects.",
+  );
 }
 
 function validateChoiceResponder(

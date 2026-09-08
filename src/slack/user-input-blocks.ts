@@ -10,6 +10,7 @@ export const USER_INPUT_PATH_ACTION_PREFIX = `${USER_INPUT_ACTION_PREFIX}paths.`
 export const USER_INPUT_BODY_ACTION_PREFIX = `${USER_INPUT_ACTION_PREFIX}body.`;
 
 const MAX_STORED_GIT_APPROVAL_DETAILS = 128;
+const MAX_TERMINAL_GIT_APPROVAL_REQUESTS = 4_096;
 
 export interface UserInputActionValue {
   readonly version: 1;
@@ -63,6 +64,8 @@ export interface WorkspaceGitApprovalDetails {
 export class WorkspaceGitApprovalDetailsStore {
   readonly #entries = new Map<string, WorkspaceGitApprovalDetails>();
   readonly #actionTails = new Map<string, Promise<void>>();
+  readonly #terminalRequestIds = new Set<string>();
+  #denyAllApprovals = false;
 
   remember(details: WorkspaceGitApprovalDetails): void {
     const key = approvalDetailsKey(details.routing);
@@ -81,10 +84,40 @@ export class WorkspaceGitApprovalDetailsStore {
   }
 
   get(routing: UserInputActionValue): WorkspaceGitApprovalDetails | undefined {
+    if (
+      this.#denyAllApprovals ||
+      this.#terminalRequestIds.has(routing.requestId)
+    ) return undefined;
     return this.#entries.get(approvalDetailsKey(routing));
   }
 
   getForRequest(
+    requestId: string,
+    channelId: string,
+    rootThreadTs: string,
+  ): WorkspaceGitApprovalDetails | undefined {
+    if (this.#denyAllApprovals || this.#terminalRequestIds.has(requestId)) {
+      return undefined;
+    }
+    return this.#findForRequest(requestId, channelId, rootThreadTs);
+  }
+
+  /** Returns inert route data needed only to remove a terminal Slack card. */
+  getForTerminalProjection(
+    requestId: string,
+    channelId: string,
+    rootThreadTs: string,
+  ): WorkspaceGitApprovalDetails | undefined {
+    return this.#findForRequest(requestId, channelId, rootThreadTs);
+  }
+
+  getIncludingTerminal(
+    routing: UserInputActionValue,
+  ): WorkspaceGitApprovalDetails | undefined {
+    return this.#entries.get(approvalDetailsKey(routing));
+  }
+
+  #findForRequest(
     requestId: string,
     channelId: string,
     rootThreadTs: string,
@@ -119,6 +152,21 @@ export class WorkspaceGitApprovalDetailsStore {
 
   forget(routing: UserInputActionValue): void {
     this.#entries.delete(approvalDetailsKey(routing));
+  }
+
+  /** Makes a terminal request non-actionable without losing its Slack route. */
+  invalidateRequest(requestId: string): void {
+    if (this.#terminalRequestIds.has(requestId) || this.#denyAllApprovals) return;
+    if (this.#terminalRequestIds.size >= MAX_TERMINAL_GIT_APPROVAL_REQUESTS) {
+      // Never evict a tombstone and accidentally revive an in-flight post.
+      this.#denyAllApprovals = true;
+      return;
+    }
+    this.#terminalRequestIds.add(requestId);
+  }
+
+  releaseTerminalRequest(requestId: string): void {
+    if (!this.#denyAllApprovals) this.#terminalRequestIds.delete(requestId);
   }
 
   async serialize<T>(
@@ -284,7 +332,7 @@ export function buildUnavailableWorkspaceGitApprovalBlocks(): KnownBlock[] {
         text:
           "*:warning: このGit承認は利用できません*\n" +
           "期限切れ、処理済み、またはGateway再起動前の承認画面です。" +
-          "このボタンからは実行できません。必要な場合は承認画面を再作成してください。",
+          "このボタンからは実行・再開できません。必要なGit操作を新しいメッセージとして依頼してください。",
       },
     },
   ];
@@ -416,7 +464,12 @@ function planFields(
     ...(plan.environment === undefined
       ? []
       : [field("Environment", plan.environment)]),
-    field("Branch", plan.branch),
+    field(
+      "Branch",
+      plan.operation === "main_update"
+        ? plan.currentBranch ?? "detached HEAD"
+        : plan.branch,
+    ),
     ...(plan.operation === "existing_pull_request_update"
       ? []
       : [field("Mode", plan.mode)]),
@@ -632,6 +685,8 @@ function operationLabel(operation: WorkspaceGitApprovalPlan["operation"]): strin
       return "既存Pull Requestを更新";
     case "github_repository_settings":
       return "GitHub Repository設定を変更";
+    case "main_update":
+      return "ローカルmainをfast-forward更新";
   }
 }
 

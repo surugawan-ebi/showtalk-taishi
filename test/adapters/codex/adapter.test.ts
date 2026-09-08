@@ -1288,7 +1288,19 @@ test("attaches the required MCP config on both thread creation and resume", asyn
   assert.equal(server.threadResumes[0]?.approvalsReviewer, undefined);
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
-    /Git approval belongs to the Koe.*Slack thread that started that same turn/u,
+    /Git approval belongs to the Koe.*plan-producing operation.*Slack thread that started that same turn/u,
+  );
+  assert.match(
+    server.threadResumes[0]?.developerInstructions ?? "",
+    /update_repository_main/u,
+  );
+  assert.match(
+    server.threadResumes[0]?.developerInstructions ?? "",
+    /Store release operations do not use AppOps MCP.*repo-local fastlane command/su,
+  );
+  assert.doesNotMatch(
+    server.threadResumes[0]?.developerInstructions ?? "",
+    /AppOps prepare tool returns|proof auto-injection/u,
   );
   assert.match(
     server.threadResumes[0]?.developerInstructions ?? "",
@@ -1837,6 +1849,29 @@ test("times out safely without interrupting a long-running external turn", async
   assert.deepEqual(server.turnStarts, []);
   assert.deepEqual(server.interruptCalls, []);
   assert.deepEqual(server.unsubscribeCalls, [session.id]);
+});
+
+test("does not start Codex after a structured continuation deadline expires", async () => {
+  const server = new FakeAppServer();
+  server.threadStatusSequence.push("active", "idle");
+  const adapter = new CodexAdapter(server, {
+    externalTurnPollMs: 5,
+    externalTurnWaitMs: 100,
+  });
+  const session = await adapter.createSession({
+    reason: "slack_conversation",
+    agent: { id: "implementer", adapter: "codex", channelId: "C123" },
+  });
+
+  await assert.rejects(
+    collectEvents(adapter.sendMessage(session, {
+      text: "Expired continuation",
+      startNotAfterMs: Date.now() + 1,
+      source: { type: "human" },
+    })),
+    /expired before Codex turn\/start/u,
+  );
+  assert.deepEqual(server.turnStarts, []);
 });
 
 test("queues a Slack turn until the external client becomes idle", async () => {
@@ -3967,7 +4002,7 @@ test("rejects structured input that is not bound to one exact workspace-git plan
   assert.equal(server.errorResponses[0]?.code, -32602);
   assert.match(
     server.errorResponses[0]?.message ?? "",
-    /REPREPARE_REQUIRED.*Do not call request_user_input again.*get_git_operation_status does not bind.*re-run.*prepare_/u,
+    /REPREPARE_REQUIRED.*Do not call request_user_input again.*get_git_operation_status does not bind.*re-run.*plan operation/u,
   );
   assert.equal(recovery?.type, "git_approval.reprepare_required");
 });
@@ -5581,6 +5616,7 @@ test("rejects an expired structured choice and resumes the App Server once", asy
 test("emits a terminal Git lifecycle event when another App Server client resolves the request", async () => {
   const server = new FakeAppServer();
   const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  const invalidatedRequests: string[] = [];
   let releasePersistence!: () => void;
   const persistenceGate = new Promise<void>((resolve) => {
     releasePersistence = resolve;
@@ -5589,6 +5625,9 @@ test("emits a terminal Git lifecycle event when another App Server client resolv
     recordExternallyResolvedGitPlan: async (plan) => {
       recordedPlans.push(plan);
       await persistenceGate;
+    },
+    onGitUserInputResolvedExternally: (requestId) => {
+      invalidatedRequests.push(requestId);
     },
   });
   const session = { id: "thr_1" };
@@ -5624,6 +5663,7 @@ test("emits a terminal Git lifecycle event when another App Server client resolv
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(recordedPlans.length, 1);
+  assert.deepEqual(invalidatedRequests, [slackRequestId]);
   assert.equal(
     events.some((event) => event.type === "git_approval.resolved_externally"),
     false,
