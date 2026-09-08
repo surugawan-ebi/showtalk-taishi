@@ -37,7 +37,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "check:types": "tsc -p tsconfig.json --noEmit",
-    "test:approval-bridge": "node --import tsx --test test/adapters/codex/app-server-client.test.ts test/adapters/codex/adapter.test.ts test/adapters/codex/appops-approval.test.ts test/adapters/codex/mcp-config.test.ts test/adapters/codex/structured-input.test.ts test/adapters/codex/workspace-git-approval.test.ts test/approvals/appops-approval-proof.test.ts test/mcp/runtime-service.test.ts test/mcp/server.test.ts test/slack/choice-blocks.test.ts test/slack/choice-continuation.test.ts test/slack/frontend.test.ts test/slack/projector.test.ts test/slack/user-input-blocks.test.ts",
+    "test:approval-bridge": "node --import tsx --test test/adapters/codex/app-server-client.test.ts test/adapters/codex/adapter.test.ts test/adapters/codex/appops-approval.test.ts test/adapters/codex/mcp-config.test.ts test/adapters/codex/structured-input.test.ts test/adapters/codex/workspace-git-approval-lifecycle.test.ts test/adapters/codex/workspace-git-approval.test.ts test/approvals/appops-approval-proof.test.ts test/core/gateway.test.ts test/mcp/runtime-service.test.ts test/mcp/server.test.ts test/slack/choice-blocks.test.ts test/slack/choice-continuation.test.ts test/slack/delegation-projector.test.ts test/slack/frontend.test.ts test/slack/git-approval-recovery-blocks.test.ts test/slack/projector.test.ts test/slack/user-input-blocks.test.ts",
     "check": "npm run check:types && npm run test:approval-bridge",
     "dev": "node --import tsx src/cli.ts start",
     "doctor": "node --import tsx src/cli.ts doctor",

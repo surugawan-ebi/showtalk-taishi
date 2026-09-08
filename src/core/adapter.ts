@@ -32,6 +32,8 @@ export interface AgentInputAttachment {
 export interface SendMessageRequest {
   readonly text: string;
   readonly attachments?: readonly AgentInputAttachment[];
+  /** Internal deadline after which a queued continuation must not start. */
+  readonly startNotAfterMs?: number;
   readonly source:
     | { readonly type: "human"; readonly slackUserId?: string }
     | {

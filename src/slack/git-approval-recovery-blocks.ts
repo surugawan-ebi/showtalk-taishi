@@ -3,7 +3,7 @@ import type { KnownBlock } from "@slack/types";
 export const GIT_APPROVAL_RECOVERY_ACTION_PREFIX = "taishi.git_recovery.";
 
 const MAX_SECTION_TEXT_LENGTH = 3_000;
-const RECOVERY_HEADING = "*Git承認画面を再作成できます*\n";
+const RECOVERY_HEADING = "*このGit承認は古いカードから再開できません*\n";
 const MAX_TRACKED_RECOVERY_MESSAGES = 4_096;
 
 export type GitApprovalRecoveryDecision = "reprepare" | "hold";
@@ -16,8 +16,8 @@ export interface GitApprovalRecoveryActionValue {
 }
 
 /**
- * Keeps a recovery action single-use while allowing a failed attempt to be
- * retried. Entries are intentionally not evicted: replaying an old action is
+ * Keeps a recovery action single-use. Entries are intentionally not evicted:
+ * replaying an old action is
  * safer to reject than silently making it usable again. A hard upper bound
  * fails closed without growing process memory indefinitely.
  */
@@ -33,9 +33,6 @@ export class GitApprovalRecoveryActionTracker {
     return true;
   }
 
-  releaseAfterFailure(key: string): void {
-    this.#used.delete(key);
-  }
 }
 
 export function buildGitApprovalRecoveryBlocks(
@@ -61,20 +58,9 @@ export function buildGitApprovalRecoveryBlocks(
       elements: [
         {
           type: "button",
-          text: { type: "plain_text", text: "承認画面を再作成", emoji: true },
-          style: "primary",
+          text: { type: "plain_text", text: "新しい依頼方法を確認", emoji: true },
           action_id: `${GIT_APPROVAL_RECOVERY_ACTION_PREFIX}reprepare`,
           value: encoded,
-          confirm: {
-            title: { type: "plain_text", text: "最新状態から再作成しますか？" },
-            text: {
-              type: "mrkdwn",
-              text:
-                "古いoperationは承認せず、Koeが現在のGit状態を再確認して新しいexact planを作ります。",
-            },
-            confirm: { type: "plain_text", text: "再作成する" },
-            deny: { type: "plain_text", text: "戻る" },
-          },
         },
         {
           type: "button",

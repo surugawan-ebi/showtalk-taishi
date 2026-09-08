@@ -86,6 +86,20 @@ class MissingSessionAdapter extends GatewayAdapter {
   }
 }
 
+class DeadlineAdvancingResumeAdapter extends GatewayAdapter {
+  readonly #advance: () => void;
+
+  constructor(advance: () => void) {
+    super();
+    this.#advance = advance;
+  }
+
+  override async resumeSession(request: ResumeSessionRequest): Promise<AdapterSession> {
+    this.#advance();
+    return super.resumeSession(request);
+  }
+}
+
 class BlockingTurnAdapter extends GatewayAdapter {
   readonly entered: Promise<void>;
   #markEntered!: () => void;
@@ -837,6 +851,102 @@ test("queues rapid human messages in FIFO order for the shared Agent", async () 
   assert.equal(firstEvents[0]?.conversation.rootThreadTs, "100.1");
   assert.equal(secondEvents[0]?.conversation.rootThreadTs, "200.2");
   assert.equal(adapter.created, 1);
+});
+
+test("revalidates a structured continuation deadline after the turn lease", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "implementer", adapter: "fake", channelId: "C123" });
+  const adapter = new BlockingTurnAdapter();
+  let now = Date.parse("2026-09-09T00:00:00.000Z");
+  const gateway = new Gateway(registry, [adapter], {
+    idFactory: () => "session-1",
+    now: () => new Date(now),
+  });
+  const active = collect(gateway.handleHumanMessage({
+    channelId: "C123",
+    rootThreadTs: "100.1",
+    text: "First",
+  }));
+  await adapter.entered;
+  const queued = collect(gateway.handleHumanMessage({
+    channelId: "C123",
+    rootThreadTs: "100.1",
+    text: "Continuation",
+    expectedSessionId: "session-1",
+    notAfterMs: now + 1_000,
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 2_000;
+  adapter.release();
+  await active;
+  await assert.rejects(queued, /expired while waiting/u);
+  assert.deepEqual(adapter.sent.map(({ request }) => request.text), ["First"]);
+});
+
+test("revalidates a structured continuation deadline after session restore", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "implementer", adapter: "fake", channelId: "C123" });
+  registry.addSession({
+    id: "session-1",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "backend-thread-1" },
+    status: "idle",
+    createdAt: "2026-09-09T00:00:00.000Z",
+    updatedAt: "2026-09-09T00:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "session-1");
+  let now = Date.parse("2026-09-09T00:00:00.000Z");
+  const adapter = new DeadlineAdvancingResumeAdapter(() => {
+    now += 2_000;
+  });
+  const gateway = new Gateway(registry, [adapter], { now: () => new Date(now) });
+
+  await assert.rejects(
+    collect(gateway.handleHumanMessage({
+      channelId: "C123",
+      rootThreadTs: "100.1",
+      text: "Continuation",
+      expectedSessionId: "session-1",
+      notAfterMs: now + 1_000,
+    })),
+    /expired while restoring/u,
+  );
+  assert.deepEqual(adapter.sent, []);
+});
+
+test("rejects a queued structured continuation after its canonical session changes", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "implementer", adapter: "fake", channelId: "C123" });
+  const adapter = new BlockingTurnAdapter();
+  const gateway = new Gateway(registry, [adapter], { idFactory: () => "session-1" });
+  const active = collect(gateway.handleHumanMessage({
+    channelId: "C123",
+    rootThreadTs: "100.1",
+    text: "First",
+  }));
+  await adapter.entered;
+  const queued = collect(gateway.handleHumanMessage({
+    channelId: "C123",
+    rootThreadTs: "100.1",
+    text: "Continuation",
+    expectedSessionId: "session-1",
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  registry.addSession({
+    id: "session-2",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "backend-thread-2" },
+    status: "idle",
+    createdAt: "2026-09-09T00:00:00.000Z",
+    updatedAt: "2026-09-09T00:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "session-2");
+  adapter.release();
+  await active;
+  await assert.rejects(queued, /changed its canonical session/u);
+  assert.deepEqual(adapter.sent.map(({ request }) => request.text), ["First"]);
 });
 
 test("queues a delayed Koe result behind a newer active Slack turn", async () => {

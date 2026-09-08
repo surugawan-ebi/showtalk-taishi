@@ -79,6 +79,42 @@ function repositorySettingsPlan(): WorkspaceGitApprovalPlan {
   };
 }
 
+function mainUpdatePlan(): WorkspaceGitApprovalPlan {
+  return {
+    operationId: "44444444-4444-4444-8444-444444444444",
+    planHash: "d".repeat(64),
+    approvalTarget: "main_update_showtalk-taishi",
+    operation: "main_update",
+    repoId: "showtalk-taishi",
+    environment: "development",
+    mode: "main_update",
+    paths: [],
+    currentBranch: "agent/fix-approval-recovery-v2",
+    expectedHead: "b".repeat(40),
+    expectedSnapshotId: "c".repeat(64),
+    worktreeId: "primary",
+    expiresAt: "2026-09-09T01:00:00+09:00",
+  };
+}
+
+function mainUpdateExecutionItem(outcome: "updated" | "skipped") {
+  const exact = mainUpdatePlan();
+  return {
+    type: "mcpToolCall",
+    id: `main-${outcome}`,
+    server: "workspace-git",
+    tool: "execute_approved_main_update",
+    status: "completed",
+    arguments: { operation_id: exact.operationId },
+    result: {
+      structuredContent: {
+        operation_id: exact.operationId,
+        status: outcome,
+      },
+    },
+  };
+}
+
 test("binds exactly one plan and preserves conflicting plans as ambiguous", () => {
   const lifecycle = new WorkspaceGitApprovalLifecycle();
   const exact = plan();
@@ -102,6 +138,19 @@ test("binds exactly one plan and preserves conflicting plans as ambiguous", () =
   assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
     kind: "missing",
   });
+});
+
+test("recognizes updated and skipped main-update executions as terminal outcomes", () => {
+  for (const outcome of ["updated", "skipped"] as const) {
+    const lifecycle = new WorkspaceGitApprovalLifecycle();
+    const exact = mainUpdatePlan();
+    lifecycle.beginApprovedExecution("session", exact);
+    lifecycle.observeItem("session", mainUpdateExecutionItem(outcome));
+    assert.deepEqual(
+      lifecycle.assessTurnCompletion("session", "idle", true),
+      { kind: "executed" },
+    );
+  }
 });
 
 test("treats changed exact-plan fields as ambiguous even when public IDs match", () => {

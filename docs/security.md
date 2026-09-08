@@ -201,14 +201,14 @@ shape, configured approver, channel, root thread, and Block message timestamp.
 The action value contains no operation ID, plan hash, repository, path, HEAD,
 or worktree data—only a random process-local request ID and routing metadata.
 
-For workspace-git publication, Draft PR, Ready, and merge approvals, Taishi
-accepts only one host-observed `awaiting_human_approval` prepare result in the
-same Codex thread and turn. If the structured request is observed before the
-matching prepare completion notification, Taishi keeps the RPC pending for at
+For workspace-git publication, Draft PR, Ready, merge, and local-main update
+approvals, Taishi accepts only one host-observed `awaiting_human_approval` plan
+result in the same Codex thread and turn. If the structured request is observed
+before the matching plan completion notification, Taishi keeps the RPC pending for at
 most two seconds and binds it only when that same thread and turn plan arrives.
 A timeout, turn completion, or different-turn plan is rejected. Taishi copies
 only bounded public fields: full operation
-ID/hash, an opaque private-state authority ID, repository, branch, mode/action,
+ID/hash, repository, branch, mode/action,
 exact repo-relative paths, expected
 HEAD/snapshot, opaque worktree ID, commit message, push target, Draft PR
 title/body/base, PR metadata, merge method, and authoritative expiry. Control
@@ -229,12 +229,13 @@ binding lives only while the originating App Server RPC is live, including its
 bounded same-turn binding grace period.
 
 The Slack choice is first recorded through a model-inaccessible local
-workspace-git decision broker. The prepare response supplies the exact bounded
-approval scope and an opaque authority ID derived one-way from the active
-private state. Taishi validates that scope against the human-facing plan and
-forwards it unchanged. Under the private store lock, workspace-git requires the
-authority ID, operation ID, full plan hash, approval target, repository, expiry,
-and complete scope to match the durable operation. For publication responses from older
+workspace-git decision broker. The plan response supplies the exact bounded
+public approval scope; any public `approval_authority_id` is rejected as a
+private-authority leak. Taishi validates that scope against the human-facing
+plan and forwards it unchanged with authenticated delivery and caller context.
+Under the private store lock, workspace-git re-reads authority and requires the
+operation ID, full plan hash, approval target, repository, expiry, complete
+scope, and human context to match the durable operation. For publication responses from older
 workspace-git versions that omit a top-level `approval_target`, Taishi derives
 that target only from the already validated `worktree_id` or
 `temporary_workspace_id`; an explicit target must match that same scope. Only
@@ -276,11 +277,14 @@ regular, non-symlink, and non-group/world-writable; the worker environment
 contains only `WORKSPACE_GIT_STATE_ROOT`. Unknown transport outcomes leave both
 the request and Slack controls pending and can be reconciled idempotently by the
 same button. They are never converted into a contradictory rejection. Permanent
-stale, missing, mismatched, or expired plans can be rejected safely and replaced
-with a fresh-plan recovery card.
-Permanent rejection intents are not retried forever; transient or outcome-unknown intents
-remain bounded and fail closed. No Git write is authorized from an uncertain
-transport result.
+stale, missing, mismatched, or expired Slack approval requests are closed without
+granting Git authority. The underlying private operation may remain awaiting
+approval when no private system-rejection recorder is configured. The old Slack
+card can only show inert guidance asking the human to send a new, explicit Git
+request; it cannot restart a turn or recreate approval authority. When a private
+system-rejection recorder is configured, permanent rejection intents are not
+retried forever; transient or outcome-unknown intents remain bounded and fail
+closed. No Git write is authorized from an uncertain transport result.
 
 Autonomous workspace-git execution is retired. Production runtime and Gateway
 composition reject automation-provider and autonomy-control factories. Stored

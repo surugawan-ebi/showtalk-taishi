@@ -119,6 +119,53 @@ function repositorySettingsNotification() {
   };
 }
 
+function mainUpdateNotification() {
+  return {
+    threadId: "thr_1",
+    turnId: "turn_main_update",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp_main_update_1",
+      server: "workspace-git",
+      tool: "update_repository_main",
+      status: "completed",
+      arguments: {
+        repo_id: "showtalk-taishi",
+        worktree_id: "primary",
+        expected_head: "b".repeat(40),
+        expected_snapshot_id: "c".repeat(64),
+        environment: "development",
+      },
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "44444444-4444-4444-8444-444444444444",
+          approval_expires_at: "2026-09-09T01:00:00+09:00",
+          scope: {
+            repo_id: "showtalk-taishi",
+            worktree_id: "primary",
+            current_branch: "agent/fix-approval-recovery-v2",
+            expected_head: "b".repeat(40),
+            expected_snapshot_id: "c".repeat(64),
+          },
+          approval_scope: {
+            kind: "main_update",
+            repo_id: "showtalk-taishi",
+            worktree_id: "primary",
+            current_branch: "agent/fix-approval-recovery-v2",
+            expected_head: "b".repeat(40),
+            expected_snapshot_id: "c".repeat(64),
+          },
+          approval_target: "main_update_showtalk-taishi",
+          plan_hash: "d".repeat(64),
+          execute_tool: "execute_approved_main_update",
+          external_write: false,
+        },
+      },
+    },
+  };
+}
+
 function existingPullRequestUpdateNotification() {
   return {
     threadId: "thr_1",
@@ -215,6 +262,40 @@ test("captures every public exact-plan field from a publication prepare result",
       expiresAt: "2026-08-14T20:00:00+09:00",
     },
   });
+});
+
+test("captures update_repository_main as an exact main-update approval plan", () => {
+  const notification = mainUpdateNotification();
+  assert.deepEqual(captureWorkspaceGitPlan(notification), {
+    turnId: "turn_main_update",
+    plan: {
+      operationId: "44444444-4444-4444-8444-444444444444",
+      planHash: "d".repeat(64),
+      approvalTarget: "main_update_showtalk-taishi",
+      approvalScope: notification.item.result.structuredContent.approval_scope,
+      operation: "main_update",
+      repoId: "showtalk-taishi",
+      environment: "development",
+      mode: "main_update",
+      paths: [],
+      currentBranch: "agent/fix-approval-recovery-v2",
+      expectedHead: "b".repeat(40),
+      expectedSnapshotId: "c".repeat(64),
+      worktreeId: "primary",
+      expiresAt: "2026-09-09T01:00:00+09:00",
+    },
+  });
+});
+
+test("rejects substituted main-update execution and state", () => {
+  const wrongTool = mainUpdateNotification();
+  wrongTool.item.result.structuredContent.execute_tool =
+    "execute_approved_git_publication";
+  assert.throws(() => captureWorkspaceGitPlan(wrongTool), /execution boundary/u);
+
+  const wrongHead = mainUpdateNotification();
+  wrongHead.item.result.structuredContent.scope.expected_head = "e".repeat(40);
+  assert.throws(() => captureWorkspaceGitPlan(wrongHead), /state does not match/u);
 });
 
 test("preserves an explicit publication environment outside provider policy", () => {

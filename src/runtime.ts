@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, constants, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
@@ -11,11 +10,6 @@ import {
   type WorkspaceGitHumanDecisionBrokerFactory,
 } from "./approvals/workspace-git-human-decision-broker.js";
 import { createWorkspaceGitHumanDecisionBrokerFromEnvironment } from "./approvals/workspace-git-manual-worker-transport.js";
-import {
-  AppOpsApprovalProofBroker,
-  createEphemeralAppOpsApprovalProofSigner,
-  type AppOpsApprovalProofSigner,
-} from "./approvals/appops-approval-proof.js";
 import {
   WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION,
   WORKSPACE_GIT_AUTOMATION_CONTRACT_VERSION_V4,
@@ -33,11 +27,7 @@ import {
   CodexModelCatalog,
   type CodexModelCatalogSnapshot,
 } from "./adapters/codex/model-catalog.js";
-import {
-  APPOPS_APPROVAL_HOOK_MCP_URL_ENV,
-  APPOPS_APPROVAL_HOOK_PATH_ENV,
-  buildCodexMcpThreadConfig,
-} from "./adapters/codex/mcp-config.js";
+import { buildCodexMcpThreadConfig } from "./adapters/codex/mcp-config.js";
 import type { TaishiConfig } from "./config/schema.js";
 import {
   AgentScopedAdapter,
@@ -57,6 +47,7 @@ import {
 } from "./mcp/index.js";
 import { SlackFrontend } from "./slack/frontend.js";
 import { createSlackMessagePresentation } from "./slack/presentation.js";
+import { WorkspaceGitApprovalDetailsStore } from "./slack/user-input-blocks.js";
 import {
   FileStateStore,
   type RuntimeState,
@@ -71,9 +62,6 @@ import {
 } from "./permissions/approval-coordinator.js";
 
 const MCP_TOKEN_ENV_VAR = "SHOWTALK_TAISHI_MCP_TOKEN";
-const APPOPS_APPROVAL_HOOK_PATH = fileURLToPath(
-  new URL("./hooks/appops-approval-pre-tool-use.js", import.meta.url),
-);
 
 export interface RunningTaishi {
   readonly gateway: Gateway;
@@ -143,8 +131,6 @@ export interface CreateRuntimeOptions {
   /** Private hosts may inject an opaque provider client; OSS defaults manual. */
   readonly workspaceGitAutomationProviderFactory?: WorkspaceGitAutomationProviderFactoryAny;
   readonly workspaceGitAutonomyControlBrokerFactory?: WorkspaceGitAutonomyControlBrokerFactoryV4;
-  /** Test/private-host override; production normally loads a parent-only key file. */
-  readonly appOpsApprovalProofSigner?: AppOpsApprovalProofSigner;
 }
 
 export async function createRuntime(
@@ -190,10 +176,6 @@ async function createLockedRuntime(
     options.workspaceGitHumanDecisionBrokerFactory === undefined
       ? await createWorkspaceGitHumanDecisionBrokerFromEnvironment(process.env)
       : await options.workspaceGitHumanDecisionBrokerFactory.create();
-  const appOpsApprovalProofSigner =
-    options.appOpsApprovalProofSigner ??
-    createEphemeralAppOpsApprovalProofSigner();
-  const appOpsApprovalProofBroker = new AppOpsApprovalProofBroker();
   if (
     workspaceGitDecisionBroker !== undefined &&
     workspaceGitDecisionBroker.contract_version !==
@@ -268,6 +250,7 @@ async function createLockedRuntime(
   recentGatewayRestartReceipts = [...gatewayRestartReplayGuard.list()];
   const clients: CodexAppServerClient[] = [];
   const codexAdapters: CodexAdapter[] = [];
+  const workspaceGitApprovalDetailsStore = new WorkspaceGitApprovalDetailsStore();
   const workspaceGitAutomationProviders: WorkspaceGitAutomationProviderAny[] = [];
   if (
     options.workspaceGitAutomationProviderFactory !== undefined &&
@@ -299,7 +282,6 @@ async function createLockedRuntime(
       ...(options.onRestartRequested === undefined
         ? {}
         : { onRestartRequested: options.onRestartRequested }),
-      appOpsApprovalProofBroker,
       gatewayRestartReplayGuard,
       runtimeInstanceId: randomUUID(),
     },
@@ -323,13 +305,6 @@ async function createLockedRuntime(
         process.env,
         adapterConfig.env_passthrough,
       );
-      codexChildEnvironment.APP_OPS_SHOWTALK_APPROVAL_KEY_ID =
-        appOpsApprovalProofSigner.keyId;
-      codexChildEnvironment.APP_OPS_SHOWTALK_APPROVAL_PUBLIC_KEY =
-        appOpsApprovalProofSigner.publicKeyPem;
-      codexChildEnvironment[APPOPS_APPROVAL_HOOK_MCP_URL_ENV] = credential.url;
-      codexChildEnvironment[APPOPS_APPROVAL_HOOK_PATH_ENV] =
-        APPOPS_APPROVAL_HOOK_PATH;
       const client = await CodexAppServerClient.spawn({
         command: adapterConfig.command,
         env: codexChildEnvironment,
@@ -376,10 +351,10 @@ async function createLockedRuntime(
         threadConfig: buildCodexMcpThreadConfig({
           url: credential.url,
           bearerTokenEnvVar: MCP_TOKEN_ENV_VAR,
-        }, {
-          publicKeyPem: appOpsApprovalProofSigner.publicKeyPem,
-          keyId: appOpsApprovalProofSigner.keyId,
         }),
+        onGitUserInputResolvedExternally: (requestId) => {
+          workspaceGitApprovalDetailsStore.invalidateRequest(requestId);
+        },
         ...(workspaceGitAutomationProvider === undefined
           ? {}
           : {
@@ -388,8 +363,6 @@ async function createLockedRuntime(
                 ? {}
                 : { workspaceGitAutomationRevisions: workspaceGitAutomationSetting }),
             }),
-        appOpsApprovalProofSigner,
-        appOpsApprovalProofBroker,
       });
       if (options.onRestartRequested !== undefined) {
         client.onClose(() => options.onRestartRequested?.());
@@ -453,6 +426,7 @@ async function createLockedRuntime(
       ),
       attachmentRoot,
       permissionApprovals,
+      workspaceGitApprovalDetailsStore,
       ...(workspaceGitDecisionBroker === undefined
         ? {}
         : { workspaceGitDecisionBroker }),

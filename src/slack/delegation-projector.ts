@@ -8,6 +8,7 @@ import {
 import { SlackThreadProjector } from "./projector.js";
 import { formatAgentTextForSlack } from "./text-format.js";
 import type { WorkspaceGitApprovalDetailsStore } from "./user-input-blocks.js";
+import type { StructuredChoiceContinuationStore } from "./choice-continuation.js";
 
 const MAX_DELEGATION_MESSAGE_TEXT = 3_300;
 const MAX_DELEGATION_ERROR_TEXT = 2_000;
@@ -32,17 +33,22 @@ export class SlackDelegationProjector {
   readonly #client: WebClient;
   readonly #presentations: SlackPresentationsByChannel;
   readonly #gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
+  readonly #choiceContinuationStore?: StructuredChoiceContinuationStore;
   readonly #active = new Map<string, ActiveProjection>();
 
   constructor(
     client: WebClient,
     presentations: SlackPresentationsByChannel = {},
     gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore,
+    choiceContinuationStore?: StructuredChoiceContinuationStore,
   ) {
     this.#client = client;
     this.#presentations = presentations;
     if (gitApprovalDetailsStore !== undefined) {
       this.#gitApprovalDetailsStore = gitApprovalDetailsStore;
+    }
+    if (choiceContinuationStore !== undefined) {
+      this.#choiceContinuationStore = choiceContinuationStore;
     }
   }
 
@@ -80,6 +86,9 @@ export class SlackDelegationProjector {
             ...(this.#gitApprovalDetailsStore === undefined
               ? {}
               : { gitApprovalDetailsStore: this.#gitApprovalDetailsStore }),
+            ...(this.#choiceContinuationStore === undefined
+              ? {}
+              : { choiceContinuationStore: this.#choiceContinuationStore }),
           },
         );
         projector.setSessionId(activity.targetSessionId);

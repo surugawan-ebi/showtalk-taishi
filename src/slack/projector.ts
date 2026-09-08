@@ -907,14 +907,16 @@ export class SlackThreadProjector {
   }
 
   async #resolveGitApprovalExternally(requestId: string): Promise<void> {
-    const initial = this.#gitApprovalDetailsStore?.getForRequest(
+    const initial = this.#gitApprovalDetailsStore?.getForTerminalProjection(
       requestId,
       this.#channelId,
       this.#rootThreadTs,
     );
     if (initial === undefined || this.#gitApprovalDetailsStore === undefined) return;
     await this.#gitApprovalDetailsStore.serialize(initial.routing, async () => {
-      const details = this.#gitApprovalDetailsStore?.get(initial.routing);
+      const details = this.#gitApprovalDetailsStore?.getIncludingTerminal(
+        initial.routing,
+      );
       if (details === undefined) return;
       const fallback =
         "このGit承認は別のCodexクライアントで解決されました。Slackからは実行できません。";
@@ -930,6 +932,12 @@ export class SlackThreadProjector {
               : [sourceMentionBlock(details.sourceUserMention), ...blocks],
         }).then(() => undefined)
       );
+      // The App Server request is already terminal. Never retain actionable
+      // private plan state merely to retry a cosmetic Slack update: the stale
+      // button could otherwise record a new private human decision after its
+      // request has disappeared.
+      this.#gitApprovalDetailsStore?.forget(initial.routing);
+      this.#gitApprovalDetailsStore?.releaseTerminalRequest(requestId);
       if (updated) {
         this.#interactionAudit?.({
           event: "git_approval.resolved_externally",
@@ -937,20 +945,21 @@ export class SlackThreadProjector {
           ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
           outcome: "unavailable",
         });
-        this.#gitApprovalDetailsStore?.forget(initial.routing);
       }
     });
   }
 
   async #expireGitApproval(requestId: string): Promise<void> {
-    const initial = this.#gitApprovalDetailsStore?.getForRequest(
+    const initial = this.#gitApprovalDetailsStore?.getForTerminalProjection(
       requestId,
       this.#channelId,
       this.#rootThreadTs,
     );
     if (initial === undefined || this.#gitApprovalDetailsStore === undefined) return;
     await this.#gitApprovalDetailsStore.serialize(initial.routing, async () => {
-      const details = this.#gitApprovalDetailsStore?.get(initial.routing);
+      const details = this.#gitApprovalDetailsStore?.getIncludingTerminal(
+        initial.routing,
+      );
       if (details === undefined) return;
       const fallback = this.#formatActionableMessage(
         "Git操作の承認期限が切れました。この計画は実行できません。",
@@ -979,6 +988,7 @@ export class SlackThreadProjector {
           outcome: "expired",
         });
         this.#gitApprovalDetailsStore?.forget(details.routing);
+        this.#gitApprovalDetailsStore?.releaseTerminalRequest(requestId);
       }
       // If every bounded update attempt fails, retain the exact route. A stale
       // click can then retry the same cosmetic terminal update without ever
@@ -1164,7 +1174,7 @@ export class SlackThreadProjector {
     event: Extract<AgentEvent, { type: "git_approval.reprepare_required" }>,
   ): Promise<void> {
     const fallback = this.#formatActionableMessage(
-      "Git承認画面を安全に再作成できます。",
+      "この古いカードからターンは再開しません。対象のGit操作を新しく依頼してください。",
       this.#sourceUserMention !== undefined,
     );
     const posted = await this.#client.chat.postMessage({
