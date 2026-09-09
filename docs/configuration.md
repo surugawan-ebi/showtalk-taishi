@@ -228,10 +228,11 @@ The former per-Koe `workspace_git_autonomy` field is accepted only for
 backward-compatible configuration loading and never authorizes execution.
 The version-1 human-only broker remains a separate manual-approval transport;
 it does not enable autonomous execution. Set
-`SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE` to the absolute built
-`workspace-git-mcp/manual` entrypoint and `WORKSPACE_GIT_STATE_ROOT` to the
-private workspace-git state directory. No signing key, MAC key, private socket,
-profile, or automation setting is used by this path.
+`SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE` and `WORKSPACE_GIT_STATE_ROOT` only
+when a compatible external operator integration is installed. No signing key,
+MAC key, private socket, profile, or automation setting is used by this path.
+See [Optional workspace-git integration](workspace-git-integration.md) for the
+exact contract, metadata checks, and fail-closed behavior.
 
 ## Local files
 

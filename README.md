@@ -157,6 +157,10 @@ this preview; install from a source checkout rather than `npm install -g`.
   through workspace-git's model-inaccessible private broker; the resumed turn
   can execute only after the exact operation is re-read as approved.
 
+Exact Git approvals require the separately installed, operator-owned integration
+described in [Optional workspace-git integration](docs/workspace-git-integration.md).
+Basic Slack and Codex routing works without it.
+
 Read the full [security model](docs/security.md) before connecting real
 repositories or enabling Koe-to-Koe consultations. Report vulnerabilities
 through the private process in [SECURITY.md](SECURITY.md).
@@ -165,6 +169,8 @@ through the private process in [SECURITY.md](SECURITY.md).
 
 - [Configuration](docs/configuration.md)
 - [Operations and Slack behavior](docs/operations.md)
+- [Gateway restart verification](docs/gateway-restart-verification.md)
+- [Optional workspace-git integration](docs/workspace-git-integration.md)
 - [Architecture](docs/architecture.md)
 - [Security model](docs/security.md)
 - [Private vulnerability reporting](SECURITY.md)

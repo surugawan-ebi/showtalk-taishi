@@ -81,7 +81,7 @@ class FakeAppServer implements CodexAppServer {
   readonly turnStatuses = new Map<string, CodexTurn["status"]>();
   readonly interruptCalls: Array<{ threadId: string; turnId: string }> = [];
   startTurnBehavior?: (params: TurnStartParams) => Promise<CodexTurn>;
-  onListTurns?: (callCount: number) => void;
+  onListTurns?: (callCount: number) => void | Promise<void>;
   interruptFailures = 0;
   userInputResponseError: Error | undefined;
   closed = false;
@@ -171,7 +171,7 @@ class FakeAppServer implements CodexAppServer {
   ): Promise<ThreadTurnsListResponse> {
     this.listTurnsCalls += 1;
     this.listTurnsParams.push(params);
-    this.onListTurns?.(this.listTurnsCalls);
+    await this.onListTurns?.(this.listTurnsCalls);
     if (this.rejectTurnPaginationAsUnsupported) {
       throw new CodexRpcError(
         "paginated_threads is not supported yet",
@@ -1823,6 +1823,236 @@ test("correlates a pre-response server request to the returned exact turn", asyn
     turn: { id: "turn_1", status: "completed" },
   });
   await events.return?.();
+});
+
+test("never resurrects a pre-response Git approval resolved by App Server", async () => {
+  for (const prepareBeforeResolution of [false, true]) {
+    const server = new FakeAppServer();
+    const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+    server.startTurnBehavior = async () => {
+      server.request({
+        id: 1001,
+        method: "item/tool/requestUserInput",
+        params: workspaceGitQuestion(),
+      });
+      if (prepareBeforeResolution) notifyPublicationPlan(server);
+      server.notify("serverRequest/resolved", {
+        threadId: "thr_1",
+        requestId: 1001,
+      });
+      if (!prepareBeforeResolution) notifyPublicationPlan(server);
+      return { id: "turn_1", status: "inProgress" };
+    };
+    const adapter = new CodexAdapter(server, {
+      recordExternallyResolvedGitPlan: async (plan) => {
+        recordedPlans.push(plan);
+      },
+    });
+    const events: AgentEvent[] = [];
+    const consuming = (async () => {
+      for await (const event of adapter.sendMessage(
+        { id: "thr_1" },
+        { text: "Do not revive stale approval", source: { type: "human" } },
+      )) {
+        events.push(event);
+        if (event.type === "git_approval.resolved_externally") {
+          server.notify("turn/completed", {
+            threadId: "thr_1",
+            turn: {
+              id: "turn_1",
+              status: "completed",
+              itemsView: "full",
+              items: [],
+            },
+          });
+        }
+      }
+    })();
+
+    await consuming;
+    assert.equal(recordedPlans.length, 1);
+    assert.equal(
+      events.some((event) => event.type === "user_input.requested"),
+      false,
+    );
+    assert.deepEqual(server.userInputResponses, []);
+    assert.deepEqual(server.errorResponses, []);
+  }
+});
+
+test("rejects a pre-response Git request when the turn completes before start returns", async () => {
+  const server = new FakeAppServer();
+  const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  server.startTurnBehavior = async () => {
+    notifyPublicationPlan(server);
+    server.request({
+      id: 1008,
+      method: "item/tool/requestUserInput",
+      params: workspaceGitQuestion(),
+    });
+    server.notify("turn/completed", {
+      threadId: "thr_1",
+      turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+    });
+    return { id: "turn_1", status: "completed" };
+  };
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async (plan) => {
+      recordedPlans.push(plan);
+    },
+  });
+
+  const events = await collectEvents(adapter.sendMessage(
+    { id: "thr_1" },
+    { text: "Do not show a completed request", source: { type: "human" } },
+  ));
+
+  assert.equal(recordedPlans.length, 1);
+  assert.equal(events.some((event) => event.type === "user_input.requested"), false);
+  assert.equal(
+    events.some((event) => event.type === "git_approval.resolved_externally"),
+    true,
+  );
+  assert.equal(server.errorResponses.some(({ id }) => id === 1008), true);
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("rejects deferred Git approval when completion itself claims turn ownership", async () => {
+  const server = new FakeAppServer();
+  const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  server.startTurnBehavior = async (params) => {
+    notifyPublicationPlan(server);
+    server.request({
+      id: 1009,
+      method: "item/tool/requestUserInput",
+      params: workspaceGitQuestion(),
+    });
+    server.notify("turn/completed", {
+      threadId: "thr_1",
+      turn: {
+        id: "turn_1",
+        status: "completed",
+        itemsView: "full",
+        items: [{
+          type: "userMessage",
+          id: "user-message-claim",
+          clientId: params.clientUserMessageId,
+        }],
+      },
+    });
+    return { id: "turn_1", status: "completed" };
+  };
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async (plan) => {
+      recordedPlans.push(plan);
+    },
+  });
+
+  const events = await collectEvents(adapter.sendMessage(
+    { id: "thr_1" },
+    { text: "Claim and finish safely", source: { type: "human" } },
+  ));
+
+  assert.equal(recordedPlans.length, 1);
+  assert.equal(events.some((event) => event.type === "user_input.requested"), false);
+  assert.equal(server.errorResponses.some(({ id }) => id === 1009), true);
+  assert.deepEqual(server.userInputResponses, []);
+});
+
+test("does not flush a completed continuation turn's deferred Git approval", async () => {
+  const server = new FakeAppServer();
+  const recordedPlans: WorkspaceGitApprovalPlan[] = [];
+  server.startTurnBehavior = async () => {
+    if (server.turnStarts.length === 1) {
+      return { id: "turn_1", status: "inProgress" };
+    }
+    notifyPublicationPlan(server, {
+      itemId: "continuation-plan",
+      turnId: "turn_2",
+      operationId: "22222222-2222-4222-8222-222222222222",
+      planHash: "d".repeat(64),
+    });
+    server.request({
+      id: 1010,
+      method: "item/tool/requestUserInput",
+      params: workspaceGitQuestionForTurn("turn_2"),
+    });
+    server.notify("turn/completed", {
+      threadId: "thr_1",
+      turn: { id: "turn_2", status: "completed", itemsView: "full", items: [] },
+    });
+    return { id: "turn_2", status: "completed" };
+  };
+  const adapter = new CodexAdapter(server, {
+    recordExternallyResolvedGitPlan: async (plan) => {
+      recordedPlans.push(plan);
+    },
+  });
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 1011);
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(server.turnStarts.length, 2);
+  assert.equal(
+    events.filter((event) => event.type === "user_input.requested").length,
+    1,
+  );
+  assert.equal(recordedPlans.length, 1);
+  assert.equal(
+    recordedPlans[0]?.operationId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+  assert.equal(server.errorResponses.some(({ id }) => id === 1010), true);
+});
+
+test("drops non-Git requests resolved before turn/start returns", async () => {
+  const server = new FakeAppServer();
+  server.startTurnBehavior = async () => {
+    server.request({
+      id: 1002,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thr_1",
+        turnId: "turn_1",
+        itemId: "early-command",
+        command: "true",
+      },
+    });
+    server.request({
+      id: 1003,
+      method: "item/tool/requestUserInput",
+      params: ordinaryChoiceQuestion(),
+    });
+    server.notify("serverRequest/resolved", {
+      threadId: "thr_1",
+      requestId: 1002,
+    });
+    server.notify("serverRequest/resolved", {
+      threadId: "thr_1",
+      requestId: 1003,
+    });
+    return { id: "turn_1", status: "inProgress" };
+  };
+  const adapter = new CodexAdapter(server);
+  const eventsPromise = collectEvents(adapter.sendMessage(
+    { id: "thr_1" },
+    { text: "Drop resolved requests", source: { type: "human" } },
+  ));
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(events.some((event) => event.type === "approval.requested"), false);
+  assert.equal(events.some((event) => event.type === "choice.requested"), false);
+  assert.deepEqual(server.approvalResponses, []);
+  assert.deepEqual(server.userInputResponses, []);
 });
 
 test("times out safely without interrupting a long-running external turn", async () => {
@@ -5876,7 +6106,7 @@ test("expires an external Git rejection instead of blocking shutdown forever", a
 
 test("allows a fresh exact approval in the same turn after the previous one expires", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server, { approvalTimeoutMs: 10 });
+  const adapter = new CodexAdapter(server, { approvalTimeoutMs: 60_000 });
   const session = { id: "thr_1" };
   const requests: Extract<AgentEvent, { type: "user_input.requested" }>[] = [];
   let freshPlanSent = false;
@@ -5918,7 +6148,12 @@ test("allows a fresh exact approval in the same turn after the previous one expi
     return events;
   })();
   await new Promise((resolve) => setImmediate(resolve));
-  notifyPublicationPlan(server);
+  notifyPublicationPlan(server, {
+    // Expire the first exact plan independently from the adapter-wide timeout.
+    // The second request then retains enough time to be answered even when the
+    // full test suite is running concurrently under load.
+    expiresAt: new Date(Date.now() + 1_000).toISOString(),
+  });
   server.request({
     id: 817,
     method: "item/tool/requestUserInput",
@@ -6016,6 +6251,115 @@ test("reconciles a missed terminal event with thread status", async () => {
   assert.equal(server.readCalls, 1, "preflight should read thread metadata once");
   assert.equal(server.listTurnsCalls, 1, "watchdog should page exact turn state");
   assert.equal(events.at(-1)?.type, "status.changed");
+});
+
+test("watchdog applies the bounded approved-Git continuation policy", async () => {
+  const server = new FakeAppServer();
+  server.threadStatusType = "idle";
+  server.hydratedTurns.set("turn_1", {
+    id: "turn_1",
+    status: "completed",
+    itemsView: "full",
+    items: [],
+  });
+  server.hydratedTurns.set("turn_2", {
+    id: "turn_2",
+    status: "completed",
+    itemsView: "full",
+    items: [],
+  });
+  const adapter = new CodexAdapter(server, { terminalWatchdogMs: 5 });
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 1004);
+
+  const events = await eventsPromise;
+
+  assert.equal(server.turnStarts.length, 2);
+  assert.equal(events.filter((event) =>
+    event.type === "error" && event.code === "GIT_APPROVAL_EXECUTION_NOT_OBSERVED"
+  ).length, 1);
+});
+
+test("watchdog accepts a complete approved-Git execution snapshot", async () => {
+  const server = new FakeAppServer();
+  server.threadStatusType = "idle";
+  server.hydratedTurns.set("turn_1", {
+    id: "turn_1",
+    status: "completed",
+    itemsView: "full",
+    items: [publicationExecutionItem()],
+  });
+  const adapter = new CodexAdapter(server, { terminalWatchdogMs: 5 });
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 1005);
+
+  const events = await eventsPromise;
+
+  assert.equal(server.turnStarts.length, 1);
+  assert.equal(events.some((event) => event.type === "error"), false);
+});
+
+test("watchdog fails closed when approved-Git final items stay unavailable", async () => {
+  const server = new FakeAppServer();
+  server.threadStatusType = "idle";
+  const adapter = new CodexAdapter(server, { terminalWatchdogMs: 5 });
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 1006);
+
+  const events = await eventsPromise;
+
+  assert.equal(server.turnStarts.length, 1);
+  assert.equal(events.some((event) =>
+    event.type === "error" && event.code === "GIT_APPROVAL_FINAL_STATE_INCOMPLETE"
+  ), true);
+});
+
+test("ignores an old watchdog result after normal completion starts a continuation", async () => {
+  const server = new FakeAppServer();
+  server.threadStatusType = "idle";
+  let releaseList!: () => void;
+  let markListEntered!: () => void;
+  const listEntered = new Promise<void>((resolve) => {
+    markListEntered = resolve;
+  });
+  const listGate = new Promise<void>((resolve) => {
+    releaseList = resolve;
+  });
+  server.onListTurns = async (callCount) => {
+    if (callCount !== 1) return;
+    markListEntered();
+    await listGate;
+  };
+  const adapter = new CodexAdapter(server, { terminalWatchdogMs: 5 });
+  const { eventsPromise } = await beginApprovedPublication(server, adapter, 1007);
+  await listEntered;
+
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_1",
+      status: "completed",
+      itemsView: "full",
+      items: [],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(server.turnStarts.length, 2);
+  releaseList();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: {
+      id: "turn_2",
+      status: "completed",
+      itemsView: "full",
+      items: [],
+    },
+  });
+
+  const events = await eventsPromise;
+  assert.equal(server.turnStarts.length, 2);
+  assert.equal(events.filter((event) =>
+    event.type === "error" && event.code === "GIT_APPROVAL_EXECUTION_NOT_OBSERVED"
+  ).length, 1);
+  assert.equal(server.closed, false);
 });
 
 test("retries a transient thread status failure without ending the stream", async () => {

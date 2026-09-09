@@ -438,7 +438,9 @@ export class RuntimeMcpService implements SwitchboardMcpService {
             completed = truncateResult(activity.event.text);
           }
         }
-        if (!projectionStartFailed) {
+        if (projectionStartFailed) {
+          await this.#cancelUnprojectedDelegationInput(activity);
+        } else {
           let destination:
             | { readonly channelId: string; readonly rootThreadTs: string }
             | undefined;
@@ -465,46 +467,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
             }
           } catch (error) {
             this.#onProjectionError(error);
-            if (
-              activity.type === "delegation.agent_event" &&
-              activity.event.type === "approval.requested"
-            ) {
-              try {
-                await this.#requireGateway().resolveSessionApproval(
-                  activity.targetSessionId,
-                  {
-                    requestId: activity.event.requestId,
-                    decision: "cancel",
-                  },
-                );
-              } catch (resolutionError) {
-                this.#onProjectionError(resolutionError);
-                // An invisible native approval must never remain live. By
-                // failing routing here, adapter cleanup interrupts the target.
-                throw resolutionError;
-              }
-            } else if (
-              activity.type === "delegation.agent_event" &&
-              (activity.event.type === "user_input.requested" ||
-                activity.event.type === "choice.requested")
-            ) {
-              try {
-                await this.#requireGateway().resolveSessionUserInput(
-                  activity.targetSessionId,
-                  {
-                    requestId: activity.event.requestId,
-                    ...(activity.event.type === "user_input.requested"
-                      ? { optionId: "reject" as const }
-                      : { cancelled: true as const }),
-                  },
-                );
-              } catch (resolutionError) {
-                this.#onProjectionError(resolutionError);
-                // An invisible structured request must never remain live. By
-                // failing routing here, adapter cleanup interrupts the target.
-                throw resolutionError;
-              }
-            }
+            await this.#cancelUnprojectedDelegationInput(activity);
             if (activity.type === "delegation.started") {
               if (targetUsesSlackThreads) {
                 if (destination !== undefined) {
@@ -959,6 +922,44 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       );
     }
     return this.#gateway;
+  }
+
+  async #cancelUnprojectedDelegationInput(
+    activity: DelegationActivity,
+  ): Promise<void> {
+    if (activity.type !== "delegation.agent_event") return;
+    try {
+      if (activity.event.type === "approval.requested") {
+        await this.#requireGateway().resolveSessionApproval(
+          activity.targetSessionId,
+          {
+            requestId: activity.event.requestId,
+            decision: "cancel",
+          },
+        );
+      } else if (activity.event.type === "user_input.requested") {
+        await this.#requireGateway().resolveSessionUserInput(
+          activity.targetSessionId,
+          {
+            requestId: activity.event.requestId,
+            optionId: "reject",
+          },
+        );
+      } else if (activity.event.type === "choice.requested") {
+        await this.#requireGateway().resolveSessionUserInput(
+          activity.targetSessionId,
+          {
+            requestId: activity.event.requestId,
+            cancelled: true,
+          },
+        );
+      }
+    } catch (resolutionError) {
+      this.#onProjectionError(resolutionError);
+      // An invisible approval or structured request must never remain live. By
+      // failing routing here, adapter cleanup interrupts the target.
+      throw resolutionError;
+    }
   }
 
   async #closeProjectedDelegation(

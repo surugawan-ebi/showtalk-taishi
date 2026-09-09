@@ -45,10 +45,7 @@
     "smoke:codex-agent-send": "node --import tsx scripts/smoke-codex-agent-send.ts",
     "smoke:codex-resume": "node --import tsx scripts/smoke-codex-resume.ts",
     "smoke:codex-user-input": "node --import tsx scripts/smoke-codex-user-input.ts",
-    "smoke:codex-appops-proof": "npm run build && node --import tsx scripts/smoke-codex-appops-proof.ts",
-    "codex:appops-hook:check": "node --import tsx scripts/activate-codex-appops-hook.ts",
-    "codex:appops-hook:activate": "node --import tsx scripts/activate-codex-appops-hook.ts --apply",
-    "verify:approval-bridge": "npm run test:approval-bridge && npm run smoke:codex-user-input && npm run smoke:codex-appops-proof",
+    "verify:approval-bridge": "npm run test:approval-bridge && npm run smoke:codex-user-input",
     "smoke:codex": "npm run smoke:codex-mcp && npm run smoke:codex-agent-send && npm run smoke:codex-resume",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "verify": "npm run check && npm test && npm run build && npm pack --dry-run --json"

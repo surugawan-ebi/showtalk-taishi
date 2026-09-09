@@ -741,34 +741,51 @@ export class CodexAdapter implements AgentAdapter {
     const scheduleTerminalWatchdog = (delayMs = this.#options.terminalWatchdogMs) => {
       clearTerminalWatchdog();
       terminalWatchdog = setTimeout(() => {
-        void this.#reconcileTurnStatus(session.id, queue).then(async (result) => {
-          if (result === "terminal") {
-            await this.#rejectPendingUserInputBindings(
-              session.id,
-              queue,
-              "The Codex turn ended before its workspace-git plan could be bound",
+        const watchedTurnId = ownedTurnId;
+        if (watchedTurnId === undefined) return;
+        void this.#reconcileTurnStatus(session.id, watchedTurnId).then(async (result) => {
+          if (
+            terminal ||
+            failed ||
+            completingTurnId !== undefined ||
+            ownedTurnId !== watchedTurnId ||
+            this.#activeTurns.get(session.id) !== watchedTurnId
+          ) {
+            return;
+          }
+          if (result.kind === "terminal") {
+            const params = { threadId: session.id, turn: result.turn };
+            admitCompletedTurn(
+              params,
+              asRecord(result.turn),
+              normalizeNotification("turn/completed", params),
             );
-            terminal = true;
-            this.#runningSessions.delete(session.id);
-            this.#removePendingApprovals(session.id);
-            this.#removePendingUserInputs(session.id);
-            this.#workspaceGitApprovals.clearTurnArtifacts(session.id);
-            this.#removeStartedItems(session.id);
-          } else if (!terminal && result === "retry") {
+          } else if (result.kind === "retry") {
             reconciliationFailures += 1;
             if (
               reconciliationFailures >=
               this.#options.terminalWatchdogMaxRetries
             ) {
-              const turnId = this.#activeTurns.get(session.id);
               let interrupted = false;
-              if (turnId !== undefined) {
+              if (
+                ownedTurnId === watchedTurnId &&
+                this.#activeTurns.get(session.id) === watchedTurnId
+              ) {
                 try {
-                  await this.#client.interruptTurn(session.id, turnId);
+                  await this.#client.interruptTurn(session.id, watchedTurnId);
                   interrupted = true;
                 } catch {
                   // Closing the transport is the fail-closed fallback below.
                 }
+              }
+              if (
+                terminal ||
+                failed ||
+                completingTurnId !== undefined ||
+                ownedTurnId !== watchedTurnId ||
+                this.#activeTurns.get(session.id) !== watchedTurnId
+              ) {
+                return;
               }
               if (!interrupted) {
                 this.#transportFailed = true;
@@ -802,7 +819,7 @@ export class CodexAdapter implements AgentAdapter {
                 this.#options.terminalWatchdogMs * 8,
               ),
             );
-          } else if (!terminal) {
+          } else {
             reconciliationFailures = 0;
             scheduleTerminalWatchdog();
           }
@@ -817,13 +834,21 @@ export class CodexAdapter implements AgentAdapter {
       }
       ownedTurnId = turnId;
       this.#activeTurns.set(session.id, turnId);
-      this.#flushDeferredServerRequests(session.id, turnId);
     };
     const completeTurn = async (
       params: unknown,
       turn: Record<string, unknown> | undefined,
       event: AgentEvent | undefined,
     ): Promise<void> => {
+      const completedTurnId = notificationTurnId(params);
+      if (completedTurnId !== undefined) {
+        this.#rejectDeferredServerRequestsForTurn(
+          session.id,
+          completedTurnId,
+          queue,
+          "The Codex turn completed before the request was correlated",
+        );
+      }
       await this.#rejectPendingUserInputBindings(
         session.id,
         queue,
@@ -835,7 +860,6 @@ export class CodexAdapter implements AgentAdapter {
       const hasExecutionWatch =
         this.#workspaceGitApprovals.hasExecutionWatch(session.id);
       let finalTurn = turn;
-      const completedTurnId = notificationTurnId(params);
       if (completedTurnId !== undefined) {
         this.#externalActionApprovalRepairStates.delete(
           turnKey(session.id, completedTurnId),
@@ -908,8 +932,36 @@ export class CodexAdapter implements AgentAdapter {
       this.#removeStartedItems(session.id);
       queue.close();
     };
+    const admitCompletedTurn = (
+      params: unknown,
+      turn: Record<string, unknown> | undefined,
+      event: AgentEvent | undefined,
+    ): boolean => {
+      const completedTurnId = notificationTurnId(params);
+      if (
+        completedTurnId === undefined ||
+        terminal ||
+        failed ||
+        completingTurnId !== undefined ||
+        ownedTurnId !== completedTurnId ||
+        this.#activeTurns.get(session.id) !== completedTurnId
+      ) {
+        return false;
+      }
+      completingTurnId = completedTurnId;
+      clearTerminalWatchdog();
+      void completeTurn(params, turn, event).catch((error: unknown) => {
+        queue.fail(
+          error instanceof Error
+            ? error
+            : new Error("Could not reconcile the completed Codex turn"),
+        );
+      });
+      return true;
+    };
     const processNotification = (method: string, params: unknown) => {
       if (!belongsToThread(params, session.id)) return;
+      let claimedTurn = false;
       if (isTurnScopedNotification(method)) {
         const notifiedTurnId = notificationTurnId(params);
         if (notifiedTurnId === undefined) return;
@@ -917,6 +969,11 @@ export class CodexAdapter implements AgentAdapter {
           if (notificationClientUserMessageId(params) === clientUserMessageId) {
             try {
               claimOwnedTurn(notifiedTurnId);
+              claimedTurn = true;
+              const pending = deferredNotifications.splice(0);
+              for (const deferred of pending.sort(deferredNotificationOrder)) {
+                processNotification(deferred.method, deferred.params);
+              }
             } catch (error) {
               queue.fail(error);
               return;
@@ -938,7 +995,11 @@ export class CodexAdapter implements AgentAdapter {
         (typeof notification?.requestId === "string" ||
           typeof notification?.requestId === "number")
       ) {
-        this.#removePendingServerRequestByRpcId(notification.requestId, queue);
+        this.#removePendingServerRequestByRpcId(
+          session.id,
+          notification.requestId,
+          queue,
+        );
       }
       const item = asRecord(notification?.item);
       if (method === "item/started" && typeof item?.id === "string") {
@@ -1010,21 +1071,14 @@ export class CodexAdapter implements AgentAdapter {
       const event = normalizeNotification(method, params);
       if (method !== "turn/completed" && event !== undefined) pushAgentEvent(event);
       if (method === "turn/completed") {
-        const completedTurnId = notificationTurnId(params);
-        if (
-          completedTurnId === undefined ||
-          completingTurnId === completedTurnId
-        ) {
-          return;
-        }
-        completingTurnId = completedTurnId;
-        void completeTurn(params, turn, event).catch((error: unknown) => {
-          queue.fail(
-            error instanceof Error
-              ? error
-              : new Error("Could not reconcile the completed Codex turn"),
-          );
-        });
+        admitCompletedTurn(params, turn, event);
+      }
+      if (
+        claimedTurn &&
+        completingTurnId === undefined &&
+        ownedTurnId !== undefined
+      ) {
+        this.#flushDeferredServerRequests(session.id, ownedTurnId);
       }
     };
     const startApprovedGitContinuation = (
@@ -1073,13 +1127,16 @@ export class CodexAdapter implements AgentAdapter {
           }
           claimOwnedTurn(turn.id);
           if (terminal) return;
-          this.#statuses.set(session.id, "running");
-          queue.push({ type: "status.changed", status: "running" });
           const pending = deferredNotifications.splice(0);
-          for (const notification of pending) {
+          for (const notification of pending.sort(deferredNotificationOrder)) {
             processNotification(notification.method, notification.params);
           }
-          if (!terminal) scheduleTerminalWatchdog();
+          this.#flushDeferredServerRequests(session.id, turn.id);
+          if (!terminal) {
+            this.#statuses.set(session.id, "running");
+            queue.push({ type: "status.changed", status: "running" });
+            scheduleTerminalWatchdog();
+          }
         })
         .catch((error: unknown) => {
           queue.fail(
@@ -1128,13 +1185,16 @@ export class CodexAdapter implements AgentAdapter {
       }
       claimOwnedTurn(turn.id);
       if (!terminal) {
-        this.#statuses.set(session.id, "running");
-        queue.push({ type: "status.changed", status: "running" });
         const pending = deferredNotifications.splice(0);
-        for (const notification of pending) {
+        for (const notification of pending.sort(deferredNotificationOrder)) {
           processNotification(notification.method, notification.params);
         }
-        if (!terminal) scheduleTerminalWatchdog();
+        this.#flushDeferredServerRequests(session.id, turn.id);
+        if (!terminal) {
+          this.#statuses.set(session.id, "running");
+          queue.push({ type: "status.changed", status: "running" });
+          scheduleTerminalWatchdog();
+        }
       }
       for await (const event of queue) yield event;
     } catch (error) {
@@ -1566,6 +1626,41 @@ export class CodexAdapter implements AgentAdapter {
     this.#deferredServerRequestsBySession.delete(sessionId);
     for (const request of deferred) {
       this.#client.respondError(request.id, { code: -32601, message });
+    }
+  }
+
+  #rejectDeferredServerRequestsForTurn(
+    sessionId: string,
+    turnId: string,
+    queue: AsyncEventQueue,
+    message: string,
+  ): void {
+    const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
+    const remaining: ServerRequestEvent[] = [];
+    for (const request of deferred) {
+      const params = asRecord(request.params);
+      if (params?.turnId !== turnId) {
+        remaining.push(request);
+        continue;
+      }
+      if (
+        request.method === "item/tool/requestUserInput" &&
+        (hasWorkspaceGitApprovalQuestionId(request.params) ||
+          looksLikeWorkspaceGitApproval(request.params))
+      ) {
+        this.#externallyResolvedUserInputBindings.set(rpcKey(request.id), {
+          sessionId,
+          turnId,
+          queue,
+        });
+        this.#queueExternallyResolvedUserInputPlans(sessionId, turnId);
+      }
+      this.#client.respondError(request.id, { code: -32601, message });
+    }
+    if (remaining.length === 0) {
+      this.#deferredServerRequestsBySession.delete(sessionId);
+    } else {
+      this.#deferredServerRequestsBySession.set(sessionId, remaining);
     }
   }
 
@@ -2730,9 +2825,38 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   #removePendingServerRequestByRpcId(
+    sessionId: string,
     rpcId: RpcId,
     queue: AsyncEventQueue,
   ): void {
+    const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
+    const remainingDeferred: ServerRequestEvent[] = [];
+    for (const request of deferred) {
+      if (request.id !== rpcId) {
+        remainingDeferred.push(request);
+        continue;
+      }
+      const params = asRecord(request.params);
+      const turnId = typeof params?.turnId === "string" ? params.turnId : undefined;
+      if (
+        request.method === "item/tool/requestUserInput" &&
+        turnId !== undefined &&
+        (hasWorkspaceGitApprovalQuestionId(request.params) ||
+          looksLikeWorkspaceGitApproval(request.params))
+      ) {
+        this.#externallyResolvedUserInputBindings.set(rpcKey(rpcId), {
+          sessionId,
+          turnId,
+          queue,
+        });
+        this.#queueExternallyResolvedUserInputPlans(sessionId, turnId);
+      }
+    }
+    if (remainingDeferred.length === 0) {
+      this.#deferredServerRequestsBySession.delete(sessionId);
+    } else {
+      this.#deferredServerRequestsBySession.set(sessionId, remainingDeferred);
+    }
     const automationKey = rpcKey(rpcId);
     const automation = this.#pendingWorkspaceGitAutomations.get(automationKey);
     if (automation !== undefined) {
@@ -3248,10 +3372,12 @@ export class CodexAdapter implements AgentAdapter {
 
   async #reconcileTurnStatus(
     sessionId: string,
-    queue: AsyncEventQueue,
-  ): Promise<"active" | "terminal" | "retry"> {
-    const ownedTurnId = this.#activeTurns.get(sessionId);
-    if (ownedTurnId === undefined) return "retry";
+    ownedTurnId: string,
+  ): Promise<
+    | { readonly kind: "active" }
+    | { readonly kind: "terminal"; readonly turn: CodexTurn }
+    | { readonly kind: "retry" }
+  > {
     if (this.#turnPaginationSupported !== false) {
       try {
         const page = await this.#client.listThreadTurns(sessionId, {
@@ -3261,25 +3387,20 @@ export class CodexAdapter implements AgentAdapter {
         });
         this.#turnPaginationSupported = true;
         const turn = page.data.find(({ id }) => id === ownedTurnId);
-        if (turn === undefined) return "retry";
+        if (turn === undefined) return { kind: "retry" };
         if (turn.status === "inProgress") {
-          return "active";
+          return { kind: "active" };
         }
         if (
           turn.status === "completed" ||
           turn.status === "interrupted" ||
           turn.status === "failed"
         ) {
-          this.#activeTurns.delete(sessionId);
-          const status = agentStatusForTurn(turn);
-          this.#statuses.set(sessionId, status);
-          queue.push({ type: "status.changed", status });
-          queue.close();
-          return "terminal";
+          return { kind: "terminal", turn };
         }
-        return "retry";
+        return { kind: "retry" };
       } catch (error) {
-        if (!isPaginatedThreadsUnsupported(error)) return "retry";
+        if (!isPaginatedThreadsUnsupported(error)) return { kind: "retry" };
         this.#turnPaginationSupported = false;
       }
     }
@@ -3289,26 +3410,32 @@ export class CodexAdapter implements AgentAdapter {
     // that compatibility mode, aggregate active is conservative: it never
     // declares our turn complete while any turn remains active.
     try {
-      const thread = await this.#client.readThread(sessionId);
+      const thread = await this.#client.readThread(sessionId, true);
       const status = threadStatusType(thread);
-      if (status === "active") return "active";
+      if (status === "active") return { kind: "active" };
       if (status === "idle" || status === "notLoaded") {
-        this.#activeTurns.delete(sessionId);
-        this.#statuses.set(sessionId, "idle");
-        queue.push({ type: "status.changed", status: "idle" });
-        queue.close();
-        return "terminal";
+        return {
+          kind: "terminal",
+          turn: thread.turns?.find(({ id }) => id === ownedTurnId) ?? {
+            id: ownedTurnId,
+            status: "completed",
+            itemsView: "notLoaded",
+          },
+        };
       }
       if (status === "systemError") {
-        this.#activeTurns.delete(sessionId);
-        this.#statuses.set(sessionId, "failed");
-        queue.push({ type: "status.changed", status: "failed" });
-        queue.close();
-        return "terminal";
+        return {
+          kind: "terminal",
+          turn: thread.turns?.find(({ id }) => id === ownedTurnId) ?? {
+            id: ownedTurnId,
+            status: "failed",
+            itemsView: "notLoaded",
+          },
+        };
       }
-      return "retry";
+      return { kind: "retry" };
     } catch {
-      return "retry";
+      return { kind: "retry" };
     }
   }
 
@@ -3818,6 +3945,14 @@ function agentStatusForTurn(turn: CodexTurn): AgentStatus {
     default:
       return "running";
   }
+}
+
+function deferredNotificationOrder(
+  left: { readonly method: string },
+  right: { readonly method: string },
+): number {
+  return Number(right.method === "serverRequest/resolved") -
+    Number(left.method === "serverRequest/resolved");
 }
 
 function notificationTurnId(params: unknown): string | undefined {
