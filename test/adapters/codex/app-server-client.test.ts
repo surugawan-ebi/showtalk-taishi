@@ -42,6 +42,7 @@ class DelayedCloseTransport extends TestTransport {
   #markCloseStarted!: () => void;
   #releaseClose!: () => void;
   readonly #closeReleased: Promise<void>;
+  closeCalls = 0;
 
   constructor() {
     super();
@@ -54,6 +55,7 @@ class DelayedCloseTransport extends TestTransport {
   }
 
   override async close(): Promise<void> {
+    this.closeCalls += 1;
     this.#markCloseStarted();
     await this.#closeReleased;
     await super.close();
@@ -441,4 +443,42 @@ test("later close calls await transport cleanup already started by an error", as
   transport.releaseClose();
   await closing;
   assert.equal(transport.closed, true);
+  assert.equal(transport.closeCalls, 1);
+});
+
+test("stdout EOF starts transport cleanup and later close calls await it once", async () => {
+  const transport = new DelayedCloseTransport();
+  const client = new CodexAppServerClient(transport);
+  const starting = client.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as {
+    id: number;
+  };
+  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+
+  const closeErrors: Error[] = [];
+  client.onClose((error) => closeErrors.push(error));
+  transport.input.end();
+  await transport.closeStarted;
+
+  let firstFinished = false;
+  let secondFinished = false;
+  const first = client.close().then(() => {
+    firstFinished = true;
+  });
+  const second = client.close().then(() => {
+    secondFinished = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstFinished, false);
+  assert.equal(secondFinished, false);
+  assert.equal(transport.closeCalls, 1);
+
+  transport.releaseClose();
+  await Promise.all([first, second]);
+  assert.equal(transport.closed, true);
+  assert.equal(transport.closeCalls, 1);
+  assert.equal(closeErrors.length, 1);
+  assert.match(closeErrors[0]?.message ?? "", /transport closed/);
 });

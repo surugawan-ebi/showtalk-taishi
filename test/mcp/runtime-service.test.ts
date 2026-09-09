@@ -755,6 +755,46 @@ test("cancels an invisible delegated native approval instead of stranding the ta
   assert.equal(projectionErrors.length, 1);
 });
 
+test("rejects delegated Git approval after the start projection already failed", async () => {
+  const adapter = new StructuredInputFakeAdapter();
+  const { service, projectionErrors } = setup({
+    adapter,
+    projectionFailsOnceOn: "delegation.started",
+  });
+
+  const result = await service.agentSend(context(), "reviewer", "Prepare safely");
+
+  assert.equal(result.message, "Rejected safely");
+  assert.deepEqual(adapter.responses, [
+    {
+      requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+      optionId: "reject",
+    },
+  ]);
+  assert.equal(projectionErrors.length, 1);
+  assert.equal(service.isIdle(), true);
+});
+
+test("cancels delegated native approval after the start projection already failed", async () => {
+  const adapter = new NativeApprovalFakeAdapter();
+  const { service, projectionErrors } = setup({
+    adapter,
+    projectionFailsOnceOn: "delegation.started",
+  });
+
+  const result = await service.agentSend(context(), "reviewer", "Run safely");
+
+  assert.equal(result.message, "Cancelled safely");
+  assert.deepEqual(adapter.approvals, [
+    {
+      requestId: "codex:11111111-1111-4111-8111-111111111111",
+      decision: "cancel",
+    },
+  ]);
+  assert.equal(projectionErrors.length, 1);
+  assert.equal(service.isIdle(), true);
+});
+
 test("enforces Slack write policy and resolves Koe IDs or call names to channels", async () => {
   const { service, posts } = setup();
   const posted = await service.slackPost(context(), "レビュー係", "Hello");

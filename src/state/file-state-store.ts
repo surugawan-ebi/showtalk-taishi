@@ -183,25 +183,45 @@ export class FileStateStore {
   }
 
   async #removeStaleLock(): Promise<boolean> {
-    let lock: StateLock;
+    const lockPath = this.#lockPath();
+    const recoveryPath = `${lockPath}.recovery`;
+    let recoveryHandle: FileHandle;
     try {
-      const parsed = await readLock(this.#lockPath());
-      if (parsed === undefined) return true;
-      lock = parsed;
+      recoveryHandle = await open(recoveryPath, "wx", 0o600);
     } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return true;
-      throw new Error(
-        `ShowTalk Taishi state lock is invalid and must be inspected: ${this.#lockPath()}`,
-        { cause: error },
-      );
-    }
-    if (processIsAlive(lock.pid)) return false;
-    try {
-      await unlink(this.#lockPath());
-      return true;
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return true;
+      if (isNodeError(error) && error.code === "EEXIST") {
+        throw new Error(
+          `ShowTalk Taishi state lock recovery is already in progress: ${this.path}`,
+        );
+      }
       throw error;
+    }
+    try {
+      let lock: StateLock;
+      try {
+        const parsed = await readLock(lockPath);
+        if (parsed === undefined) return true;
+        lock = parsed;
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") return true;
+        throw new Error(
+          `ShowTalk Taishi state lock is invalid and must be inspected: ${lockPath}`,
+          { cause: error },
+        );
+      }
+      if (processIsAlive(lock.pid)) return false;
+      try {
+        await unlink(lockPath);
+        return true;
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") return true;
+        throw error;
+      }
+    } finally {
+      await recoveryHandle.close().catch(() => undefined);
+      await unlink(recoveryPath).catch((error: unknown) => {
+        if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+      });
     }
   }
 }

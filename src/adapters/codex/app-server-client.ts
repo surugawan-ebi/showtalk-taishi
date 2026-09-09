@@ -396,7 +396,7 @@ export class CodexAppServerClient {
     const error = new Error("Codex app-server transport closed");
     this.#rejectPending(error);
     this.#events.emit("close", error);
-    this.#closePromise ??= Promise.resolve();
+    void this.#beginTransportClose().catch(() => undefined);
   }
 
   #rejectPending(error: Error): void {
@@ -425,7 +425,7 @@ export class CodexAppServerClient {
   }
 
   #beginTransportClose(): Promise<void> {
-    this.#closePromise ??= this.#transport.close();
+    this.#closePromise ??= Promise.resolve().then(() => this.#transport.close());
     return this.#closePromise;
   }
 }
