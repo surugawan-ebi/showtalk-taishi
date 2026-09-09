@@ -16,6 +16,70 @@ const STATE_ROOT_ENV_VAR = "WORKSPACE_GIT_STATE_ROOT";
 const WORKER_START_TIMEOUT_MS = 15_000;
 const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 
+export type WorkspaceGitManualConfigurationInspection =
+  | {
+      readonly status: "not_configured";
+      readonly message: "not configured; exact Git approvals unavailable";
+    }
+  | {
+      readonly status: "configured";
+      readonly message: "configuration present; live decision round-trip unverified";
+    }
+  | {
+      readonly status: "invalid";
+      readonly message: string;
+    };
+
+/** Performs metadata-only checks and never imports or initializes the module. */
+export async function inspectWorkspaceGitManualConfiguration(
+  environment: NodeJS.ProcessEnv,
+): Promise<WorkspaceGitManualConfigurationInspection> {
+  const configuredModule = environment[APPROVAL_MODULE_ENV_VAR]?.trim();
+  const configuredStateRoot = environment[STATE_ROOT_ENV_VAR]?.trim();
+  if (!configuredModule) {
+    return {
+      status: "not_configured",
+      message: "not configured; exact Git approvals unavailable",
+    };
+  }
+  if (!configuredStateRoot) {
+    return {
+      status: "invalid",
+      message: `${STATE_ROOT_ENV_VAR} is required when ${APPROVAL_MODULE_ENV_VAR} is configured`,
+    };
+  }
+  try {
+    if (!isAbsolute(configuredModule)) {
+      throw new Error(`${APPROVAL_MODULE_ENV_VAR} must be an absolute file path`);
+    }
+    await assertSafeManualModule(resolve(configuredModule));
+    if (!isAbsolute(configuredStateRoot)) {
+      throw new Error(
+        `${STATE_ROOT_ENV_VAR} must be set to an absolute private state directory`,
+      );
+    }
+    return {
+      status: "configured",
+      message: "configuration present; live decision round-trip unverified",
+    };
+  } catch (error) {
+    return {
+      status: "invalid",
+      message: manualConfigurationInspectionError(error),
+    };
+  }
+}
+
+function manualConfigurationInspectionError(error: unknown): string {
+  const code = asRecord(error)?.code;
+  if (typeof code === "string") {
+    return `${APPROVAL_MODULE_ENV_VAR} could not be inspected (${code})`;
+  }
+  return error instanceof Error
+    ? error.message
+    : "workspace-git manual configuration is invalid";
+}
+
 /**
  * Loads only local-mcp's exported manual composition in an isolated worker.
  * Absence is an intentional fail-closed manual configuration: Slack can show

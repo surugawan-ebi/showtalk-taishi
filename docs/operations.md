@@ -69,7 +69,15 @@ metadata scope, and automatic-release setting. Taishi records only the approval
 answer for that displayed command; it does not mint Store-specific proofs,
 rewrite tool arguments, call Store MCP tools, or inspect Store credentials.
 After approval, Codex runs only the displayed fastlane command in the target app
-repository with the shared machine-local release env sourced by the shell.
+repository after loading the operator-configured private release environment
+outside the repository.
+
+The retired AppOps hook installer and live proof smoke are no longer public
+commands. The standard runtime does not configure an AppOps signer or broker;
+retained AppOps source and tests cover legacy fail-closed compatibility only.
+Operators who previously activated the old hook must inspect their private
+Codex configuration and remove only the generated ShowTalk AppOps hook/trust
+entry. Taishi does not modify user configuration automatically.
 
 If `request_user_input` returns `answers: {}`, the gated action remains blocked.
 A Koe with `showtalk` in its consultations immediately sends sanitized context
@@ -97,6 +105,8 @@ non-group/world-writable file implementing the version-1 human-only contract.
 ShowTalk has no compile-time local-mcp dependency and rejects any composition
 that exposes automation or control factories. Without that module, Git
 decisions fail closed instead of manufacturing authority.
+See [Optional workspace-git integration](workspace-git-integration.md) for the
+external contract, metadata-only diagnostics, and availability boundary.
 
 Each human decision also carries a delivery ID derived from the exact Slack
 channel, root thread, Block message, request, approver, decision, operation,
@@ -202,6 +212,9 @@ workspace sources, but not automatic memory from other Slack roots.
 
 ## Restart and service operation
 
+Use the public [Gateway restart and approval-bridge verification](gateway-restart-verification.md)
+gate whenever restart or structured-input behavior changes.
+
 `taishi start` runs a parent Supervisor and replaceable Gateway Worker. An
 approved restart pauses new work, drains accepted responses and active turns,
 flushes state, exits the Worker with a reserved restart code, and starts a fresh
@@ -281,6 +294,9 @@ npm run smoke:codex-mcp
 npm run smoke:codex-agent-send
 npm run smoke:codex-resume
 ```
+
+Approval-bridge changes also run `npm run verify:approval-bridge`, followed by
+the live acceptance gate when a Worker restart is part of verification.
 
 See [Architecture](architecture.md) for component boundaries and
 [Security](security.md) for the trust model.

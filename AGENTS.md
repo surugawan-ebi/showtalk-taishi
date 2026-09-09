@@ -17,7 +17,7 @@ These instructions describe public project expectations for contributors and cod
 - Keep Slack OAuth scopes minimal and preserve the Gateway permission boundary even when Slack itself allows an operation.
 - Do not weaken command, file-change, structured-input, or Git publication approval binding.
 - In the ShowTalk App Server flow, a blocking structured-input answer from the bound Slack approval message separates the pre-approval and post-approval phases of one Codex turn. `承認して実行` is the new human decision; after exact revalidation, the post-approval phase may execute only that bound plan without waiting for another Slack message.
-- Store release operations do not use Appops MCP, Store MCP tools, or proof-injection hooks. When Store work is requested, approve and run only the exact repo-local fastlane command in the target app repository after sourcing `$HOME/.config/surugawan/release/env`.
+- Store release operations do not use Appops MCP, Store MCP tools, or proof-injection hooks. When Store work is requested, approve and run only the exact repo-local fastlane command in the target app repository after loading the operator-configured private release environment outside the repository.
 
 ## Runtime diagnosis
 
@@ -42,7 +42,7 @@ These instructions describe public project expectations for contributors and cod
 - Preserve unrelated working-tree changes and keep patches scoped to the request.
 - Run `npm run check` for normal changes. Use `npm run verify` for release-facing or cross-cutting changes.
 - `npm run check` includes the deterministic approval-bridge regression suite. Changes to Codex structured input, Slack choices, approvals, continuation, turn mode, or restart activation must also run `npm run verify:approval-bridge`, which exercises a real Codex App Server answer round-trip.
-- After restarting a worker for an approval-bridge change, do not report the fix verified from unit tests or reconnect logs alone. Use the `showtalk-gateway-restart` Skill and complete its live Slack approval round-trip gate.
+- After restarting a worker for an approval-bridge change, do not report the fix verified from unit tests or reconnect logs alone. Complete the public live acceptance gate in `docs/gateway-restart-verification.md`; an available private skill may automate the same procedure.
 - Keep tests aligned with the source responsibility boundaries in `src/`.
 - Do not commit, push, publish packages, create releases, or change external services unless the user explicitly requests that scope.
 

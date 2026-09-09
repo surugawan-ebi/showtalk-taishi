@@ -44,6 +44,10 @@ This runs the TypeScript check, unit tests, build, and package dry run. The
 installation and consume real Codex turns. Run them only when your change
 affects the Codex App Server, MCP, routing, or resume paths.
 
+Changes to restart or approval-bridge behavior also follow the public
+[Gateway restart and approval-bridge verification](docs/gateway-restart-verification.md)
+gate. Report any live stage that was not exercised as unverified.
+
 ## Pull requests
 
 In the pull request, summarize the change, its security or compatibility

@@ -34,10 +34,9 @@ export const APPOPS_APPROVAL_HOOK_MCP_URL_ENV =
   "SHOWTALK_TAISHI_APPOPS_HOOK_MCP_URL" as const;
 
 /**
- * Codex 0.149 discovers hooks from hooks.json/config layers and requires an
- * exact trusted hash for non-managed hooks. The runtime installer persists
- * this one hook and its exact hash; thread/start config must not inject an
- * untrusted hook or bypass trust globally.
+ * Legacy fail-closed compatibility shape for installations that previously
+ * configured the retired AppOps hook. The standard runtime does not install or
+ * activate it; thread/start config must not inject an untrusted hook.
  */
 export function buildAppOpsApprovalHookConfig(): Readonly<Record<string, JsonValue>> {
   return {

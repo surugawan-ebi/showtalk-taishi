@@ -10,6 +10,9 @@ import {
   createEphemeralAppOpsApprovalProofSigner,
 } from "../../src/approvals/appops-approval-proof.js";
 
+// Legacy proof-boundary coverage retained for existing configurations. New
+// Store releases use an exact repo-local fastlane command after normal approval.
+
 function brokerBinding() {
   return {
     agentId: "implementer",

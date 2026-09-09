@@ -28,6 +28,8 @@ import {
   type MacOSLaunchAgentStatus,
 } from "./service/macos-launch-agent.js";
 import { isGatewayWorker, superviseGatewayWorker } from "./supervisor.js";
+import { inspectWorkspaceGitManualConfiguration } from
+  "./approvals/workspace-git-manual-worker-transport.js";
 
 export { adminUiUrlForLog } from "./gateway-worker.js";
 
@@ -88,6 +90,14 @@ async function init(path: string): Promise<void> {
 async function doctor(path: string, offline: boolean): Promise<void> {
   const config = await loadConfig(path);
   const checks = [...(await validateRuntimePrerequisites(config))];
+  const workspaceGit = await inspectWorkspaceGitManualConfiguration(process.env);
+  if (workspaceGit.status === "invalid") {
+    throw new Error(`workspace-git: ${workspaceGit.message}`);
+  }
+  console.log(`workspace-git: ${workspaceGit.message}`);
+  if (workspaceGit.status === "configured") {
+    checks.push("workspace-git:manual-configuration-metadata");
+  }
   for (const [name, adapter] of Object.entries(config.adapters)) {
     let client: CodexAppServerClient | undefined;
     try {

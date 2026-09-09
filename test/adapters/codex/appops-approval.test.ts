@@ -4,6 +4,9 @@ import test from "node:test";
 
 import { normalizeAppOpsPrepareCompletion } from "../../../src/adapters/codex/appops-approval.js";
 
+// Legacy fail-closed compatibility coverage. The standard runtime no longer
+// installs an AppOps hook or uses this path for Store releases.
+
 test("captures a hash-checked AppOps prepare result and canonical approval prompt", () => {
   const fixture = appOpsPrepareFixture();
   const capture = normalizeAppOpsPrepareCompletion(fixture.completed, fixture.started.item);

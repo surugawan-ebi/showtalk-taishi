@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,10 @@ import {
   workspaceGitHumanDecisionPayload,
   type WorkspaceGitHumanDecisionInput,
 } from "../../src/approvals/workspace-git-human-decision-broker.js";
-import { createWorkspaceGitHumanDecisionBrokerFromEnvironment } from "../../src/approvals/workspace-git-manual-worker-transport.js";
+import {
+  createWorkspaceGitHumanDecisionBrokerFromEnvironment,
+  inspectWorkspaceGitManualConfiguration,
+} from "../../src/approvals/workspace-git-manual-worker-transport.js";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
 const plan = {
@@ -192,6 +195,65 @@ test("does not load a human broker unless an explicit module is configured", asy
     }),
     /absolute file path/u,
   );
+});
+
+test("inspects optional workspace-git configuration without importing it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "showtalk-manual-inspection-"));
+  const modulePath = join(root, "manual.mjs");
+  const sentinelPath = join(root, "imported.txt");
+  try {
+    assert.deepEqual(await inspectWorkspaceGitManualConfiguration({}), {
+      status: "not_configured",
+      message: "not configured; exact Git approvals unavailable",
+    });
+    assert.deepEqual(await inspectWorkspaceGitManualConfiguration({
+      WORKSPACE_GIT_STATE_ROOT: root,
+    }), {
+      status: "not_configured",
+      message: "not configured; exact Git approvals unavailable",
+    });
+    const incomplete = await inspectWorkspaceGitManualConfiguration({
+      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
+    });
+    assert.equal(incomplete.status, "invalid");
+    assert.match(incomplete.message, /is required when/u);
+
+    const missingPath = join(root, "missing-manual.mjs");
+    const missing = await inspectWorkspaceGitManualConfiguration({
+      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: missingPath,
+      WORKSPACE_GIT_STATE_ROOT: root,
+    });
+    assert.equal(missing.status, "invalid");
+    assert.match(missing.message, /could not be inspected \(ENOENT\)/u);
+    assert.equal(missing.message.includes(missingPath), false);
+
+    await writeFile(
+      modulePath,
+      `import { writeFile } from "node:fs/promises";\n` +
+        `await writeFile(${JSON.stringify(sentinelPath)}, "imported\\n");\n`,
+      { mode: 0o600 },
+    );
+    const configured = await inspectWorkspaceGitManualConfiguration({
+      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
+      WORKSPACE_GIT_STATE_ROOT: root,
+    });
+    assert.deepEqual(configured, {
+      status: "configured",
+      message: "configuration present; live decision round-trip unverified",
+    });
+    await assert.rejects(stat(sentinelPath), /ENOENT/u);
+
+    await chmod(modulePath, 0o620);
+    const unsafe = await inspectWorkspaceGitManualConfiguration({
+      SHOWTALK_WORKSPACE_GIT_APPROVAL_MODULE: modulePath,
+      WORKSPACE_GIT_STATE_ROOT: root,
+    });
+    assert.equal(unsafe.status, "invalid");
+    assert.match(unsafe.message, /must not be group\/world writable/u);
+    await assert.rejects(stat(sentinelPath), /ENOENT/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("rejects a group-writable manual module before importing it", async () => {

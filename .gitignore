@@ -13,6 +13,9 @@ config.local.yaml
 /state.json.tmp-*
 /admin-ui.token
 /attachments/
+admin-config-overrides.v1.json
+admin-config-overrides.v1.json.lock
+.admin-config-overrides.*.tmp
 *.log
 .DS_Store
 
