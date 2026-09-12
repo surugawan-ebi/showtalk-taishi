@@ -45,7 +45,40 @@ Start a fresh Slack-originated diagnostic turn after replacement.
 1. Request one ordinary blocking question with two distinct labels. Select the
    second option and confirm that exact label returns to the same originating
    conversation.
-2. When external-action approval code changed, test both accept and reject with
+2. For a ShowTalk MCP operation governed by the Permission Engine, identify the
+   target channel class and its effective policy before expecting a card. Agent
+   overrides take precedence over defaults; an omitted leaf denies. The policy
+   must resolve to `approval`, and the process must not already hold a matching
+   session grant. Use separate harmless calls: accept one with `allow_once` and
+   verify it executes once in the same turn; cancel the other and verify it is
+   not executed. Confirm both cards become terminal.
+
+   A routing-free `showtalk_taishi.slack.reply` targets the caller's own channel.
+   It therefore displays no permission card when `own_channel.write` resolves
+   to `allow`, or when an earlier `allow_session` decision granted that exact
+   scope. Treat immediate execution in either case as a preflight mismatch, not
+   as evidence that an approval callback was bypassed.
+3. When Codex-native MCP tool approval code changed, call
+   `showtalk_taishi.diagnostics.approval-probe` with a unique, non-secret
+   `probe_id`. First set the target Codex adapter's
+   `live_acceptance_mcp_probe: true`; this option is absent/false in normal
+   operation. Its per-tool Codex App Server configuration must then set
+   `approval_mode: "prompt"`, while the other ShowTalk MCP tools retain the
+   server default of `auto`. The adapter must use `approval_policy: on-request`
+   and `approvals_reviewer: user`. Confirm the Slack card offers
+   `allow_once` and `cancel`. Use separate fresh turns: accept one with
+   `allow_once` and verify it returns `status: executed` with the exact
+   `probe_id` in the same App Server turn; cancel the other and verify the tool
+   returns no result. Confirm both cards become terminal.
+
+   Do not use `showtalk_taishi.slack.reply` as this native MCP approval probe.
+   The ShowTalk MCP is configured for App Server `auto` mode, while the Slack
+   write itself follows the Permission Engine. An effective `allow` policy or
+   process-local session grant therefore executes without an approval card.
+   If this diagnostic tool is absent, or either adapter setting differs, mark
+   this stage unverified and stop instead of substituting a Slack write,
+   Gateway restart, production service, or production data operation.
+4. When external-action approval code changed, test both accept and reject with
    separate confirmations using question ID `external_action_approval`, the
    exact two fixed labels, non-empty descriptions, and separate `Target:`,
    `Scope:`, and `Impact:` lines. Use only an explicitly described reversible
@@ -55,8 +88,13 @@ Start a fresh Slack-originated diagnostic turn after replacement.
    the accept case, create, inspect, and remove that exact marker and directory.
    For the reject case, verify the marker was never created, then remove the
    empty directory.
-3. Confirm each Slack card reaches one terminal state and that the accepted
+5. Confirm each Slack card reaches one terminal state and that the accepted
    answer resumes the same App Server turn exactly once.
+
+`npm run verify:approval-bridge` exercises an isolated prompt-configured MCP
+probe through a real local Codex App Server. It is deterministic evidence for
+the adapter round trip, but it does not replace observation of the live Slack
+card after a Worker restart.
 
 Do not invent a Git plan for this diagnostic. A live Git approval test requires
 a real current workspace-git operation and its normal prepare, bound approval,

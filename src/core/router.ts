@@ -16,7 +16,13 @@ export interface DelegationRequest {
   readonly message: string;
   /** Trusted Slack reply destination of the source turn, when it has one. */
   readonly sourceRootThreadTs?: string;
+  /** Authenticated Slack user whose request originated this delegation chain. */
+  readonly sourceSlackUserId?: string;
   readonly metadata?: Readonly<Record<string, JsonValue>>;
+  /** Exact previously-created target session for a durable job continuation. */
+  readonly targetSessionId?: string;
+  /** Exact adapter backend paired with targetSessionId when work was persisted. */
+  readonly targetAdapterSessionId?: string;
   readonly signal?: AbortSignal;
 }
 
@@ -24,6 +30,17 @@ export interface DelegationRequest {
 export interface DelegationContext {
   readonly depth: number;
   readonly parentDelegationId?: string;
+  /** Host-owned stable ID for an already accepted durable delegation job. */
+  readonly delegationId?: string;
+  /** Execution-time marker for a request authorized and persisted at admission. */
+  readonly preauthorized?: boolean;
+  /** FIFO lease acquired by the durable queue before execution. */
+  readonly reservedTurnRelease?: () => void;
+}
+
+export interface DerivedDelegationContext {
+  readonly context: DelegationContext;
+  readonly continuationDelegationId?: string;
 }
 
 interface DelegationActivityBase {
@@ -32,6 +49,7 @@ interface DelegationActivityBase {
   readonly sourceAgentId: AgentId;
   readonly sourceChannelId: string;
   readonly sourceRootThreadTs?: string;
+  readonly sourceSlackUserId?: string;
   readonly targetAgentId: AgentId;
   readonly targetChannelId: string;
   readonly targetSessionId: string;
@@ -162,23 +180,25 @@ export class AgentRouter {
         `Koe ${source.id} is not allowed to send to itself`,
       );
     }
-    const permission = await this.#authorizeDelegation(
-      source.id,
-      target.id,
-      request.signal,
-    );
-    throwIfCancelled(request.signal);
-    if (permission === "deny") {
-      throw new CoreError(
-        "PERMISSION_DENIED",
-        `Koe ${source.id} may not send to ${target.id}`,
+    if (context.preauthorized !== true) {
+      const permission = await this.#authorizeDelegation(
+        source.id,
+        target.id,
+        request.signal,
       );
-    }
-    if (permission === "approval") {
-      throw new CoreError(
-        "PERMISSION_APPROVAL_REQUIRED",
-        `Koe ${source.id} requires human approval to send to ${target.id}`,
-      );
+      throwIfCancelled(request.signal);
+      if (permission === "deny") {
+        throw new CoreError(
+          "PERMISSION_DENIED",
+          `Koe ${source.id} may not send to ${target.id}`,
+        );
+      }
+      if (permission === "approval") {
+        throw new CoreError(
+          "PERMISSION_APPROVAL_REQUIRED",
+          `Koe ${source.id} requires human approval to send to ${target.id}`,
+        );
+      }
     }
 
     const adapter = this.#adapters.get(target.adapter);
@@ -188,14 +208,30 @@ export class AgentRouter {
         `No adapter is registered for kind ${target.adapter}`,
       );
     }
-    const delegationId = this.#idFactory();
-    const releaseAgentTurn = this.#registry.reserveAgentTurn(target.id);
+    const delegationId = context.delegationId ?? this.#idFactory();
+    const releaseAgentTurn =
+      context.reservedTurnRelease ?? this.#registry.reserveAgentTurn(target.id);
 
     try {
-      const session =
-        (target.conversationScope ?? "channel") === "slack_thread"
+      if (
+        (request.targetSessionId === undefined) !==
+          (request.targetAdapterSessionId === undefined)
+      ) {
+        throw new CoreError(
+          "INVALID_ADAPTER_SESSION",
+          "A durable delegation must bind both the core and adapter sessions",
+        );
+      }
+      const session = request.targetSessionId === undefined
+        ? (target.conversationScope ?? "channel") === "slack_thread"
           ? await this.#createSession(target.id, adapter, false)
-          : await this.#getOrCreatePrimarySession(target.id, adapter);
+          : await this.#getOrCreatePrimarySession(target.id, adapter)
+        : await this.#getOrResumeExactSession(
+            target.id,
+            request.targetSessionId,
+            request.targetAdapterSessionId!,
+            adapter,
+          );
       throwIfCancelled(request.signal);
       const base = {
         delegationId,
@@ -207,6 +243,9 @@ export class AgentRouter {
         ...(request.sourceRootThreadTs === undefined
           ? {}
           : { sourceRootThreadTs: request.sourceRootThreadTs }),
+        ...(request.sourceSlackUserId === undefined
+          ? {}
+          : { sourceSlackUserId: request.sourceSlackUserId }),
         targetAgentId: target.id,
         targetChannelId: target.channelId,
         targetSessionId: session.id,
@@ -321,29 +360,9 @@ export class AgentRouter {
   async *sendFromAgent(
     request: DelegationRequest,
   ): AsyncIterable<DelegationActivity> {
-    const parent = this.#activeDelegationsByAgent.get(request.sourceAgentId);
-    const sourceTurn = this.#registry.hasActiveAgentTurn(request.sourceAgentId)
-      ? this.#registry.getActiveSession(request.sourceAgentId)?.activeTurn
-      : undefined;
-    const continuation =
-      sourceTurn?.type === "slack" &&
-      sourceTurn.continuationDelegationId !== undefined &&
-      sourceTurn.continuationDepth !== undefined
-        ? {
-            delegationId: sourceTurn.continuationDelegationId,
-            depth: sourceTurn.continuationDepth,
-          }
-        : undefined;
-    const context: DelegationContext =
-      parent === undefined && continuation === undefined
-        ? { depth: 1 }
-        : {
-            depth: (parent?.depth ?? continuation!.depth) + 1,
-            parentDelegationId:
-              parent?.delegationId ?? continuation!.delegationId,
-          };
-    const continuationDelegationId =
-      parent === undefined ? continuation?.delegationId : undefined;
+    const derived = this.deriveDelegationContext(request.sourceAgentId);
+    const context = derived.context;
+    const continuationDelegationId = derived.continuationDelegationId;
     if (continuationDelegationId === undefined) {
       yield* this.send(request, context);
       return;
@@ -384,6 +403,42 @@ export class AgentRouter {
     } finally {
       this.#reservedContinuationDelegationIds.delete(continuationDelegationId);
     }
+  }
+
+  /** Captures host-owned causation before an agent.send caller turn can end. */
+  deriveDelegationContext(sourceAgentId: AgentId): DerivedDelegationContext {
+    const parent = this.#activeDelegationsByAgent.get(sourceAgentId);
+    const sourceTurn = this.#registry.hasActiveAgentTurn(sourceAgentId)
+      ? this.#registry.getActiveSession(sourceAgentId)?.activeTurn
+      : undefined;
+    const continuation =
+      sourceTurn?.type === "slack" &&
+      sourceTurn.continuationDelegationId !== undefined &&
+      sourceTurn.continuationDepth !== undefined
+        ? {
+            delegationId: sourceTurn.continuationDelegationId,
+            depth: sourceTurn.continuationDepth,
+          }
+        : undefined;
+    const derived = parent === undefined && continuation === undefined
+      ? { context: { depth: 1 } }
+      : {
+          context: {
+            depth: (parent?.depth ?? continuation!.depth) + 1,
+            parentDelegationId:
+              parent?.delegationId ?? continuation!.delegationId,
+          },
+          ...(parent === undefined && continuation !== undefined
+            ? { continuationDelegationId: continuation.delegationId }
+            : {}),
+        };
+    if (derived.context.depth > this.#maxDelegationDepth) {
+      throw new CoreError(
+        "DELEGATION_DEPTH_EXCEEDED",
+        `Delegation depth ${derived.context.depth} exceeds limit ${this.#maxDelegationDepth}`,
+      );
+    }
+    return derived;
   }
 
   /** Interrupts the direct-routing session for an Agent, if it is active. */
@@ -449,9 +504,33 @@ export class AgentRouter {
     }
   }
 
+  async #getOrResumeExactSession(
+    agentId: AgentId,
+    sessionId: string,
+    adapterSessionId: string,
+    adapter: AgentAdapter,
+  ): Promise<AgentSessionRecord> {
+    const current = this.#registry.requireSession(sessionId);
+    if (current.agentId !== agentId || current.adapter !== adapter.kind) {
+      throw new CoreError(
+        "SESSION_AGENT_MISMATCH",
+        `Delegation session ${sessionId} does not belong to Koe ${agentId}`,
+      );
+    }
+    if (current.adapterSession.id !== adapterSessionId) {
+      throw new CoreError(
+        "INVALID_ADAPTER_SESSION",
+        `Delegation session ${sessionId} backend binding changed`,
+      );
+    }
+    if (this.#registry.isSessionActivated(current.id)) return current;
+    return this.#resumePrimarySession(current, adapter, adapterSessionId);
+  }
+
   async #resumePrimarySession(
     current: AgentSessionRecord,
     adapter: AgentAdapter,
+    expectedAdapterSessionId?: string,
   ): Promise<AgentSessionRecord> {
     if (!adapter.capabilities.resume || adapter.resumeSession === undefined) {
       throw new Error(
@@ -466,6 +545,15 @@ export class AgentRouter {
         ? {}
         : { state: current.adapterSession.state }),
     });
+    if (
+      expectedAdapterSessionId !== undefined &&
+      adapterSession.id !== expectedAdapterSessionId
+    ) {
+      throw new CoreError(
+        "INVALID_ADAPTER_SESSION",
+        `Delegation session ${current.id} resumed with a different backend binding`,
+      );
+    }
     const resumed = this.#registry.replaceAdapterSession(
       current.id,
       adapterSession,

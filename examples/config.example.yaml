@@ -35,6 +35,10 @@ adapters:
     # settings used by Codex App and CLI; set them only for a Taishi override.
     # approval_policy: on-request
     # approvals_reviewer: auto_review
+    # Enable only while running the documented live MCP approval acceptance gate.
+    # The live gate also requires approval_policy: on-request and
+    # approvals_reviewer: user.
+    # live_acceptance_mcp_probe: true
     # sandbox: workspace-write
     # Parent-process credentials are denied by default. Deliberately name any
     # additional build/runtime variable this Koe really needs.

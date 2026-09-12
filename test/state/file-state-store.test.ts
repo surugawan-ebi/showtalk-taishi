@@ -124,6 +124,69 @@ test("persists state with owner-only file permissions", async () => {
   }
 });
 
+test("persists accepted queued delegations across Gateway replacement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-state-queue-"));
+  const store = new FileStateStore(join(directory, "state.json"));
+  const now = "2026-08-31T00:00:00.000Z";
+  const state = {
+    ...emptyRuntimeState(),
+    core: {
+      ...emptyRuntimeState().core,
+      agents: [
+        { id: "source", adapter: "codex", channelId: "C-SOURCE" },
+        { id: "target", adapter: "codex", channelId: "C-TARGET" },
+      ],
+      sessions: [{
+        id: "source-session",
+        agentId: "source",
+        adapter: "codex",
+        adapterSession: { id: "source-thread" },
+        status: "idle" as const,
+        createdAt: now,
+        updatedAt: now,
+      }],
+      conversations: [{
+        channelId: "C-SOURCE",
+        rootThreadTs: "1000.001",
+        agentId: "source",
+        sessionId: "source-session",
+      }],
+      queuedDelegations: [{
+        version: 1 as const,
+        id: "delegation-1",
+        requestKey: "request-1",
+        source: {
+          type: "slack" as const,
+          agentId: "source",
+          channelId: "C-SOURCE",
+          rootThreadTs: "1000.001",
+          messageTs: "1000.002",
+          sessionId: "source-session",
+          adapterSessionId: "source-thread",
+          turnStartedAt: now,
+        },
+        targetAgentId: "target",
+        targetAdapter: "codex",
+        targetChannelId: "C-TARGET",
+        targetConversationScope: "channel" as const,
+        consultationScope: "Review one change",
+        permissionDecision: "allow" as const,
+        message: "Review this",
+        depth: 1,
+        state: "queued" as const,
+        pendingChildIds: [],
+        childOutcomes: [],
+        createdAt: now,
+        queueExpiresAt: "2026-08-31T00:30:00.000Z",
+        updatedAt: now,
+      }],
+    },
+  };
+
+  await store.save(state);
+  assert.deepEqual(await store.load(), state);
+});
+
 test("holds an exclusive state lock until the runtime releases it", async () => {
   const directory = await mkdtemp(join(tmpdir(), "taishi-state-lock-"));
   const path = join(directory, "state.json");

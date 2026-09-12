@@ -27,6 +27,9 @@ export interface McpAgentStatusResult {
   readonly agent_id: string;
   readonly status: string;
   readonly session_id?: string;
+  readonly queue_status?: "active" | "blocked";
+  readonly queued_delegations?: number;
+  readonly pending_deliveries?: number;
 }
 
 export interface McpAgentSendResult {

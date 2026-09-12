@@ -42,6 +42,8 @@ const UPDATE_INTERVAL_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const TERMINAL_UPDATE_RETRY_DELAYS_MS = [100, 500] as const;
 const WORKING_FRAMES = ["◐", "◓", "◑", "◒"] as const;
+const GIT_APPROVAL_RECOVERY_FINAL_TEXT =
+  "Git操作は承認されませんでした。元の依頼の処理は終了しました。";
 
 type HeartbeatScheduler = (
   task: () => Promise<void>,
@@ -112,6 +114,10 @@ export class SlackThreadProjector {
   #compactActivityProjection = false;
   #turnActivityStarted = false;
   #terminalErrorPosted = false;
+  #pendingGitApprovalRecovery:
+    | Extract<AgentEvent, { type: "git_approval.reprepare_required" }>
+    | undefined;
+  #gitApprovalRecoveryPublished = false;
   #cancelHeartbeat: (() => void) | undefined;
   #activityWriteTail: Promise<void> = Promise.resolve();
   readonly #activeTools = new Set<string>();
@@ -254,8 +260,8 @@ export class SlackThreadProjector {
         break;
       case "git_approval.reprepare_required":
         this.#turnActivityStarted = true;
+        this.#pendingGitApprovalRecovery ??= event;
         await this.#upsertAgentMessage();
-        await this.#postGitApprovalRecovery(event);
         break;
       case "tool.started": {
         this.#turnActivityStarted = true;
@@ -350,13 +356,22 @@ export class SlackThreadProjector {
   async #completeProjection(): Promise<void> {
     if (this.#sourceUserMention === undefined) {
       await this.#publishFinalMessagesToActivity();
+      if (this.#finalMessagesPublished) {
+        await this.#publishPendingGitApprovalRecovery();
+      }
       return;
     }
+    let collapseError: unknown;
     try {
       await this.#collapseActivityMessage();
-    } finally {
-      await this.#publishFinalReply();
+    } catch (error) {
+      collapseError = error;
     }
+    await this.#publishFinalReply();
+    if (this.#finalMessagesPublished) {
+      await this.#publishPendingGitApprovalRecovery();
+    }
+    if (collapseError !== undefined) throw collapseError;
   }
 
   async #upsertAgentMessage(): Promise<void> {
@@ -568,11 +583,15 @@ export class SlackThreadProjector {
 
   #renderFinalMessages(): string[] {
 
-    const agentText = formatAgentTextForSlack(
+    const projectedAgentText = formatAgentTextForSlack(
       this.#text,
       MAX_FINAL_AGENT_TEXT,
       MAX_FINAL_AGENT_UTF8_BYTES,
     );
+    const agentText =
+      projectedAgentText.length === 0 && this.#pendingGitApprovalRecovery !== undefined
+        ? GIT_APPROVAL_RECOVERY_FINAL_TEXT
+        : projectedAgentText;
     const allChunks = splitSlackText(
       agentText,
       MAX_FINAL_CHUNK_BODY,
@@ -1170,38 +1189,28 @@ export class SlackThreadProjector {
     }
   }
 
-  async #postGitApprovalRecovery(
-    event: Extract<AgentEvent, { type: "git_approval.reprepare_required" }>,
-  ): Promise<void> {
+  async #publishPendingGitApprovalRecovery(): Promise<void> {
+    const event = this.#pendingGitApprovalRecovery;
+    if (event === undefined || this.#gitApprovalRecoveryPublished) return;
     const fallback = this.#formatActionableMessage(
-      "この古いカードからターンは再開しません。対象のGit操作を新しく依頼してください。",
+      "Git操作は承認されていません。必要な操作を新しいメッセージとして依頼してください。",
       this.#sourceUserMention !== undefined,
     );
-    const posted = await this.#client.chat.postMessage({
+    await this.#client.chat.postMessage({
       channel: this.#channelId,
       thread_ts: this.#rootThreadTs,
       text: fallback,
       mrkdwn: this.#sourceUserMention !== undefined,
-      ...this.#presentation,
-    });
-    if (typeof posted.ts !== "string") {
-      throw new Error("Slack did not return a timestamp for Git approval recovery UI");
-    }
-    const blocks = buildGitApprovalRecoveryBlocks(event.message, {
-      version: 1,
-      channelId: this.#channelId,
-      rootThreadTs: this.#rootThreadTs,
-      messageTs: posted.ts,
-    });
-    await this.#client.chat.update({
-      channel: this.#channelId,
-      ts: posted.ts,
-      text: fallback,
       blocks:
         this.#sourceUserMention === undefined
-          ? blocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+          ? buildGitApprovalRecoveryBlocks(event.message)
+          : [
+              sourceMentionBlock(this.#sourceUserMention),
+              ...buildGitApprovalRecoveryBlocks(event.message),
+            ],
+      ...this.#presentation,
     });
+    this.#gitApprovalRecoveryPublished = true;
   }
 
   #formatActionableMessage(text: string, includeSourceMention: boolean): string {

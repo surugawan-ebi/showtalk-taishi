@@ -106,6 +106,48 @@ test("snapshot round-trips without storage-specific types", () => {
     agentId: "reviewer",
     sessionId: "session-review",
   });
+  registry.registerAgent({
+    id: "implementer",
+    adapter: "fake",
+    channelId: "C-IMPLEMENTER",
+  });
+  registry.addSession(session("session-source", "implementer"));
+  registry.setPrimarySession("implementer", "session-source");
+  registry.bindConversation({
+    channelId: "C-IMPLEMENTER",
+    rootThreadTs: "1000.001",
+    agentId: "implementer",
+    sessionId: "session-source",
+  });
+  registry.replaceQueuedDelegations([{
+    version: 1,
+    id: "delegation-1",
+    requestKey: "request-1",
+    source: {
+      type: "slack",
+      agentId: "implementer",
+      channelId: "C-IMPLEMENTER",
+      rootThreadTs: "1000.001",
+      messageTs: "1000.002",
+      sessionId: "session-source",
+      adapterSessionId: "adapter-session-source",
+      turnStartedAt: now,
+    },
+    targetAgentId: "reviewer",
+    targetAdapter: "fake",
+    targetChannelId: "C-REVIEWER",
+    targetConversationScope: "channel",
+    consultationScope: "Review changes",
+    permissionDecision: "allow",
+    message: "Review this",
+    depth: 1,
+    state: "queued",
+    pendingChildIds: [],
+    childOutcomes: [],
+    createdAt: now,
+    queueExpiresAt: "2026-08-12T00:30:00.000Z",
+    updatedAt: now,
+  }]);
   registry.replacePendingWorkspaceGitSystemRejections([{
     operationId: "11111111-1111-4111-8111-111111111111",
     planHash: "a".repeat(64),
@@ -123,6 +165,72 @@ test("snapshot round-trips without storage-specific types", () => {
   assert.equal(
     restored.listPendingWorkspaceGitSystemRejections()[0]?.repoId,
     "showtalk-taishi",
+  );
+});
+
+test("reserves durable headroom for a continuation after ingress is near its limit", () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({
+    id: "source",
+    adapter: "fake",
+    channelId: "C-SOURCE",
+  });
+  registry.registerAgent({
+    id: "target",
+    adapter: "fake",
+    channelId: "C-TARGET",
+  });
+  registry.addSession(session("session-source", "source"));
+  registry.bindConversation({
+    channelId: "C-SOURCE",
+    rootThreadTs: "4000.001",
+    agentId: "source",
+    sessionId: "session-source",
+  });
+  const job = {
+    version: 1 as const,
+    id: "large-delegation",
+    requestKey: "large-request",
+    source: {
+      type: "slack" as const,
+      agentId: "source",
+      channelId: "C-SOURCE",
+      rootThreadTs: "4000.001",
+      messageTs: "4000.002",
+      sessionId: "session-source",
+      adapterSessionId: "adapter-session-source",
+      turnStartedAt: now,
+    },
+    targetAgentId: "target",
+    targetAdapter: "fake",
+    targetChannelId: "C-TARGET",
+    targetConversationScope: "channel" as const,
+    consultationScope: "Review large input",
+    permissionDecision: "allow" as const,
+    message: "m".repeat(1_048_000),
+    depth: 1,
+    state: "queued" as const,
+    pendingChildIds: [],
+    childOutcomes: [],
+    createdAt: now,
+    queueExpiresAt: "2026-08-12T00:30:00.000Z",
+    updatedAt: now,
+  };
+
+  registry.assertQueuedDelegationAdmission([job]);
+  registry.replaceQueuedDelegations([job]);
+  assert.doesNotThrow(() =>
+    registry.replaceQueuedDelegations([{
+      ...job,
+      resumeMessage: "r".repeat(64_000),
+    }]),
+  );
+  assert.throws(
+    () => registry.assertQueuedDelegationAdmission([
+      job,
+      { ...job, id: "overflow", requestKey: "overflow", message: "x".repeat(1_000) },
+    ]),
+    /admission payload limit/u,
   );
 });
 
@@ -325,4 +433,21 @@ test("waits until active and FIFO-queued turns are all released", async () => {
   await idle;
   assert.equal(becameIdle, true);
   assert.equal(registry.isTurnQueueIdle(), true);
+});
+
+test("removes a cancelled FIFO turn waiter without leaking the Koe lease", async () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({ id: "worker", adapter: "fake", channelId: "C-WORKER" });
+  const release = registry.reserveAgentTurn("worker");
+  const controller = new AbortController();
+  const waiting = registry.waitForAgentTurn("worker", controller.signal);
+
+  controller.abort();
+  await assert.rejects(
+    waiting,
+    (error) => error instanceof CoreError && error.code === "REQUEST_CANCELLED",
+  );
+  release();
+  await registry.waitForTurnQueueIdle();
+  assert.doesNotThrow(() => registry.reserveAgentTurn("worker")());
 });

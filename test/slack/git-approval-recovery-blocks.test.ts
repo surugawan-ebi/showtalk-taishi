@@ -16,23 +16,19 @@ const routing = {
 } as const;
 
 test("renders bounded recovery guidance without stale plan authority or auto-resume wording", () => {
-  const blocks = buildGitApprovalRecoveryBlocks(
-    "期限切れです。<@UATTACKER>",
-    routing,
-  );
+  const blocks = buildGitApprovalRecoveryBlocks("期限切れです。<@UATTACKER>");
   const encoded = JSON.stringify(blocks);
 
-  assert.match(encoded, /新しい依頼方法を確認/u);
-  assert.match(encoded, /保留/u);
+  assert.match(encoded, /元の依頼がまだ処理中の場合/u);
   assert.doesNotMatch(encoded, /承認して実行/u);
   assert.doesNotMatch(encoded, /再作成する/u);
+  assert.doesNotMatch(encoded, /"type":"button"|"type":"actions"/u);
   assert.doesNotMatch(encoded, /<@UATTACKER>/u);
   assert.match(encoded, /&lt;@UATTACKER&gt;/u);
-  assert.match(encoded, /taishi\.git_recovery\.reprepare/u);
 });
 
 test("bounds oversized recovery text to Slack's section limit", () => {
-  const blocks = buildGitApprovalRecoveryBlocks("<&>".repeat(5_000), routing);
+  const blocks = buildGitApprovalRecoveryBlocks("<&>".repeat(5_000));
   const section = blocks[0];
 
   assert.equal(section?.type, "section");
@@ -41,7 +37,7 @@ test("bounds oversized recovery text to Slack's section limit", () => {
   }
   assert.ok(section.text.text.length <= 3_000);
   assert.doesNotMatch(section.text.text, /<|>/u);
-  assert.match(section.text.text, /…$/u);
+  assert.match(section.text.text, /…\n\n元の依頼がまだ処理中/u);
 });
 
 test("never reopens a consumed recovery action", () => {

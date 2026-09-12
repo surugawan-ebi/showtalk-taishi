@@ -244,6 +244,7 @@ export const taishiConfigSchema = z
             approvals_reviewer: z
               .enum(["user", "auto_review", "guardian_subagent"])
               .optional(),
+            live_acceptance_mcp_probe: z.boolean().optional(),
             sandbox: z
               .enum(["read-only", "workspace-write", "danger-full-access"])
               .optional(),
@@ -289,6 +290,25 @@ export const taishiConfigSchema = z
   })
   .strict()
   .superRefine((config, context) => {
+    for (const [name, adapter] of Object.entries(config.adapters)) {
+      if (adapter.live_acceptance_mcp_probe !== true) continue;
+      if (adapter.approval_policy !== "on-request") {
+        context.addIssue({
+          code: "custom",
+          path: ["adapters", name, "approval_policy"],
+          message:
+            "live_acceptance_mcp_probe requires approval_policy: on-request",
+        });
+      }
+      if (adapter.approvals_reviewer !== "user") {
+        context.addIssue({
+          code: "custom",
+          path: ["adapters", name, "approvals_reviewer"],
+          message:
+            "live_acceptance_mcp_probe requires approvals_reviewer: user",
+        });
+      }
+    }
     const channels = new Map<string, string>();
     const adapterSessions = new Map<string, string>();
     const channelOwnersByNormalizedAddress = new Map<string, string>();

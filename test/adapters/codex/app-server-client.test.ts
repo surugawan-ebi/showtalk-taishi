@@ -179,6 +179,20 @@ test("correlates responses and exposes server requests", async () => {
       answers: { git_approval: { answers: ["承認して実行"] } },
     },
   });
+  client.respondToMcpServerElicitation(102, {
+    action: "accept",
+    content: null,
+    _meta: { persist: "session" },
+  });
+  const [rawElicitationResponse] = transport.readOutput();
+  assert.deepEqual(JSON.parse(rawElicitationResponse ?? "null"), {
+    id: 102,
+    result: {
+      action: "accept",
+      content: null,
+      _meta: { persist: "session" },
+    },
+  });
   await client.close();
 });
 

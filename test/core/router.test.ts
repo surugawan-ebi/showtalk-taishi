@@ -52,7 +52,16 @@ class FakeAdapter implements AgentAdapter {
   }
 }
 
-function setup(options: { allowSelfDelegation?: boolean } = {}) {
+class ReboundResumeAdapter extends FakeAdapter {
+  override async resumeSession(): Promise<AdapterSession> {
+    this.resumed += 1;
+    return { id: "replacement-backend-session" };
+  }
+}
+
+function setup(
+  options: { allowSelfDelegation?: boolean; adapter?: FakeAdapter } = {},
+) {
   const registry = new InMemoryAgentRegistry();
   registry.registerAgent({
     id: "implementer",
@@ -67,7 +76,7 @@ function setup(options: { allowSelfDelegation?: boolean } = {}) {
     adapter: "fake",
     channelId: "C-REVIEWER",
   });
-  const adapter = new FakeAdapter();
+  const adapter = options.adapter ?? new FakeAdapter();
   let nextId = 0;
   const router = new AgentRouter(registry, [adapter], {
     maxDelegationDepth: 2,
@@ -95,6 +104,7 @@ test("agent.send directly creates and invokes the target adapter session", async
       targetAgentId: "reviewer",
       message: "Review this change",
       sourceRootThreadTs: "1710000000.000001",
+      sourceSlackUserId: "U123",
     }),
   );
 
@@ -119,7 +129,8 @@ test("agent.send directly creates and invokes the target adapter session", async
     activity.every(
       (event) =>
         event.sourceChannelId === "C-IMPLEMENTER" &&
-        event.sourceRootThreadTs === "1710000000.000001",
+        event.sourceRootThreadTs === "1710000000.000001" &&
+        event.sourceSlackUserId === "U123",
     ),
   );
   assert.equal(registry.getPrimarySession("reviewer")?.agentId, "reviewer");
@@ -323,6 +334,39 @@ test("activity is independent of Slack ingestion and is projection-ready", async
   assert.equal(started?.targetAgentId, "reviewer");
   assert.equal(started?.targetChannelId, "C-REVIEWER");
   assert.match(started?.targetSessionId ?? "", /^id-/);
+});
+
+test("fails closed when an exact durable session resumes to another backend", async () => {
+  const adapter = new ReboundResumeAdapter();
+  const { registry, router } = setup({ adapter });
+  registry.addSession({
+    id: "durable-target-session",
+    agentId: "reviewer",
+    adapter: "fake",
+    adapterSession: { id: "original-backend-session" },
+    status: "idle",
+    createdAt: "2026-08-12T00:00:00.000Z",
+    updatedAt: "2026-08-12T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => collect(router.send({
+      sourceAgentId: "implementer",
+      targetAgentId: "reviewer",
+      message: "Do not cross the durable backend boundary",
+      targetSessionId: "durable-target-session",
+      targetAdapterSessionId: "original-backend-session",
+    })),
+    (error) =>
+      error instanceof CoreError && error.code === "INVALID_ADAPTER_SESSION",
+  );
+
+  assert.equal(adapter.resumed, 1);
+  assert.equal(adapter.sent.length, 0);
+  assert.equal(
+    registry.requireSession("durable-target-session").adapterSession.id,
+    "original-backend-session",
+  );
 });
 
 test("derives nested MCP delegation causation from host-owned active state", async () => {

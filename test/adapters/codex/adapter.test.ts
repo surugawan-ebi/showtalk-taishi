@@ -28,6 +28,7 @@ import type {
   CodexTurn,
   CommandApprovalDecision,
   FileChangeApprovalDecision,
+  McpServerElicitationResponse,
   ModelListParams,
   ModelListResponse,
   PermissionsApprovalResponse,
@@ -45,7 +46,10 @@ class FakeAppServer implements CodexAppServer {
   readonly threadStarts: ThreadStartParams[] = [];
   readonly threadResumes: ThreadResumeParams[] = [];
   readonly turnStarts: TurnStartParams[] = [];
-  readonly approvalResponses: Array<{ id: RpcId; decision: string }> = [];
+  readonly approvalResponses: Array<{
+    id: RpcId;
+    decision: CommandApprovalDecision | FileChangeApprovalDecision;
+  }> = [];
   readonly permissionsApprovalResponses: Array<{
     id: RpcId;
     response: PermissionsApprovalResponse;
@@ -59,6 +63,10 @@ class FakeAppServer implements CodexAppServer {
   readonly userInputResponses: Array<{
     id: RpcId;
     response: ToolRequestUserInputResponse;
+  }> = [];
+  readonly mcpElicitationResponses: Array<{
+    id: RpcId;
+    response: McpServerElicitationResponse;
   }> = [];
   readonly unsubscribeCalls: string[] = [];
   readonly readThreadIncludeTurns: boolean[] = [];
@@ -249,7 +257,7 @@ class FakeAppServer implements CodexAppServer {
   }
 
   respondToCommandApproval(id: RpcId, decision: CommandApprovalDecision): void {
-    this.approvalResponses.push({ id, decision: String(decision) });
+    this.approvalResponses.push({ id, decision });
   }
 
   respondToFileChangeApproval(id: RpcId, decision: FileChangeApprovalDecision): void {
@@ -268,6 +276,13 @@ class FakeAppServer implements CodexAppServer {
       throw this.userInputResponseError;
     }
     this.userInputResponses.push({ id, response });
+  }
+
+  respondToMcpServerElicitation(
+    id: RpcId,
+    response: McpServerElicitationResponse,
+  ): void {
+    this.mcpElicitationResponses.push({ id, response });
   }
 
   respondError(id: RpcId, error: RpcError): void {
@@ -1078,6 +1093,7 @@ test("omits per-turn application context when no Slack persona is configured", a
   );
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(server.turnStarts[0]?.additionalContext, undefined);
+  assert.equal(server.turnStarts[0]?.collaborationMode?.mode, "plan");
 
   server.notify("turn/completed", {
     threadId: session.id,
@@ -1112,6 +1128,7 @@ test("allows internal subagents when paginated resume is supported", async () =>
     "showtalk_taishi.paginated_thread_compatibility"
   ];
   assert.equal(compatibility, undefined);
+  assert.equal(server.turnStarts[0]?.collaborationMode?.mode, "plan");
 
   server.notify("turn/completed", {
     threadId: session.id,
@@ -1148,6 +1165,7 @@ test("falls back when the active App Server rejects excludeTurns", async () => {
     "showtalk_taishi.paginated_thread_compatibility"
   ];
   assert.equal(compatibility?.kind, "application");
+  assert.equal(server.turnStarts[0]?.collaborationMode?.mode, "plan");
   assert.match(
     compatibility?.value ?? "",
     /rejected the modern paginated-thread resume path/u,
@@ -1175,6 +1193,7 @@ test("falls back when the active App Server rejects excludeTurns", async () => {
   );
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(server.threadResumes.at(-1)?.excludeTurns, undefined);
+  assert.equal(server.turnStarts[1]?.collaborationMode?.mode, "plan");
   server.notify("turn/completed", {
     threadId: session.id,
     turn: { id: "turn_2", status: "completed" },
@@ -1578,6 +1597,10 @@ test("releases and resumes the same Codex thread between turns", async () => {
   assert.equal(server.threadResumes.length, 1);
   assert.equal(server.threadResumes[0]?.threadId, session.id);
   assert.equal(server.threadResumes[0]?.cwd, "/tmp");
+  assert.deepEqual(
+    server.turnStarts.map((params) => params.collaborationMode?.mode),
+    ["plan", "plan"],
+  );
 });
 
 test("reuses the same Codex thread after a model capacity failure", async () => {
@@ -2176,6 +2199,7 @@ test("reapplies resume overrides after an active thread becomes idle", async () 
   );
   assert.deepEqual(server.unsubscribeCalls, [session.id, session.id]);
   assert.equal(server.turnStarts.length, 1);
+  assert.equal(server.turnStarts[0]?.collaborationMode?.mode, "plan");
 });
 
 test("status inspection does not retain an idle thread subscription", async () => {
@@ -2250,6 +2274,117 @@ test("normalizes stream events and resolves an approval", async () => {
     }),
     /Unknown approval request/,
   );
+});
+
+test("routes MCP tool approval elicitations through the native permission UI", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Run the bounded MCP tool",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type === "approval.requested") {
+        await adapter.approve(session, {
+          requestId: event.requestId,
+          decision: "allow_session",
+        });
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 701,
+    method: "mcpServer/elicitation/request",
+    params: {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      serverName: "functions",
+      mode: "form",
+      message: "Allow the bounded local check?",
+      requestedSchema: { type: "object", properties: {} },
+      _meta: {
+        codex_approval_kind: "mcp_tool_call",
+        tool_name: "exec",
+        tool_params: { secret: "must-not-be-projected" },
+        persist: ["session", "always"],
+      },
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  const approval = events.find(
+    (event): event is Extract<AgentEvent, { type: "approval.requested" }> =>
+      event.type === "approval.requested",
+  );
+  assert.deepEqual(approval?.availableDecisions, [
+    "allow_once",
+    "allow_session",
+    "cancel",
+  ]);
+  assert.match(approval?.summary ?? "", /functions\.exec/u);
+  assert.doesNotMatch(JSON.stringify(approval?.details), /must-not-be-projected/u);
+  assert.deepEqual(server.mcpElicitationResponses, [{
+    id: 701,
+    response: {
+      action: "accept",
+      content: null,
+      _meta: { persist: "session" },
+    },
+  }]);
+  assert.equal(server.errorResponses.length, 0);
+});
+
+test("cancels non-approval MCP elicitations instead of misrouting authority", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const eventsPromise = collectEvents(adapter.sendMessage(
+    { id: "thr_1" },
+    { text: "Do not render arbitrary elicitation", source: { type: "human" } },
+  ));
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 702,
+    method: "mcpServer/elicitation/request",
+    params: {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      serverName: "example",
+      mode: "form",
+      message: "Collect a value",
+      requestedSchema: {
+        type: "object",
+        properties: { value: { type: "string" } },
+        required: ["value"],
+      },
+      _meta: null,
+    },
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  const events = await eventsPromise;
+
+  assert.equal(events.some((event) => event.type === "approval.requested"), false);
+  assert.ok(events.some(
+    (event) =>
+      event.type === "error" && event.code === "UNSUPPORTED_MCP_ELICITATION",
+  ));
+  assert.deepEqual(server.mcpElicitationResponses, [{
+    id: 702,
+    response: { action: "cancel", content: null, _meta: null },
+  }]);
 });
 
 test("normalizes completed generated images once for Slack projection", async () => {
@@ -2479,6 +2614,119 @@ test("presents and accepts only command decisions offered by Codex", async () =>
 
   assert.deepEqual(offered, ["allow_once", "cancel"]);
   assert.deepEqual(server.approvalResponses, [{ id: 71, decision: "accept" }]);
+});
+
+test("returns only the exact execpolicy amendment offered by Codex", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  const amendment = ["/usr/bin/open", "-n", "-a", "Godot"];
+  let offered: readonly string[] | undefined;
+  let summary: string | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Open Godot",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "approval.requested") continue;
+      offered = event.availableDecisions;
+      summary = event.summary;
+      await adapter.approve(session, {
+        requestId: event.requestId,
+        decision: "allow_command_rule",
+      });
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 73,
+    method: "item/commandExecution/requestApproval",
+    params: {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      itemId: "item_1",
+      command: '/usr/bin/open -n -a "Godot"',
+      proposedExecpolicyAmendment: amendment,
+      availableDecisions: [
+        "accept",
+        {
+          acceptWithExecpolicyAmendment: {
+            execpolicy_amendment: amendment,
+          },
+        },
+        "cancel",
+      ],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.deepEqual(offered, [
+    "allow_once",
+    "allow_command_rule",
+    "cancel",
+  ]);
+  assert.match(summary ?? "", /exact command rule/u);
+  assert.match(summary ?? "", /\["\/usr\/bin\/open","-n","-a","Godot"\]/u);
+  assert.deepEqual(server.approvalResponses, [{
+    id: 73,
+    decision: {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: amendment,
+      },
+    },
+  }]);
+});
+
+test("does not offer an execpolicy amendment that differs from the proposal", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  let offered: readonly string[] | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Reject mismatched rule", source: { type: "human" } },
+    )) {
+      if (event.type !== "approval.requested") continue;
+      offered = event.availableDecisions;
+      await adapter.approve(
+        { id: "thr_1" },
+        { requestId: event.requestId, decision: "cancel" },
+      );
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 74,
+    method: "item/commandExecution/requestApproval",
+    params: {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      itemId: "item_1",
+      proposedExecpolicyAmendment: ["git", "status"],
+      availableDecisions: [
+        {
+          acceptWithExecpolicyAmendment: {
+            execpolicy_amendment: ["git", "push"],
+          },
+        },
+        "cancel",
+      ],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.deepEqual(offered, ["cancel"]);
+  assert.deepEqual(server.approvalResponses, [{ id: 74, decision: "cancel" }]);
 });
 
 test("cancels command approvals with no safely presentable decision", async () => {
@@ -4232,7 +4480,7 @@ test("rejects structured input that is not bound to one exact workspace-git plan
   assert.equal(server.errorResponses[0]?.code, -32602);
   assert.match(
     server.errorResponses[0]?.message ?? "",
-    /REPREPARE_REQUIRED.*Do not call request_user_input again.*get_git_operation_status does not bind.*re-run.*plan operation/u,
+    /REPREPARE_REQUIRED.*Do not call request_user_input again.*End this turn.*new explicit Git request.*Only in that new turn.*plan operation/u,
   );
   assert.equal(recovery?.type, "git_approval.reprepare_required");
 });
@@ -4903,6 +5151,10 @@ test("continues one bounded turn when an approved Git plan was not executed", as
 
   assert.equal(server.turnStarts.length, 2);
   const continuationInput = server.turnStarts[1]?.input[0];
+  assert.deepEqual(
+    server.turnStarts.map((params) => params.collaborationMode?.mode),
+    ["plan", "plan"],
+  );
   assert.equal(continuationInput?.type, "text");
   if (continuationInput?.type !== "text") {
     throw new Error("Git continuation did not use a text input");

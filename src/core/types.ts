@@ -99,7 +99,12 @@ export interface ConversationBinding {
 
 export interface AgentApproval {
   readonly requestId: string;
-  readonly decision: "allow_once" | "allow_session" | "deny" | "cancel";
+  readonly decision:
+    | "allow_once"
+    | "allow_session"
+    | "allow_command_rule"
+    | "deny"
+    | "cancel";
 }
 
 export type WorkspaceGitPublicationMode =
@@ -517,6 +522,95 @@ export interface PrimarySessionBinding {
   readonly sessionId: SessionId;
 }
 
+export interface QueuedDelegationSlackSource {
+  readonly type: "slack";
+  readonly agentId: AgentId;
+  readonly channelId: SlackChannelId;
+  readonly rootThreadTs: SlackRootThreadTs;
+  readonly messageTs: string;
+  readonly slackUserId?: string;
+  readonly sessionId: SessionId;
+  readonly adapterSessionId: string;
+  readonly turnStartedAt: string;
+}
+
+export interface QueuedDelegationJobSource {
+  readonly type: "job";
+  readonly agentId: AgentId;
+  /** The durable parent job whose target turn issued this child request. */
+  readonly ownerJobId: string;
+  readonly sessionId: SessionId;
+  readonly adapterSessionId: string;
+  readonly turnStartedAt: string;
+}
+
+export type QueuedDelegationSource =
+  | QueuedDelegationSlackSource
+  | QueuedDelegationJobSource;
+
+export type QueuedDelegationOutcomeStatus =
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "expired"
+  | "unknown";
+
+export interface QueuedDelegationOutcome {
+  readonly status: QueuedDelegationOutcomeStatus;
+  readonly text: string;
+}
+
+/**
+ * Durable accepted Koe-to-Koe work. Adapter turns may stop and resume while one
+ * job waits for child consultations; the job remains the result owner.
+ */
+export interface QueuedDelegationJob {
+  readonly version: 1;
+  readonly id: string;
+  readonly requestKey: string;
+  readonly source: QueuedDelegationSource;
+  readonly targetAgentId: AgentId;
+  readonly targetAdapter: string;
+  readonly targetChannelId: SlackChannelId;
+  readonly targetConversationScope: ConversationScope;
+  readonly targetWorkspacePath?: string;
+  readonly consultationScope: string;
+  readonly permissionDecision: "allow" | "approval";
+  readonly message: string;
+  readonly metadata?: Readonly<Record<string, JsonValue>>;
+  /** Causation depth for the next adapter turn of this job. */
+  readonly depth: number;
+  /** Immediate causation predecessor; distinct from source.ownerJobId. */
+  readonly causationParentId?: string;
+  readonly state:
+    | "queued"
+    | "running"
+    | "waiting_for_children"
+    | "result_pending"
+    | "delivering";
+  readonly pendingChildIds: readonly string[];
+  readonly childOutcomes: readonly {
+    readonly childJobId: string;
+    readonly targetAgentId: AgentId;
+    readonly depth: number;
+    readonly outcome: QueuedDelegationOutcome;
+  }[];
+  readonly targetSessionId?: SessionId;
+  readonly targetAdapterSessionId?: string;
+  /** Slack root that displays this accepted job and survives adapter pauses. */
+  readonly targetRootThreadTs?: SlackRootThreadTs;
+  /** Present only when a child result is resuming this job's target session. */
+  readonly resumeMessage?: string;
+  /** Non-terminal adapter-turn failure retained while accepted children finish. */
+  readonly turnFailure?: QueuedDelegationOutcome;
+  /** Durable at-most-once fence set before starting the source Koe continuation. */
+  readonly sourceContinuationStarted?: boolean;
+  readonly outcome?: QueuedDelegationOutcome;
+  readonly createdAt: string;
+  readonly queueExpiresAt: string;
+  readonly updatedAt: string;
+}
+
 /** Durable intent to fail-close a Git approval that no longer has a visible UI. */
 export interface PendingWorkspaceGitSystemRejection {
   readonly operationId: string;
@@ -542,6 +636,8 @@ export interface CoreStateSnapshot {
   readonly handledDelegationResults?: readonly string[];
   /** Delayed results that have already started their one permitted next Koe step. */
   readonly usedContinuationDelegations?: readonly string[];
+  /** Accepted Koe-to-Koe work awaiting execution, children, or exact delivery. */
+  readonly queuedDelegations?: readonly QueuedDelegationJob[];
   /** Recently completed Slack Events API deliveries (durable retry guard). */
   readonly handledSlackEvents?: readonly string[];
   /** Fail-closed Git decisions queued before an App Server request was released. */

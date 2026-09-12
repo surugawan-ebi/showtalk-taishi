@@ -17,6 +17,21 @@ import type { StructuredChoiceContinuationStore } from "./choice-continuation.js
 
 const MAX_FALLBACK_RESULT_TEXT = 3_000;
 
+export class DelegationContinuationDeliveryError extends Error {
+  readonly delegationResultPublished: boolean;
+
+  constructor(cause: unknown, delegationResultPublished: boolean) {
+    super(
+      cause instanceof Error
+        ? cause.message
+        : "Delegation continuation projection was incomplete",
+      { cause },
+    );
+    this.name = "DelegationContinuationDeliveryError";
+    this.delegationResultPublished = delegationResultPublished;
+  }
+}
+
 export type UserInputProjectionFailure = {
   readonly kind: "git_approval";
   readonly plan: WorkspaceGitApprovalPlan;
@@ -161,7 +176,7 @@ export async function projectDelegationContinuation(
       presentations,
       sourceUserId,
     );
-    throw turnError;
+    throw new DelegationContinuationDeliveryError(turnError, true);
   }
 
   let completionError: unknown;
@@ -174,10 +189,13 @@ export async function projectDelegationContinuation(
     if (!projector.hasPublishedFinalResponse()) {
       await postRawResultFallback(client, request, presentations, sourceUserId);
     }
-    throw completionError;
+    throw new DelegationContinuationDeliveryError(completionError, true);
   }
   if (projectionError !== undefined) {
-    throw projectionError;
+    throw new DelegationContinuationDeliveryError(
+      projectionError,
+      projector.hasPublishedFinalResponse(),
+    );
   }
 }
 

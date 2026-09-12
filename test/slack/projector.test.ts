@@ -1260,7 +1260,7 @@ test("forgets an externally resolved Git card after terminal Slack update failur
   assert.equal(detailsStore.get(routing), undefined);
 });
 
-test("projects one safe recovery choice when an exact Git plan is unavailable", async () => {
+test("projects inert Git recovery only after the original turn's final reply", async () => {
   const { client, posts, updates } = recordingClient();
   const projector = new SlackThreadProjector(client, "C1", "100.0", {
     sourceUserId: "U123",
@@ -1271,16 +1271,211 @@ test("projects one safe recovery choice when an exact Git plan is unavailable", 
     message: "古い計画は現在のターンに紐づいていません。",
   });
 
-  assert.equal(posts.length, 2);
-  const recoveryPost = posts[1];
+  assert.equal(posts.length, 1);
+  assert.doesNotMatch(JSON.stringify(posts), /このGit承認は古いカード/u);
+
+  await projector.project({
+    type: "message.completed",
+    text: "元の依頼は未公開のまま終了しました。",
+  });
+  await projector.complete();
+
+  assert.equal(posts.length, 3);
+  assert.match(String(posts[1]?.text), /元の依頼は未公開のまま終了/u);
+  const recoveryPost = posts[2];
   assert.equal(recoveryPost?.channel, "C1");
   assert.equal(recoveryPost?.thread_ts, "100.0");
   assert.match(String(recoveryPost?.text), /<@U123>$/u);
-  const recoveryUpdate = updates.find((update) => update.ts === "102.1");
-  const blocks = JSON.stringify(recoveryUpdate?.blocks);
-  assert.match(blocks, /新しい依頼方法を確認/u);
-  assert.match(blocks, /保留/u);
-  assert.doesNotMatch(blocks, /承認して実行/u);
+  const blocks = JSON.stringify(recoveryPost?.blocks);
+  assert.match(blocks, /元の依頼がまだ処理中の場合/u);
+  assert.doesNotMatch(blocks, /承認して実行|"type":"button"/u);
+  assert.equal(
+    updates.some((update) =>
+      String(JSON.stringify(update.blocks)).includes("git_recovery")
+    ),
+    false,
+  );
+});
+
+test("deduplicates delayed Git recovery across repeated events and concurrent completion", async () => {
+  const { client, posts } = recordingClient();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+  });
+  const recovery = {
+    type: "git_approval.reprepare_required" as const,
+    message: "古い計画は承認できません。",
+  };
+
+  await projector.project(recovery);
+  await projector.project(recovery);
+  await projector.project({ type: "message.completed", text: "終了しました。" });
+  await Promise.all([projector.complete(), projector.complete()]);
+  await projector.complete();
+
+  assert.equal(
+    posts.filter((post) =>
+      String(JSON.stringify(post.blocks)).includes("このGit承認は古いカード")
+    ).length,
+    1,
+  );
+});
+
+test("does not publish Git recovery before a failed final reply is retried", async () => {
+  const posts: Array<Record<string, unknown>> = [];
+  let failFinalOnce = true;
+  const client = {
+    chat: {
+      postMessage: async (input: Record<string, unknown>) => {
+        if (String(input.text).includes("再試行後の最終回答") && failFinalOnce) {
+          failFinalOnce = false;
+          throw new Error("temporary final reply failure");
+        }
+        posts.push(input);
+        return { ok: true, ts: `${100 + posts.length}.1` };
+      },
+      update: async () => ({ ok: true }),
+    },
+  } as unknown as WebClient;
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+  });
+
+  await projector.project({
+    type: "git_approval.reprepare_required",
+    message: "新しい依頼が必要です。",
+  });
+  await projector.project({
+    type: "message.completed",
+    text: "再試行後の最終回答です。",
+  });
+
+  await assert.rejects(projector.complete(), /temporary final reply failure/u);
+  assert.equal(
+    posts.some((post) =>
+      String(JSON.stringify(post.blocks)).includes("このGit承認は古いカード")
+    ),
+    false,
+  );
+
+  await projector.complete();
+  const finalIndex = posts.findIndex((post) =>
+    String(post.text).includes("再試行後の最終回答")
+  );
+  const recoveryIndex = posts.findIndex((post) =>
+    String(JSON.stringify(post.blocks)).includes("このGit承認は古いカード")
+  );
+  assert.ok(finalIndex >= 0);
+  assert.ok(recoveryIndex > finalIndex);
+});
+
+test("keeps final reply before Git recovery when activity collapse fails", async () => {
+  const posts: Array<Record<string, unknown>> = [];
+  let failCollapseOnce = true;
+  const client = {
+    chat: {
+      postMessage: async (input: Record<string, unknown>) => {
+        posts.push(input);
+        return { ok: true, ts: `${100 + posts.length}.1` };
+      },
+      update: async (input: Record<string, unknown>) => {
+        if (
+          String(input.text).includes(":hourglass_flowing_sand:") &&
+          failCollapseOnce
+        ) {
+          failCollapseOnce = false;
+          throw new Error("temporary activity collapse failure");
+        }
+        return { ok: true };
+      },
+    },
+  } as unknown as WebClient;
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+  });
+
+  await projector.project({
+    type: "git_approval.reprepare_required",
+    message: "新しい依頼が必要です。",
+  });
+  await projector.project({
+    type: "message.completed",
+    text: "元のターンの最終回答です。",
+  });
+
+  await assert.rejects(
+    projector.complete(),
+    /temporary activity collapse failure/u,
+  );
+  const finalIndex = posts.findIndex((post) =>
+    String(post.text).includes("元のターンの最終回答")
+  );
+  const recoveryIndex = posts.findIndex((post) =>
+    String(JSON.stringify(post.blocks)).includes("このGit承認は古いカード")
+  );
+  assert.ok(finalIndex >= 0);
+  assert.ok(recoveryIndex > finalIndex);
+
+  await projector.complete();
+  assert.equal(
+    posts.filter((post) =>
+      String(JSON.stringify(post.blocks)).includes("このGit承認は古いカード")
+    ).length,
+    1,
+  );
+});
+
+test("orders source-less Git recovery after the terminal activity update", async () => {
+  const operations: string[] = [];
+  let postCount = 0;
+  const client = {
+    chat: {
+      postMessage: async (input: Record<string, unknown>) => {
+        operations.push(
+          input.blocks === undefined ? "activity-post" : "recovery-post",
+        );
+        postCount += 1;
+        return { ok: true, ts: `${100 + postCount}.1` };
+      },
+      update: async (input: Record<string, unknown>) => {
+        operations.push(
+          String(input.text).includes("Git操作は承認されませんでした")
+            ? "terminal-update"
+            : "activity-update",
+        );
+        return { ok: true };
+      },
+    },
+  } as unknown as WebClient;
+  const projector = new SlackThreadProjector(client, "C1", "100.0");
+
+  await projector.project({
+    type: "git_approval.reprepare_required",
+    message: "新しい依頼が必要です。",
+  });
+  await projector.complete();
+
+  assert.ok(operations.indexOf("terminal-update") >= 0);
+  assert.ok(
+    operations.indexOf("recovery-post") > operations.indexOf("terminal-update"),
+  );
+});
+
+test("uses a blocked Git result instead of generic success when recovery has no model text", async () => {
+  const { client, posts } = recordingClient();
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+  });
+
+  await projector.project({
+    type: "git_approval.reprepare_required",
+    message: "新しい依頼が必要です。",
+  });
+  await projector.complete();
+
+  assert.match(String(posts[1]?.text), /Git操作は承認されませんでした/u);
+  assert.doesNotMatch(String(posts[1]?.text), /処理が完了しました/u);
+  assert.match(JSON.stringify(posts[2]?.blocks), /このGit承認は古いカード/u);
 });
 
 test("bounds and escapes actionable text before adding the source mention", async () => {

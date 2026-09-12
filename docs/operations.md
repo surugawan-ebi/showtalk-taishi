@@ -95,6 +95,11 @@ reconstructed through `agent.send`, `slack.post`, or `slack.reply`. A copied,
 expired, reused, restarted, wrong-thread, or otherwise unbound action fails
 closed. The owning Koe must inspect current status and prepare a fresh exact
 plan before requesting approval again.
+An unbound-plan recovery notice is inert and is posted only after the original
+turn's final response. It never starts a turn or authorizes Git. Buttons from an
+older deployed notice provide guidance only. If the original turn is still
+running when one is used, its final response arrives separately from that
+guidance.
 
 Selecting `承認して実行` first records the exact decision through the
 model-inaccessible workspace-git private broker, then resumes the original
@@ -197,14 +202,31 @@ Slack shows the visit in the target channel; the Gateway—not Slack events—is
 the transport.
 
 For an ordered request, the controlling Koe sends one bounded step at a time
-and uses the returned result to formulate the next. A review/fix cycle needs an
-explicit retry bound and must not loop indefinitely.
+and waits for its delayed result before formulating the next. A live
+`agent.send` call durably records the request, returns `queued` with a stable
+delegation ID, and releases the caller to finish its current turn. The target
+runs accepted work FIFO while retaining the one-active-turn-per-Koe boundary.
+The queued acknowledgement is not the target's result and must not be resent.
+A review/fix cycle needs an explicit retry bound and must not loop indefinitely.
 
 If the target finishes after the source turn closes, Taishi resumes the source
 Koe on the backend conversation mapped to the original Slack root, queues it
 behind newer work, and posts the source Koe's conclusion in that same Slack
 thread. Accepted delegation and continuation IDs are persisted so handled
 results are not projected twice after a restart.
+
+Queued requests, parent/child ownership, and exact return bindings are durable.
+After replacement, requests that were certainly still queued resume. Work that
+was already running is not executed again because its external outcome may be
+unknown; that outcome is returned visibly instead. Queue admission is bounded
+per target and globally, and requests expire rather than waiting forever.
+If durable state or Slack result delivery fails after acceptance, Taishi keeps
+the affected job but blocks automatic retries for that worker process to avoid
+a hot loop. `agent.status` then reports `queue_status: blocked` with queued and
+pending-delivery counts. After repairing the underlying dependency, restart the
+Gateway through `gateway.restart`; the replacement worker reloads the saved job
+and makes one safe recovery attempt. It never re-runs a target turn whose
+execution or source-continuation outcome is uncertain.
 
 With `slack_thread` scope, separate visits create separate backend threads in
 the target workspace. They receive the delegated request and configured

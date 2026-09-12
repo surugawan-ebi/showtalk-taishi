@@ -295,9 +295,10 @@ Ordinary structured questions are classified only after the bounded
 same-turn Git-plan race window. They use a separate Slack action namespace and
 carry only opaque request-local question/option IDs plus message routing.
 Model-provided labels and prompts are displayed but never placed in action
-values. A direct Slack question is answerable only by the user who started the
-turn; a Koe-to-Koe question without a source user falls back to configured
-operators. Secret questions are not projected. Free text is accepted only
+values. A direct Slack question and a Slack-originated Koe-to-Koe question are
+answerable only by the authenticated user who started the delegation chain;
+a Koe-to-Koe question without a Slack origin falls back to configured operators.
+Secret questions are not projected. Free text is accepted only
 when the App Server question explicitly allows `Other`, is length bounded,
 and is returned as an answer—not as approval authority.
 
@@ -339,12 +340,15 @@ repository rule requiring backend-local internal sub-agents.
 The Router owns delegation IDs, parent causation, and depth. Nested tool calls
 derive their context from active routing state; models cannot reset the hop
 counter. Self-routing is denied unless a Koe definition explicitly opts
-in, and a busy target rejects a second delegated turn.
+in. A busy target does not run a second turn concurrently: authenticated work
+is admitted to a bounded durable queue and executed after the current lease.
 
 MCP authentication is Koe-scoped. Each Koe has one canonical backend
 thread, and v0.1 runs at most one active turn for that identity. Rapid human
-Slack inputs wait in FIFO order. Direct routing to a busy Koe fails fast;
-queuing nested Koe-to-Koe work could deadlock a routing cycle.
+Slack inputs and accepted routed work wait in FIFO order. Routed calls return a
+queued acknowledgement instead of synchronously holding the source turn, so a
+nested A-to-B-to-A chain cannot deadlock on two held Koe leases. The hop bound
+still terminates cyclic causation.
 
 If a routed result outlives its originating Slack turn, only the trusted
 process-local lease and exact active-turn coordinates may trigger delivery back

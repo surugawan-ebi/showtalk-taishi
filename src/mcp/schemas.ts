@@ -122,6 +122,13 @@ export const threadTsSchema = z
 
 export const agentListInputSchema = z.object({}).strict().default({});
 export const gatewayRestartInputSchema = z.object({}).strict().default({});
+export const approvalProbeInputSchema = z
+  .object({
+    probe_id: boundedIdentifier("Approval probe ID", 128).describe(
+      "Non-secret identifier used to distinguish one live acceptance attempt",
+    ),
+  })
+  .strict();
 export const appOpsPreToolUseInputSchema = z
   .object({
     session_id: sessionIdSchema,
@@ -205,6 +212,9 @@ export const agentStatusOutputSchema = z
     agent_id: agentIdSchema,
     status: statusSchema,
     session_id: sessionIdSchema.optional(),
+    queue_status: z.enum(["active", "blocked"]).optional(),
+    queued_delegations: z.number().int().nonnegative().max(256).optional(),
+    pending_deliveries: z.number().int().nonnegative().max(256).optional(),
   })
   .strict();
 
@@ -220,6 +230,13 @@ export const agentSendOutputSchema = z
 export const gatewayRestartOutputSchema = z
   .object({
     status: z.literal("scheduled"),
+  })
+  .strict();
+
+export const approvalProbeOutputSchema = z
+  .object({
+    status: z.literal("executed"),
+    probe_id: boundedIdentifier("Approval probe ID", 128),
   })
   .strict();
 

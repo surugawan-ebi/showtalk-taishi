@@ -1,8 +1,8 @@
 import type { AgentEvent } from "../../core/index.js";
 
-export const MAX_CODEX_GENERATED_IMAGE_FILES = 10;
+export const MAX_CODEX_GENERATED_IMAGE_FILES = 30;
 export const MAX_CODEX_GENERATED_IMAGE_FILE_BYTES = 25 * 1024 * 1024;
-export const MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
+export const MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES = 150 * 1024 * 1024;
 
 type GeneratedImageEvent = Extract<
   AgentEvent,
