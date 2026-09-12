@@ -16,6 +16,9 @@ test("renders a nonce-bound responsive admin page with parseable browser code", 
   assert.match(page, /"\/models" \+ suffix/u);
   assert.match(page, /次のターンから反映/u);
   assert.match(page, /自動進行とWorkspace Git自動運転は停止しました/u);
+  assert.match(page, /Slack MCP投稿はPermission Engineの実効ポリシーに従う/u);
+  assert.match(page, /allow設定または有効なsession grantでは承認カードを表示せず/u);
+  assert.doesNotMatch(page, /外部操作はmanualで確認します/u);
   assert.match(
     page,
     /<div hidden aria-hidden="true">\s*<div class="field-grid">/u,

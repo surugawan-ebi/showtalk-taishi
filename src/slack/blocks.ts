@@ -41,6 +41,8 @@ export function buildApprovalBlocks(
             ? "Allow once"
             : decision === "allow_session"
               ? "Allow session"
+              : decision === "allow_command_rule"
+                ? "正確なコマンド規則を今後許可"
               : decision === "deny"
                 ? "Deny"
                 : "Cancel",
@@ -69,16 +71,31 @@ function approvalButton(
     action_id: `${APPROVAL_ACTION_PREFIX}${decision}`,
     value,
     ...(style === undefined ? {} : { style }),
-    ...(decision === "allow_session"
+    ...(decision === "allow_session" || decision === "allow_command_rule"
       ? {
           confirm: {
-            title: { type: "plain_text" as const, text: "Allow for session?" },
+            title: {
+              type: "plain_text" as const,
+              text: decision === "allow_session"
+                ? "Allow for session?"
+                : "今後も許可しますか？",
+            },
             text: {
               type: "mrkdwn" as const,
-              text: "This allows matching requests for the active Koe session.",
+              text: decision === "allow_session"
+                ? "This allows matching requests for the active Koe session."
+                : "Codexが提示した正確なコマンド規則に一致する、今後の実行を許可します。",
             },
-            confirm: { type: "plain_text" as const, text: "Allow session" },
-            deny: { type: "plain_text" as const, text: "Go back" },
+            confirm: {
+              type: "plain_text" as const,
+              text: decision === "allow_session"
+                ? "Allow session"
+                : "規則を許可",
+            },
+            deny: {
+              type: "plain_text" as const,
+              text: decision === "allow_session" ? "Go back" : "戻る",
+            },
           },
         }
       : {}),
@@ -92,6 +109,7 @@ export function parseApprovalDecision(
   const decision = actionId.slice(APPROVAL_ACTION_PREFIX.length);
   return decision === "allow_once" ||
     decision === "allow_session" ||
+    decision === "allow_command_rule" ||
     decision === "deny" ||
     decision === "cancel"
     ? decision

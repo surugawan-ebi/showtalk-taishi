@@ -284,6 +284,7 @@ async function createLockedRuntime(
         : { onRestartRequested: options.onRestartRequested }),
       gatewayRestartReplayGuard,
       runtimeInstanceId: randomUUID(),
+      onStateChanged: persist,
     },
   );
   const mcpServer = new AuthenticatedMcpHttpServer(mcpService);
@@ -348,10 +349,17 @@ async function createLockedRuntime(
         ...(adapterConfig.sandbox === undefined
           ? {}
           : { sandbox: adapterConfig.sandbox }),
-        threadConfig: buildCodexMcpThreadConfig({
-          url: credential.url,
-          bearerTokenEnvVar: MCP_TOKEN_ENV_VAR,
-        }),
+        threadConfig: buildCodexMcpThreadConfig(
+          {
+            url: credential.url,
+            bearerTokenEnvVar: MCP_TOKEN_ENV_VAR,
+          },
+          undefined,
+          {
+            enableLiveAcceptanceProbe:
+              adapterConfig.live_acceptance_mcp_probe === true,
+          },
+        ),
         onGitUserInputResolvedExternally: (requestId) => {
           workspaceGitApprovalDetailsStore.invalidateRequest(requestId);
         },
@@ -1174,8 +1182,9 @@ export function configuredKoeRole(
             return `- ${callName === undefined ? target : `${callName} [${target}]`} (Slack channel ${targetChannel ?? "unknown"}): ${rule.scope}`;
           }),
           "A configured call name and its bracketed Koe ID identify the same target. Pass either exact value to agent.send; never infer an unlisted name.",
-          "For an ordered multi-Koe request, delegate one step at a time and use each returned result to decide and formulate the next configured delegation.",
-          "Delayed delegation results continue the original request. Do not repeat the completed delegation_id, and bound review/fix retries instead of looping indefinitely.",
+          "agent.send normally returns queued with a delegation_id. Do not resend it or treat the queued acknowledgement as the target's final result.",
+          "The final success or failure continues this exact conversation later. For an ordered multi-Koe request, delegate one step at a time and use each delayed result to decide and formulate the next configured delegation.",
+          "Do not repeat a completed delegation_id, and bound review/fix retries instead of looping indefinitely.",
         ];
   return [agent.role.trim(), ...directory].join("\n\n");
 }

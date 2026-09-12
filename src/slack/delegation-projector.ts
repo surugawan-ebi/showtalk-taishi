@@ -74,35 +74,7 @@ export class SlackDelegationProjector {
         if (typeof result.ts !== "string") {
           throw new Error("Slack did not return a timestamp for delegation activity");
         }
-        const projector = new SlackThreadProjector(
-          this.#client,
-          activity.targetChannelId,
-          result.ts,
-          {
-            presentation: presentationForChannel(
-              this.#presentations,
-              activity.targetChannelId,
-            ),
-            ...(this.#gitApprovalDetailsStore === undefined
-              ? {}
-              : { gitApprovalDetailsStore: this.#gitApprovalDetailsStore }),
-            ...(this.#choiceContinuationStore === undefined
-              ? {}
-              : { choiceContinuationStore: this.#choiceContinuationStore }),
-          },
-        );
-        projector.setSessionId(activity.targetSessionId);
-        this.#active.set(activity.delegationId, {
-          channelId: activity.targetChannelId,
-          rootThreadTs: result.ts,
-          sourceAgentId: activity.sourceAgentId,
-          sourceChannelId: activity.sourceChannelId,
-          ...(activity.sourceRootThreadTs === undefined
-            ? {}
-            : { sourceRootThreadTs: activity.sourceRootThreadTs }),
-          targetAgentId: activity.targetAgentId,
-          projector,
-        });
+        this.#activate(activity, result.ts);
         return {
           channelId: activity.targetChannelId,
           rootThreadTs: result.ts,
@@ -194,6 +166,66 @@ export class SlackDelegationProjector {
         return undefined;
       }
     }
+  }
+
+  /** Restores a durable queued job onto its already-visible Slack root. */
+  restore(
+    activity: Extract<DelegationActivity, { readonly type: "delegation.started" }>,
+    rootThreadTs: string,
+  ): SlackDelegationDestination {
+    const active = this.#active.get(activity.delegationId);
+    if (active !== undefined) {
+      if (
+        active.channelId !== activity.targetChannelId ||
+        active.rootThreadTs !== rootThreadTs ||
+        active.targetAgentId !== activity.targetAgentId
+      ) {
+        throw new Error(
+          `Delegation projection ${activity.delegationId} changed its Slack binding`,
+        );
+      }
+      return { channelId: active.channelId, rootThreadTs: active.rootThreadTs };
+    }
+    this.#activate(activity, rootThreadTs);
+    return { channelId: activity.targetChannelId, rootThreadTs };
+  }
+
+  #activate(
+    activity: Extract<DelegationActivity, { readonly type: "delegation.started" }>,
+    rootThreadTs: string,
+  ): void {
+    const projector = new SlackThreadProjector(
+      this.#client,
+      activity.targetChannelId,
+      rootThreadTs,
+      {
+        ...(activity.sourceSlackUserId === undefined
+          ? {}
+          : { sourceUserId: activity.sourceSlackUserId }),
+        presentation: presentationForChannel(
+          this.#presentations,
+          activity.targetChannelId,
+        ),
+        ...(this.#gitApprovalDetailsStore === undefined
+          ? {}
+          : { gitApprovalDetailsStore: this.#gitApprovalDetailsStore }),
+        ...(this.#choiceContinuationStore === undefined
+          ? {}
+          : { choiceContinuationStore: this.#choiceContinuationStore }),
+      },
+    );
+    projector.setSessionId(activity.targetSessionId);
+    this.#active.set(activity.delegationId, {
+      channelId: activity.targetChannelId,
+      rootThreadTs,
+      sourceAgentId: activity.sourceAgentId,
+      sourceChannelId: activity.sourceChannelId,
+      ...(activity.sourceRootThreadTs === undefined
+        ? {}
+        : { sourceRootThreadTs: activity.sourceRootThreadTs }),
+      targetAgentId: activity.targetAgentId,
+      projector,
+    });
   }
 
   #requireActive(delegationId: string): ActiveProjection {

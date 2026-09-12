@@ -194,6 +194,8 @@ export interface CommandApprovalRequest {
   command?: string | null;
   cwd?: string | null;
   commandActions?: unknown[] | null;
+  /** Exact command-prefix rule Codex proposes remembering. */
+  proposedExecpolicyAmendment?: readonly string[] | null;
   /** Ordered choices the App Server allows this client to present. */
   availableDecisions?: readonly unknown[] | null;
 }
@@ -210,6 +212,11 @@ export interface FileChangeApprovalRequest {
 export type CommandApprovalDecision =
   | "accept"
   | "acceptForSession"
+  | {
+      readonly acceptWithExecpolicyAmendment: {
+        readonly execpolicy_amendment: readonly string[];
+      };
+    }
   | "decline"
   | "cancel";
 
@@ -254,6 +261,14 @@ export interface ToolRequestUserInputResponse {
   readonly answers: Readonly<
     Record<string, { readonly answers: readonly string[] }>
   >;
+}
+
+export type McpServerElicitationAction = "accept" | "decline" | "cancel";
+
+export interface McpServerElicitationResponse {
+  readonly action: McpServerElicitationAction;
+  readonly content: CodexJsonValue | null;
+  readonly _meta: Readonly<Record<string, CodexJsonValue>> | null;
 }
 
 export class CodexRpcError extends Error {

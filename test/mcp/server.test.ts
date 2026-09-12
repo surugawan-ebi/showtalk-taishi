@@ -333,6 +333,7 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
       "agent.list",
       "agent.send",
       "agent.status",
+      "diagnostics.approval-probe",
       "gateway.restart",
       "internal.appops-pre-tool-use",
       "slack.post",
@@ -367,6 +368,21 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
   assert.match(
     tools.tools.find((tool) => tool.name === "slack.reply")?.description ?? "",
     /workspace-relative image or audio.*current originating Slack thread/u,
+  );
+  assert.match(
+    tools.tools.find((tool) => tool.name === "diagnostics.approval-probe")
+      ?.description ?? "",
+    /Read-only no-op.*changes no Gateway, Slack, repository, or production state/iu,
+  );
+  assert.deepEqual(
+    tools.tools.find((tool) => tool.name === "diagnostics.approval-probe")
+      ?.annotations,
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   );
   assert.match(
     tools.tools.find((tool) => tool.name === "gateway.restart")?.description ?? "",
@@ -410,6 +426,15 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
   });
   assert.equal(restarted.isError, undefined);
   assert.deepEqual(restarted.structuredContent, { status: "scheduled" });
+  const probed = await client.callTool({
+    name: "diagnostics.approval-probe",
+    arguments: { probe_id: "accept-1" },
+  });
+  assert.equal(probed.isError, undefined);
+  assert.deepEqual(probed.structuredContent, {
+    status: "executed",
+    probe_id: "accept-1",
+  });
   const hookDenied = await client.callTool({
     name: "internal.appops-pre-tool-use",
     arguments: {

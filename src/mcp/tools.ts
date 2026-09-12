@@ -3,6 +3,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
 
 import {
+  approvalProbeInputSchema,
+  approvalProbeOutputSchema,
   agentListInputSchema,
   agentListOutputSchema,
   agentSendInputSchema,
@@ -19,6 +21,7 @@ import {
   slackReplyInputSchema,
   slackWriteOutputSchema,
 } from "./schemas.js";
+import { SHOWTALK_APPROVAL_PROBE_TOOL } from "./tool-names.js";
 import {
   McpServiceError,
   type McpCallerContext,
@@ -32,7 +35,7 @@ export const MCP_SERVER_INSTRUCTIONS =
   "Stable internal tool names retain the agent.* prefix. agent.send visits another Koe directly through the ShowTalk Taishi Gateway. " +
   "agent.send is not a Codex internal subagent tool and must never be used to satisfy AGENTS.md subagent-delegation rules. " +
   "agent.list returns each configured target's canonical ID and optional operator-facing call_name. Use agent.send only for a returned ID or exact call_name and only within its consultation_scope; never infer an unlisted name or select an unrelated Koe because it is idle. " +
-  "For a user-requested sequence, delegate one bounded step at a time and continue from each result; delayed results resume the original request, while review/fix retries must be bounded. " +
+  "agent.send durably accepts work from a live Koe turn and normally returns queued immediately; do not resend that delegation ID. The final success or failure resumes the exact originating conversation. For a user-requested sequence, delegate one bounded step at a time and use the delayed results to continue; review/fix retries must be bounded. " +
   "Slack makes the channel visit visible but is never the Koe-to-Koe transport. " +
   "Git approval UI belongs to the Koe that prepared the operation and its originating Slack turn; never use agent.send or Slack write tools to relay, recreate, or move an approval to another Koe or channel. " +
   "slack.post and slack.reply can upload workspace-relative images and audio files from the authenticated Koe's workspace. " +
@@ -124,7 +127,7 @@ export function createAgentMcpServer(
     {
       title: "Talk to Another Koe",
       description:
-        "Talk directly to a configured consultation target through the Gateway using its canonical ID or exact call_name from agent.list. This creates a visible visit to another persistent Koe and Slack channel; it is not a Codex internal subagent. The request must stay within consultation_scope. Never infer an unlisted name. Never use this tool to display, relay, approve, or reconstruct a Git approval owned by the caller Koe.",
+        "Durably queue work for a configured consultation target through the Gateway using its canonical ID or exact call_name from agent.list. A live Koe call returns queued with a delegation_id; do not resend it. The target runs one turn at a time and the final success or failure resumes the exact originating conversation. This creates a visible visit to another persistent Koe and Slack channel; it is not a Codex internal subagent. The request must stay within consultation_scope. Never infer an unlisted name. Never use this tool to display, relay, approve, or reconstruct a Git approval owned by the caller Koe.",
       inputSchema: agentSendInputSchema,
       outputSchema: agentSendOutputSchema,
       annotations: {
@@ -148,6 +151,28 @@ export function createAgentMcpServer(
           message,
         ),
       ),
+  );
+
+  server.registerTool(
+    SHOWTALK_APPROVAL_PROBE_TOOL,
+    {
+      title: "Exercise MCP Approval Bridge",
+      description:
+        "Read-only no-op for live acceptance of Codex-native MCP approval. It returns the supplied non-secret probe ID and changes no Gateway, Slack, repository, or production state. Call only when a human explicitly requests this diagnostic.",
+      inputSchema: approvalProbeInputSchema,
+      outputSchema: approvalProbeOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ probe_id: probeId }) =>
+      executeTool(approvalProbeOutputSchema, () => ({
+        status: "executed",
+        probe_id: probeId,
+      })),
   );
 
   server.registerTool(

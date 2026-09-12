@@ -437,6 +437,13 @@ export class SlackFrontend {
     return this.#delegationProjector.project(activity);
   }
 
+  restoreDelegationProjection(
+    activity: Extract<DelegationActivity, { readonly type: "delegation.started" }>,
+    rootThreadTs: string,
+  ) {
+    return this.#delegationProjector.restore(activity, rootThreadTs);
+  }
+
   async projectDelegationContinuation(
     request: DelegationResultMessage,
     events: AsyncIterable<GatewayAgentEvent>,
@@ -736,12 +743,7 @@ export class SlackFrontend {
         const message =
           `Git承認をprivate stateへ記録できなかったため、このSlack承認要求を終了しました。${reason}` +
           " Git操作は承認されていません。必要なら最新状態で新しく依頼してください。";
-        const blocks = buildGitApprovalRecoveryBlocks(message, {
-          version: 1,
-          channelId: details.routing.channelId,
-          rootThreadTs: details.routing.rootThreadTs,
-          messageTs: details.routing.messageTs,
-        });
+        const blocks = buildGitApprovalRecoveryBlocks(message);
         await client.chat.update({
           channel: details.routing.channelId,
           ts: details.routing.messageTs,
@@ -1976,7 +1978,8 @@ export class SlackFrontend {
             ts: source.messageTs,
             text:
               `Git approval recovery instructions requested by <@${source.userId}>. ` +
-              "The previous operation remains unapproved and no turn was started.",
+              "The previous operation remains unapproved and no new turn was started. " +
+              "If the original turn is still running, its final response arrives separately.",
             blocks: [],
           });
           await client.chat.postEphemeral({
@@ -1985,7 +1988,8 @@ export class SlackFrontend {
             text:
               "古い承認カードからはターンを再開しません。対象のGit操作を" +
               "このスレッドへ新しいメッセージとして明記してください。Koeは最新状態を確認し、" +
-              "新しいexact planを作成してから承認画面を表示します。",
+              "新しいexact planを作成してから承認画面を表示します。" +
+              "元の依頼がまだ処理中の場合、その最終結果はこの案内とは別に届きます。",
             ...this.#presentation(routing.channelId),
           });
         } catch (error) {
@@ -2814,6 +2818,8 @@ function decisionLabel(decision: string): string {
       return "allowed once";
     case "allow_session":
       return "allowed for session";
+    case "allow_command_rule":
+      return "allowed for future matching commands";
     case "deny":
       return "denied";
     default:

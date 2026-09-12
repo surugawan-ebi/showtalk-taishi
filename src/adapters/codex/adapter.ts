@@ -30,6 +30,7 @@ import {
   type CodexTurn,
   type CommandApprovalDecision,
   type FileChangeApprovalDecision,
+  type McpServerElicitationResponse,
   type ModelListParams,
   type ModelListResponse,
   type PermissionsApprovalResponse,
@@ -154,7 +155,7 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "- If request_user_input returns WORKSPACE_GIT_AUTOMATION_BLOCKED, do not retry, switch to manual approval, or use another Git path in that turn. Report the fail-closed reason.",
   "- If the answer is `拒否・保留`, or revalidation is stale, mismatched, expired, rejected, already executed, or inconclusive, do not approve or execute and report the exact blocker.",
   "- Never use agent.send, slack.post, or slack.reply to ask another Koe or channel to display, relay, approve, or reconstruct a Git approval.",
-  "- If the exact plan is unbound, expired, or invalidated by a Gateway restart, inspect status and re-run the matching workspace-git plan-producing operation in this Koe's current turn before requesting approval. Never reconstruct authority from IDs or prose.",
+  "- If the exact plan is found unbound, expired, or invalidated by a Gateway restart before request_user_input is called, inspect status and re-run the matching workspace-git plan-producing operation in this Koe's current turn before requesting approval. Never reconstruct authority from IDs or prose.",
   "- get_git_operation_status never binds an approval plan, even when it reports awaiting_human_approval. Only a fresh plan-producing operation completion observed in this same turn can be approved.",
   "- If request_user_input reports REPREPARE_REQUIRED, do not call request_user_input again in that turn. Do not claim that approval is still available. End the turn; Slack may explain how the human can send a new explicit Git request, but must not restart one automatically.",
   "- Never claim that approval controls were displayed unless request_user_input is currently waiting for the human response. If a prepared plan is still awaiting approval, do not finish the turn with prose instead of opening that structured request.",
@@ -181,6 +182,7 @@ export interface CodexAppServer {
   respondToFileChangeApproval(id: RpcId, decision: FileChangeApprovalDecision): void;
   respondToPermissionsApproval(id: RpcId, response: PermissionsApprovalResponse): void;
   respondToUserInput(id: RpcId, response: ToolRequestUserInputResponse): void;
+  respondToMcpServerElicitation(id: RpcId, response: McpServerElicitationResponse): void;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onServerRequest(listener: (event: ServerRequestEvent) => void): () => void;
   onProtocolError(listener: (error: Error) => void): () => void;
@@ -193,10 +195,16 @@ interface PendingApproval {
   readonly method:
     | "item/commandExecution/requestApproval"
     | "item/fileChange/requestApproval"
-    | "item/permissions/requestApproval";
+    | "item/permissions/requestApproval"
+    | "mcpServer/elicitation/request";
   readonly sessionId: string;
   readonly requestedPermissions?: Readonly<Record<string, JsonValue>>;
   readonly availableDecisions?: readonly AgentApproval["decision"][];
+  /** Exact App Server decisions keyed by the protocol-neutral Slack choice. */
+  readonly commandDecisions?: ReadonlyMap<
+    AgentApproval["decision"],
+    CommandApprovalDecision
+  >;
   readonly expiresAt: number;
   readonly expirationTimer: NodeJS.Timeout;
 }
@@ -1278,7 +1286,14 @@ export class CodexAdapter implements AgentAdapter {
         `Approval decision is not available for this request: ${approval.decision}`,
       );
     }
-    const decision = mapApprovalDecision(approval.decision);
+    const decision =
+      pending.commandDecisions?.get(approval.decision) ??
+      mapApprovalDecision(approval.decision);
+    if (decision === undefined) {
+      throw new Error(
+        `Approval decision is not available for this request: ${approval.decision}`,
+      );
+    }
     try {
       this.#respondToPendingApproval(pending, decision);
     } finally {
@@ -1519,6 +1534,27 @@ export class CodexAdapter implements AgentAdapter {
       this.#handleUserInputRequest(serverRequest, sessionId, queue);
       return;
     }
+    const mcpToolApproval =
+      serverRequest.method === "mcpServer/elicitation/request"
+        ? parseMcpToolApprovalRequest(serverRequest.params)
+        : undefined;
+    if (
+      serverRequest.method === "mcpServer/elicitation/request" &&
+      mcpToolApproval === undefined
+    ) {
+      this.#client.respondToMcpServerElicitation(serverRequest.id, {
+        action: "cancel",
+        content: null,
+        _meta: null,
+      });
+      queue.push({
+        type: "error",
+        message:
+          "Codex requested an MCP elicitation that ShowTalk cannot safely render",
+        code: "UNSUPPORTED_MCP_ELICITATION",
+      });
+      return;
+    }
     if (!isApprovalMethod(serverRequest.method)) {
       this.#client.respondError(serverRequest.id, {
         code: -32601,
@@ -1533,15 +1569,24 @@ export class CodexAdapter implements AgentAdapter {
     }
 
     const requestId = `codex:${randomUUID()}`;
-    const availableDecisions = availableApprovalDecisions(
-      serverRequest.method,
-      serverRequest.params,
-    );
+    const commandApprovalOptions =
+      serverRequest.method === "item/commandExecution/requestApproval"
+        ? commandApprovalDecisionOptions(serverRequest.params)
+        : undefined;
+    const availableDecisions =
+      mcpToolApproval?.availableDecisions ??
+      commandApprovalOptions?.availableDecisions;
     if (availableDecisions !== undefined && availableDecisions.length === 0) {
       if (serverRequest.method === "item/commandExecution/requestApproval") {
         this.#client.respondToCommandApproval(serverRequest.id, "cancel");
       } else if (serverRequest.method === "item/fileChange/requestApproval") {
         this.#client.respondToFileChangeApproval(serverRequest.id, "cancel");
+      } else if (serverRequest.method === "mcpServer/elicitation/request") {
+        this.#client.respondToMcpServerElicitation(serverRequest.id, {
+          action: "cancel",
+          content: null,
+          _meta: null,
+        });
       } else {
         this.#client.respondToPermissionsApproval(serverRequest.id, {
           permissions: {},
@@ -1583,6 +1628,9 @@ export class CodexAdapter implements AgentAdapter {
         ? { requestedPermissions: requestedPermissions(serverRequest.params) }
         : {}),
       ...(availableDecisions === undefined ? {} : { availableDecisions }),
+      ...(commandApprovalOptions?.commandDecisions === undefined
+        ? {}
+        : { commandDecisions: commandApprovalOptions.commandDecisions }),
       expiresAt: Date.now() + this.#options.approvalTimeoutMs,
       expirationTimer,
     });
@@ -1595,12 +1643,24 @@ export class CodexAdapter implements AgentAdapter {
       type: "approval.requested",
       requestId,
       summary:
-        serverRequest.method === "item/commandExecution/requestApproval"
-          ? commandSummary(serverRequest.params, item)
+        mcpToolApproval !== undefined
+          ? mcpToolApproval.summary
+          : serverRequest.method === "item/commandExecution/requestApproval"
+          ? commandSummary(
+              serverRequest.params,
+              item,
+              commandApprovalOptions?.execPolicyAmendment,
+            )
           : serverRequest.method === "item/fileChange/requestApproval"
             ? fileChangeSummary(serverRequest.params, item)
             : permissionsSummary(serverRequest.params),
-      details: toJsonValue({ request: serverRequest.params, item: item ?? null }),
+      details:
+        mcpToolApproval === undefined
+          ? toJsonValue({ request: serverRequest.params, item: item ?? null })
+          : toJsonValue({
+              serverName: mcpToolApproval.serverName,
+              toolName: mcpToolApproval.toolName ?? null,
+            }),
       ...(availableDecisions === undefined ? {} : { availableDecisions }),
     });
   }
@@ -3345,20 +3405,35 @@ export class CodexAdapter implements AgentAdapter {
 
   #respondToPendingApproval(
     pending: PendingApproval,
-    decision: "accept" | "acceptForSession" | "decline" | "cancel",
+    decision: CommandApprovalDecision,
   ): void {
     if (pending.method === "item/commandExecution/requestApproval") {
       this.#client.respondToCommandApproval(pending.rpcId, decision);
-    } else if (pending.method === "item/fileChange/requestApproval") {
-      this.#client.respondToFileChangeApproval(pending.rpcId, decision);
+      return;
+    }
+    const simpleDecision = typeof decision === "string" ? decision : "cancel";
+    if (pending.method === "item/fileChange/requestApproval") {
+      this.#client.respondToFileChangeApproval(pending.rpcId, simpleDecision);
+    } else if (pending.method === "mcpServer/elicitation/request") {
+      this.#client.respondToMcpServerElicitation(pending.rpcId, {
+        action:
+          simpleDecision === "accept" || simpleDecision === "acceptForSession"
+            ? "accept"
+            : simpleDecision,
+        content: null,
+        _meta:
+          simpleDecision === "acceptForSession"
+            ? { persist: "session" }
+            : null,
+      });
     } else {
       const granted =
-        decision === "accept" || decision === "acceptForSession"
+        simpleDecision === "accept" || simpleDecision === "acceptForSession"
           ? pending.requestedPermissions ?? {}
           : {};
       this.#client.respondToPermissionsApproval(pending.rpcId, {
         permissions: granted,
-        scope: decision === "acceptForSession" ? "session" : "turn",
+        scope: simpleDecision === "acceptForSession" ? "session" : "turn",
       });
     }
   }
@@ -3592,9 +3667,10 @@ function gitApprovalBindingErrorMessage(error: unknown): string {
     "Do not call request_user_input again in this turn. " +
     "get_git_operation_status does not bind an approval plan. " +
     "Do not use agent.send or another Slack channel to recover this approval. " +
-    "In the Koe that owns the Git operation, inspect workspace-git status, " +
-    "re-run the matching workspace-git plan operation in the current turn, and then " +
-    "request the fixed structured approval again."
+    "End this turn without preparing or requesting another Git approval. " +
+    "The human must send a new explicit Git request to the Koe that owns the operation. " +
+    "Only in that new turn, inspect workspace-git status, re-run the matching " +
+    "workspace-git plan operation, and request the fixed structured approval."
   );
 }
 
@@ -3984,13 +4060,71 @@ function isApprovalMethod(
   return (
     method === "item/commandExecution/requestApproval" ||
     method === "item/fileChange/requestApproval" ||
-    method === "item/permissions/requestApproval"
+    method === "item/permissions/requestApproval" ||
+    method === "mcpServer/elicitation/request"
   );
+}
+
+interface McpToolApprovalRequest {
+  readonly serverName: string;
+  readonly toolName?: string;
+  readonly summary: string;
+  readonly availableDecisions: readonly AgentApproval["decision"][];
+}
+
+function parseMcpToolApprovalRequest(
+  params: unknown,
+): McpToolApprovalRequest | undefined {
+  const request = asRecord(params);
+  const meta = asRecord(request?._meta);
+  const schema = asRecord(request?.requestedSchema);
+  const properties = asRecord(schema?.properties);
+  if (
+    request?.mode !== "form" ||
+    typeof request.serverName !== "string" ||
+    request.serverName.trim().length === 0 ||
+    request.serverName.length > MAX_STRUCTURED_INPUT_ID_LENGTH ||
+    typeof request.message !== "string" ||
+    request.message.trim().length === 0 ||
+    request.message.length > 2_000 ||
+    meta?.codex_approval_kind !== "mcp_tool_call" ||
+    schema?.type !== "object" ||
+    properties === undefined ||
+    Object.keys(properties).length !== 0 ||
+    (schema.required !== undefined &&
+      (!Array.isArray(schema.required) || schema.required.length !== 0))
+  ) {
+    return undefined;
+  }
+  const toolName =
+    typeof meta.tool_name === "string" &&
+      meta.tool_name.trim().length > 0 &&
+      meta.tool_name.length <= MAX_STRUCTURED_INPUT_ID_LENGTH
+      ? meta.tool_name
+      : undefined;
+  const persist = meta.persist;
+  const supportsSession =
+    persist === "session" ||
+    (Array.isArray(persist) && persist.includes("session"));
+  const target = toolName === undefined
+    ? request.serverName
+    : `${request.serverName}.${toolName}`;
+  return {
+    serverName: request.serverName,
+    ...(toolName === undefined ? {} : { toolName }),
+    summary: `${request.message.trim()}\nMCP tool: ${target}`,
+    availableDecisions: Object.freeze([
+      "allow_once",
+      ...(supportsSession ? ["allow_session" as const] : []),
+      "cancel",
+    ]),
+  };
 }
 
 function commandSummary(
   params: unknown,
   item?: Record<string, unknown>,
+  execPolicyAmendment?: readonly string[],
 ): string {
   const record = asRecord(params);
   const network = asRecord(record?.networkApprovalContext);
@@ -4004,7 +4138,10 @@ function commandSummary(
       : typeof item?.command === "string"
         ? item.command
         : "command";
-  return `Codex requests permission to run: ${command}`;
+  const request = `Codex requests permission to run: ${command}`;
+  return execPolicyAmendment === undefined
+    ? request
+    : `Codex proposes this exact command rule for future requests: ${JSON.stringify(execPolicyAmendment)}\n${request}`;
 }
 
 function fileChangeSummary(
@@ -4093,12 +4230,14 @@ function delay(milliseconds: number): Promise<void> {
 
 function mapApprovalDecision(
   decision: AgentApproval["decision"],
-): "accept" | "acceptForSession" | "decline" | "cancel" {
+): FileChangeApprovalDecision | undefined {
   switch (decision) {
     case "allow_once":
       return "accept";
     case "allow_session":
       return "acceptForSession";
+    case "allow_command_rule":
+      return undefined;
     case "deny":
       return "decline";
     case "cancel":
@@ -4106,15 +4245,33 @@ function mapApprovalDecision(
   }
 }
 
-function availableApprovalDecisions(
-  method: PendingApproval["method"],
+interface CommandApprovalDecisionOptions {
+  readonly availableDecisions: readonly AgentApproval["decision"][];
+  readonly commandDecisions: ReadonlyMap<
+    AgentApproval["decision"],
+    CommandApprovalDecision
+  >;
+  readonly execPolicyAmendment?: readonly string[];
+}
+
+function commandApprovalDecisionOptions(
   params: unknown,
-): readonly AgentApproval["decision"][] | undefined {
-  if (method !== "item/commandExecution/requestApproval") return undefined;
+): CommandApprovalDecisionOptions | undefined {
   const raw = asRecord(params)?.availableDecisions;
   if (raw === undefined || raw === null) return undefined;
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) {
+    return {
+      availableDecisions: Object.freeze([]),
+      commandDecisions: new Map(),
+    };
+  }
   const decisions: AgentApproval["decision"][] = [];
+  const commandDecisions = new Map<
+    AgentApproval["decision"],
+    CommandApprovalDecision
+  >();
+  const amendmentCandidates = new Map<string, readonly string[]>();
+  let amendmentPosition: number | undefined;
   for (const decision of raw) {
     const mapped = decision === "accept"
       ? "allow_once"
@@ -4125,9 +4282,86 @@ function availableApprovalDecisions(
           : decision === "cancel"
             ? "cancel"
             : undefined;
-    if (mapped !== undefined && !decisions.includes(mapped)) decisions.push(mapped);
+    if (mapped !== undefined) {
+      if (!decisions.includes(mapped)) decisions.push(mapped);
+      commandDecisions.set(mapped, decision);
+      continue;
+    }
+    const amendment = parseExecPolicyAmendmentDecision(decision, params);
+    if (amendment === undefined) continue;
+    amendmentPosition ??= decisions.length;
+    amendmentCandidates.set(JSON.stringify(amendment), amendment);
   }
-  return Object.freeze(decisions);
+  let execPolicyAmendment: readonly string[] | undefined;
+  if (amendmentCandidates.size === 1) {
+    execPolicyAmendment = amendmentCandidates.values().next().value;
+    if (execPolicyAmendment !== undefined) {
+      const uiDecision = "allow_command_rule";
+      decisions.splice(amendmentPosition ?? decisions.length, 0, uiDecision);
+      commandDecisions.set(uiDecision, {
+        acceptWithExecpolicyAmendment: {
+          execpolicy_amendment: execPolicyAmendment,
+        },
+      });
+    }
+  }
+  return {
+    availableDecisions: Object.freeze(decisions),
+    commandDecisions,
+    ...(execPolicyAmendment === undefined ? {} : { execPolicyAmendment }),
+  };
+}
+
+function parseExecPolicyAmendmentDecision(
+  value: unknown,
+  params: unknown,
+): readonly string[] | undefined {
+  const decision = asRecord(value);
+  if (
+    decision === undefined ||
+    Object.keys(decision).length !== 1 ||
+    !("acceptWithExecpolicyAmendment" in decision)
+  ) {
+    return undefined;
+  }
+  const payload = asRecord(decision.acceptWithExecpolicyAmendment);
+  if (
+    payload === undefined ||
+    Object.keys(payload).length !== 1 ||
+    !("execpolicy_amendment" in payload)
+  ) {
+    return undefined;
+  }
+  const amendment = parseExecPolicyAmendment(payload.execpolicy_amendment);
+  if (amendment === undefined) return undefined;
+  const proposed = asRecord(params)?.proposedExecpolicyAmendment;
+  if (proposed !== undefined && proposed !== null) {
+    const parsedProposed = parseExecPolicyAmendment(proposed);
+    if (
+      parsedProposed === undefined ||
+      JSON.stringify(parsedProposed) !== JSON.stringify(amendment)
+    ) {
+      return undefined;
+    }
+  }
+  return amendment;
+}
+
+function parseExecPolicyAmendment(value: unknown): readonly string[] | undefined {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > 64 ||
+    value.some(
+      (part) =>
+        typeof part !== "string" || part.length === 0 || part.length > 512,
+    )
+  ) {
+    return undefined;
+  }
+  const amendment = value as string[];
+  if (JSON.stringify(amendment).length > 1_500) return undefined;
+  return Object.freeze([...amendment]);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

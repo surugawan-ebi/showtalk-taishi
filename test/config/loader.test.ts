@@ -54,6 +54,7 @@ test("loads config and expands environment references", async () => {
   assert.equal(config.agents.implementer?.workspace.path, "/tmp/project");
   assert.equal(config.adapters.codex?.approval_policy, undefined);
   assert.equal(config.adapters.codex?.approvals_reviewer, undefined);
+  assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, undefined);
   assert.equal(config.adapters.codex?.sandbox, undefined);
   assert.equal(config.agents.implementer?.adapter_session_id, undefined);
   assert.equal(config.agents.implementer?.consultations, undefined);
@@ -793,6 +794,66 @@ test("loads explicit Codex permission overrides", async () => {
   assert.equal(config.adapters.codex?.approval_policy, "never");
   assert.equal(config.adapters.codex?.approvals_reviewer, "auto_review");
   assert.equal(config.adapters.codex?.sandbox, "read-only");
+});
+
+test("loads the live acceptance MCP probe only with human approval routing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "    transport: stdio",
+      [
+        "    transport: stdio",
+        "    approval_policy: on-request",
+        "    approvals_reviewer: user",
+        "    live_acceptance_mcp_probe: true",
+      ].join("\n"),
+    ),
+  );
+  const config = await loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  });
+  assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, true);
+});
+
+test("rejects a live acceptance MCP probe without human approval routing", async () => {
+  const invalidOverrides = [
+    ["    live_acceptance_mcp_probe: true"],
+    [
+      "    approval_policy: never",
+      "    approvals_reviewer: user",
+      "    live_acceptance_mcp_probe: true",
+    ],
+    [
+      "    approval_policy: on-request",
+      "    approvals_reviewer: auto_review",
+      "    live_acceptance_mcp_probe: true",
+    ],
+  ];
+  for (const [index, override] of invalidOverrides.entries()) {
+    const directory = await mkdtemp(join(tmpdir(), `taishi-config-${index}-`));
+    const path = join(directory, "config.yaml");
+    await writeFile(
+      path,
+      source.replace(
+        "    transport: stdio",
+        ["    transport: stdio", ...override].join("\n"),
+      ),
+    );
+    await assert.rejects(
+      loadConfig(path, {
+        STATE_FILE: "/tmp/state.json",
+        APP_TOKEN: "xapp-test",
+        BOT_TOKEN: "xoxb-test",
+        WORKSPACE: "/tmp/project",
+      }),
+      /live_acceptance_mcp_probe requires/u,
+    );
+  }
 });
 
 test("loads a bounded per-Agent Slack display name and icon", async () => {

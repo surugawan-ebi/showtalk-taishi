@@ -1335,7 +1335,7 @@ export function renderAdminPage(csrfToken: string): string {
             <legend>承認</legend>
             <div class="field-grid">
               <div class="field field-wide">
-                <p class="field-help">自動進行とWorkspace Git自動運転は停止しました。選択肢、Git操作、外部操作はmanualで確認します。</p>
+                <p class="field-help">自動進行とWorkspace Git自動運転は停止しました。提示された通常選択肢、Git承認、外部操作の最終確認は人間が回答します。Slack MCP投稿はPermission Engineの実効ポリシーに従うため、allow設定または有効なsession grantでは承認カードを表示せず実行されます。</p>
               </div>
             </div>
             <div hidden aria-hidden="true">

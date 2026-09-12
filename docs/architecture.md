@@ -338,6 +338,10 @@ Pending plan mirrors, App Server RPC IDs,
 and Slack action request IDs are process-local and are deliberately absent from
 runtime state. A restart invalidates the card instead of reconstructing
 authority from stale state.
+When plan binding fails, Slack holds the inert recovery notice until the owned
+turn's final response has been projected. This ordering prevents guidance from
+looking like it started the original turn's later response; it does not extend
+or reconstruct approval authority.
 
 Non-Git structured questions are emitted as a distinct normalized event and
 use `waiting_for_input` rather than approval status. Multiple questions are
@@ -456,9 +460,13 @@ derives nested depth; models cannot submit or reset causation fields.
 deduplicates exact transport retries with the host MCP request identity,
 canonical arguments, and the current Gateway-owned turn. JSON-RPC IDs are
 client-local and may restart after a reconnect, so they are never treated as
-Koe-global identities. A busy target rejects concurrent independent work. v0.1
-also permits only one active turn per Koe identity so Agent-scoped MCP
-authentication cannot make the originating conversation ambiguous.
+Koe-global identities. Authenticated live calls are durably admitted as bounded
+jobs and return `queued`; one FIFO worker per target starts them only after the
+target's existing turn releases its lease. Parent jobs wait for queued child
+results and resume on their exact backend session before returning a final
+result. Taishi still permits only one active turn per Koe identity so
+Agent-scoped MCP authentication cannot make the originating conversation
+ambiguous.
 
 `gateway.restart` adds a narrower restart-spanning guard: after human approval,
 Taishi persists a TTL-bounded hash of the authenticated caller and exact host
@@ -603,7 +611,9 @@ Source Koe calls agent.send
 The user-facing form of this flow is called a **channel visit**. The source
 Koe posts the visit root in the target channel using the source channel's
 configured presentation. The target Koe's streamed response uses the target
-channel presentation in the same Slack thread. If the source call originated
+channel presentation in the same Slack thread. If that visit asks for a
+structured choice, Taishi mentions the authenticated user who originated the
+delegation chain and binds the controls to that user. If the source call originated
 from a live Slack turn, completion or failure is also posted back to that exact
 source Slack thread using the source presentation. The source Koe receives
 the response through MCP and produces its normal final answer there. When a

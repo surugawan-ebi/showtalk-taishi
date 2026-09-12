@@ -2,12 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_CODEX_GENERATED_IMAGE_FILES,
+  MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES,
   normalizeCodexDynamicToolImageCompletions,
   normalizeCodexImageGenerationCompletion,
 } from "../../../src/adapters/codex/image-generation.js";
 
 const ONE_PIXEL_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=";
+
+test("allows up to 30 generated images and 150 MiB per turn", () => {
+  assert.equal(MAX_CODEX_GENERATED_IMAGE_FILES, 30);
+  assert.equal(MAX_CODEX_GENERATED_IMAGE_TOTAL_BYTES, 150 * 1024 * 1024);
+});
 
 test("normalizes an App Server imageGeneration result without reading savedPath", async () => {
   const event = normalizeCodexImageGenerationCompletion({

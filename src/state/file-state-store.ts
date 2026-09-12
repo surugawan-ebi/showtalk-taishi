@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import type { CoreStateSnapshot } from "../core/index.js";
+import type { CoreStateSnapshot, QueuedDelegationJob } from "../core/index.js";
 import type { PersistedPermissionApprovalCard } from "../slack/permission-card-tracker.js";
 import type { PersistedWorkspaceGitAutonomyActivation } from "../approvals/workspace-git-autonomy-control.js";
 import {
@@ -48,6 +48,7 @@ export function emptyRuntimeState(): RuntimeState {
       primarySessions: [],
       handledDelegationResults: [],
       usedContinuationDelegations: [],
+      queuedDelegations: [],
       handledSlackEvents: [],
       pendingWorkspaceGitSystemRejections: [],
     },
@@ -299,6 +300,10 @@ function validateRuntimeState(value: unknown): RuntimeState {
         !core.usedContinuationDelegations.every(
           (item) => typeof item === "string" && item.trim().length > 0,
         ))) ||
+    (core.queuedDelegations !== undefined &&
+      (!Array.isArray(core.queuedDelegations) ||
+        core.queuedDelegations.length > 256 ||
+        !core.queuedDelegations.every(isQueuedDelegationJob))) ||
     (core.handledSlackEvents !== undefined &&
       (!Array.isArray(core.handledSlackEvents) ||
         core.handledSlackEvents.length > 10_000 ||
@@ -338,6 +343,94 @@ function validateRuntimeState(value: unknown): RuntimeState {
     throw new Error("Unsupported or corrupt ShowTalk Taishi runtime state");
   }
   return value as RuntimeState;
+}
+
+function isQueuedDelegationJob(value: unknown): value is QueuedDelegationJob {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const source = record.source;
+  const sourceValid =
+    source !== null &&
+    typeof source === "object" &&
+    !Array.isArray(source) &&
+    ((source as Record<string, unknown>).type === "slack" ||
+      (source as Record<string, unknown>).type === "job") &&
+    ["agentId", "sessionId", "adapterSessionId", "turnStartedAt"].every(
+      (key) => nonEmptyString((source as Record<string, unknown>)[key]),
+    ) &&
+    ((source as Record<string, unknown>).type !== "slack" ||
+      ["channelId", "rootThreadTs", "messageTs"].every((key) =>
+        nonEmptyString((source as Record<string, unknown>)[key]),
+      )) &&
+    ((source as Record<string, unknown>).type !== "job" ||
+      nonEmptyString((source as Record<string, unknown>).ownerJobId));
+  const stringFields = [
+    "id",
+    "requestKey",
+    "targetAgentId",
+    "targetAdapter",
+    "targetChannelId",
+    "targetConversationScope",
+    "consultationScope",
+    "message",
+    "createdAt",
+    "queueExpiresAt",
+    "updatedAt",
+  ];
+  return (
+    record.version === 1 &&
+    sourceValid &&
+    stringFields.every((key) => nonEmptyString(record[key])) &&
+    (record.targetConversationScope === "channel" ||
+      record.targetConversationScope === "slack_thread") &&
+    (record.permissionDecision === "allow" || record.permissionDecision === "approval") &&
+    Number.isSafeInteger(record.depth) &&
+    Number(record.depth) >= 1 &&
+    Number(record.depth) <= 32 &&
+    ["queued", "running", "waiting_for_children", "result_pending", "delivering"].includes(
+      String(record.state),
+    ) &&
+    Array.isArray(record.pendingChildIds) &&
+    record.pendingChildIds.every(nonEmptyString) &&
+    Array.isArray(record.childOutcomes) &&
+    record.childOutcomes.every(isQueuedDelegationChildOutcome) &&
+    (record.turnFailure === undefined || isQueuedDelegationOutcome(record.turnFailure)) &&
+    (record.sourceContinuationStarted === undefined ||
+      typeof record.sourceContinuationStarted === "boolean") &&
+    (record.outcome === undefined || isQueuedDelegationOutcome(record.outcome))
+  );
+}
+
+function isQueuedDelegationChildOutcome(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    nonEmptyString(record.childJobId) &&
+    nonEmptyString(record.targetAgentId) &&
+    Number.isSafeInteger(record.depth) &&
+    Number(record.depth) >= 1 &&
+    isQueuedDelegationOutcome(record.outcome)
+  );
+}
+
+function isQueuedDelegationOutcome(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    ["completed", "failed", "cancelled", "expired", "unknown"].includes(
+      String(record.status),
+    ) && nonEmptyString(record.text)
+  );
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isWorkspaceGitAutonomyRevisionState(value: unknown): boolean {

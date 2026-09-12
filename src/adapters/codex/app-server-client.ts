@@ -10,6 +10,7 @@ import {
   type CodexTurn,
   type CommandApprovalDecision,
   type FileChangeApprovalDecision,
+  type McpServerElicitationResponse,
   type ModelListParams,
   type ModelListResponse,
   type PermissionsApprovalResponse,
@@ -264,6 +265,13 @@ export class CodexAppServerClient {
   }
 
   respondToUserInput(id: RpcId, response: ToolRequestUserInputResponse): void {
+    this.respond(id, response);
+  }
+
+  respondToMcpServerElicitation(
+    id: RpcId,
+    response: McpServerElicitationResponse,
+  ): void {
     this.respond(id, response);
   }
 

@@ -1,4 +1,5 @@
 import type { JsonValue } from "../../core/index.js";
+import { SHOWTALK_APPROVAL_PROBE_TOOL } from "../../mcp/tool-names.js";
 import { APPOPS_EXECUTE_PRE_TOOL_USE_MATCHER } from
   "../../approvals/appops-approval-proof.js";
 
@@ -10,6 +11,10 @@ export interface CodexMcpConnection {
 export interface CodexAppOpsApprovalVerifierConfig {
   readonly publicKeyPem: string;
   readonly keyId: string;
+}
+
+export interface CodexMcpThreadConfigOptions {
+  readonly enableLiveAcceptanceProbe?: boolean;
 }
 
 /**
@@ -65,6 +70,7 @@ export function buildAppOpsApprovalHookConfig(): Readonly<Record<string, JsonVal
 export function buildCodexMcpThreadConfig(
   connection: CodexMcpConnection,
   appOpsApprovalVerifier?: CodexAppOpsApprovalVerifierConfig,
+  options: CodexMcpThreadConfigOptions = {},
 ): Readonly<Record<string, JsonValue>> {
   const url = new URL(connection.url);
   if (url.protocol !== "http:" || !isLoopback(url.hostname)) {
@@ -101,7 +107,21 @@ export function buildCodexMcpThreadConfig(
         startup_timeout_sec: 10,
         tool_timeout_sec: 3_600,
         default_tools_approval_mode: "auto",
-        disabled_tools: [APPOPS_APPROVAL_HOOK_TOOL],
+        ...(options.enableLiveAcceptanceProbe === true
+          ? {
+              tools: {
+                [SHOWTALK_APPROVAL_PROBE_TOOL]: {
+                  approval_mode: "prompt",
+                },
+              },
+            }
+          : {}),
+        disabled_tools: [
+          APPOPS_APPROVAL_HOOK_TOOL,
+          ...(options.enableLiveAcceptanceProbe === true
+            ? []
+            : [SHOWTALK_APPROVAL_PROBE_TOOL]),
+        ],
       },
     },
   };

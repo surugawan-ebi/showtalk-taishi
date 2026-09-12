@@ -4,6 +4,8 @@ export const GIT_APPROVAL_RECOVERY_ACTION_PREFIX = "taishi.git_recovery.";
 
 const MAX_SECTION_TEXT_LENGTH = 3_000;
 const RECOVERY_HEADING = "*このGit承認は古いカードから再開できません*\n";
+const RECOVERY_TRAILER =
+  "\n\n元の依頼がまだ処理中の場合、その最終結果はこの案内とは別に届きます。この案内が新しいターンを開始することはありません。";
 const MAX_TRACKED_RECOVERY_MESSAGES = 4_096;
 
 export type GitApprovalRecoveryDecision = "reprepare" | "hold";
@@ -37,9 +39,7 @@ export class GitApprovalRecoveryActionTracker {
 
 export function buildGitApprovalRecoveryBlocks(
   message: string,
-  value: GitApprovalRecoveryActionValue,
 ): KnownBlock[] {
-  const encoded = JSON.stringify(validateValue(value));
   return [
     {
       type: "section",
@@ -49,26 +49,11 @@ export function buildGitApprovalRecoveryBlocks(
           RECOVERY_HEADING +
           boundedEscapedSlackText(
             message,
-            MAX_SECTION_TEXT_LENGTH - RECOVERY_HEADING.length,
-          ),
+            MAX_SECTION_TEXT_LENGTH -
+              RECOVERY_HEADING.length -
+              RECOVERY_TRAILER.length,
+          ) + RECOVERY_TRAILER,
       },
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "新しい依頼方法を確認", emoji: true },
-          action_id: `${GIT_APPROVAL_RECOVERY_ACTION_PREFIX}reprepare`,
-          value: encoded,
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "保留", emoji: true },
-          action_id: `${GIT_APPROVAL_RECOVERY_ACTION_PREFIX}hold`,
-          value: encoded,
-        },
-      ],
     },
   ];
 }
@@ -117,12 +102,6 @@ export function parseGitApprovalRecoveryActionValue(
     rootThreadTs: record.rootThreadTs,
     messageTs: record.messageTs,
   };
-}
-
-function validateValue(
-  value: GitApprovalRecoveryActionValue,
-): GitApprovalRecoveryActionValue {
-  return parseGitApprovalRecoveryActionValue(JSON.stringify(value));
 }
 
 function countLiteralKey(value: string, key: string): number {

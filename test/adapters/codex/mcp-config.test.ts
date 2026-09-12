@@ -30,7 +30,10 @@ test("builds a required loopback MCP config that references, but never stores, t
         startup_timeout_sec: 10,
         tool_timeout_sec: 3600,
         default_tools_approval_mode: "auto",
-        disabled_tools: ["internal.appops-pre-tool-use"],
+        disabled_tools: [
+          "internal.appops-pre-tool-use",
+          "diagnostics.approval-probe",
+        ],
       },
     },
   });
@@ -51,6 +54,36 @@ test("builds a required loopback MCP config that references, but never stores, t
   assert.equal(SHOWTALK_CODE_MODE_ENABLED, false);
   assert.equal(APPOPS_APPROVAL_HOOK_TOOL, "internal.appops-pre-tool-use");
   assert.doesNotMatch(JSON.stringify(config), /secret-token/);
+});
+
+test("exposes only the no-op live acceptance probe with a per-tool prompt override", () => {
+  const config = buildCodexMcpThreadConfig(
+    {
+      url: "http://127.0.0.1:3210/mcp",
+      bearerTokenEnvVar: "SHOWTALK_TAISHI_MCP_TOKEN",
+    },
+    undefined,
+    { enableLiveAcceptanceProbe: true },
+  );
+  assert.deepEqual(
+    (config.mcp_servers as Record<string, Record<string, unknown>>)
+      .showtalk_taishi,
+    {
+      url: "http://127.0.0.1:3210/mcp",
+      bearer_token_env_var: "SHOWTALK_TAISHI_MCP_TOKEN",
+      enabled: true,
+      required: true,
+      startup_timeout_sec: 10,
+      tool_timeout_sec: 3600,
+      default_tools_approval_mode: "auto",
+      tools: {
+        "diagnostics.approval-probe": {
+          approval_mode: "prompt",
+        },
+      },
+      disabled_tools: ["internal.appops-pre-tool-use"],
+    },
+  );
 });
 
 test("rejects non-loopback endpoints and unsafe environment names", () => {

@@ -14,6 +14,7 @@ import {
   type AgentCapabilities,
   type AgentEvent,
   type AgentUserInputResponse,
+  type QueuedDelegationJob,
   type SendMessageRequest,
 } from "../../src/core/index.js";
 import { RuntimeMcpService, McpServiceError } from "../../src/mcp/index.js";
@@ -97,6 +98,98 @@ class SlowFakeAdapter extends FakeAdapter {
 
   finish(): void {
     this.#finish();
+  }
+}
+
+class MentionResultFakeAdapter extends FakeAdapter {
+  override async *sendMessage(
+    _session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    this.sendCalls += 1;
+    this.sentTexts.push(request.text);
+    yield {
+      type: "message.completed",
+      text: "Unsafe <!channel> and <@U123> must stay inert",
+    };
+    yield { type: "status.changed", status: "idle" };
+  }
+}
+
+class NestedQueueFakeAdapter extends FakeAdapter {
+  requestChild: (() => Promise<void>) | undefined;
+
+  override async *sendMessage(
+    session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    if (request.text === "Parent review") {
+      this.sendCalls += 1;
+      this.sentTexts.push(request.text);
+      await this.requestChild?.();
+      yield { type: "message.completed", text: "Child consultation accepted" };
+      yield { type: "status.changed", status: "idle" };
+      return;
+    }
+    if (request.text.includes("子Koeの遅延結果")) {
+      this.sendCalls += 1;
+      this.sentTexts.push(request.text);
+      yield { type: "message.completed", text: "Integrated child result" };
+      yield { type: "status.changed", status: "idle" };
+      return;
+    }
+    yield* super.sendMessage(session, request);
+  }
+}
+
+class FailingParentQueueFakeAdapter extends NestedQueueFakeAdapter {
+  override async *sendMessage(
+    session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    if (request.text === "Failing parent review") {
+      this.sendCalls += 1;
+      this.sentTexts.push(request.text);
+      await this.requestChild?.();
+      throw new Error("parent turn failed after accepting child");
+    }
+    yield* super.sendMessage(session, request);
+  }
+}
+
+class InterruptedParentQueueFakeAdapter extends NestedQueueFakeAdapter {
+  override async *sendMessage(
+    session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    if (request.text === "Interrupted parent review") {
+      this.sendCalls += 1;
+      this.sentTexts.push(request.text);
+      await this.requestChild?.();
+      yield { type: "status.changed", status: "interrupted" };
+      return;
+    }
+    yield* super.sendMessage(session, request);
+  }
+}
+
+class ChildCompletionRaceFakeAdapter extends NestedQueueFakeAdapter {
+  waitForChildDelivery: (() => Promise<void>) | undefined;
+
+  override async *sendMessage(
+    session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    if (request.text === "Race parent review") {
+      this.sendCalls += 1;
+      this.sentTexts.push(request.text);
+      await this.requestChild?.();
+      await this.waitForChildDelivery?.();
+      yield { type: "message.completed", text: "Parent observed delivered child" };
+      yield { type: "status.changed", status: "idle" };
+      return;
+    }
+    yield* super.sendMessage(session, request);
   }
 }
 
@@ -195,6 +288,7 @@ function setup(
     onRestartRequested?: () => void;
     adapter?: FakeAdapter;
     allowReviewerConsultation?: boolean;
+    allowSecurityConsultationFromReviewer?: boolean;
     implementerConversationScope?: "channel" | "slack_thread";
     reviewerConversationScope?: "channel" | "slack_thread";
     abortOnStartedProjection?: AbortController;
@@ -205,6 +299,10 @@ function setup(
     };
     runtimeInstanceId?: string;
     appOpsApprovalProofBroker?: AppOpsApprovalProofBroker;
+    prepareRegistry?: (registry: InMemoryAgentRegistry) => void;
+    onStateChanged?: () => Promise<void>;
+    continuationFails?: boolean;
+    replyFails?: boolean;
   } = {},
 ) {
   const registry = new InMemoryAgentRegistry();
@@ -234,6 +332,7 @@ function setup(
     adapter: "fake",
     channelId: "C3",
   });
+  options.prepareRegistry?.(registry);
   const adapter = options.adapter ?? new FakeAdapter();
   const router = new AgentRouter(registry, [adapter], {
     authorizeDelegation: () => "allow",
@@ -259,7 +358,12 @@ function setup(
             ? {}
             : { reviewer: { scope: "Review implementation changes" } },
       },
-      reviewer: { slack: { channel_id: "C2" } },
+      reviewer: {
+        slack: { channel_id: "C2" },
+        consultations: options.allowSecurityConsultationFromReviewer
+          ? { security: { scope: "Request a bounded security review" } }
+          : {},
+      },
       security: { slack: { channel_id: "C3" } },
     },
   );
@@ -283,12 +387,17 @@ function setup(
     ...(options.appOpsApprovalProofBroker === undefined
       ? {}
       : { appOpsApprovalProofBroker: options.appOpsApprovalProofBroker }),
+    ...(options.onStateChanged === undefined
+      ? {}
+      : { onStateChanged: options.onStateChanged }),
   });
   const posts: unknown[][] = [];
   const projected: unknown[] = [];
   const projectionAttempts: unknown[] = [];
   const continuations: unknown[] = [];
   const continuationEvents: unknown[] = [];
+  let continuationAttempts = 0;
+  let replyAttempts = 0;
   let projectionFailedOnce = false;
   service.attach(router, gateway, {
     postMessage: async (...values) => {
@@ -296,6 +405,8 @@ function setup(
       return "1710000000.000001";
     },
     reply: async (...values) => {
+      replyAttempts += 1;
+      if (options.replyFails) throw new Error("Slack raw reply unavailable");
       posts.push(values);
       return "1710000000.000002";
     },
@@ -319,7 +430,15 @@ function setup(
       }
       return undefined;
     },
+    restoreDelegationProjection: (activity, rootThreadTs) => ({
+      channelId: activity.targetChannelId,
+      rootThreadTs,
+    }),
     projectDelegationContinuation: async (request, events) => {
+      continuationAttempts += 1;
+      if (options.continuationFails) {
+        throw new Error("Source continuation unavailable");
+      }
       continuations.push(request);
       for await (const event of events) continuationEvents.push(event);
     },
@@ -333,6 +452,12 @@ function setup(
     projectionAttempts,
     continuations,
     continuationEvents,
+    get continuationAttempts() {
+      return continuationAttempts;
+    },
+    get replyAttempts() {
+      return replyAttempts;
+    },
     projectionErrors,
     restartRequests,
     approvals,
@@ -346,6 +471,85 @@ function context(agentId = "implementer", requestId?: string) {
     signal: new AbortController().signal,
     requestId: requestId ?? `test:${++requestSequence}`,
   } as const;
+}
+
+function bindActiveSource(
+  registry: InMemoryAgentRegistry,
+  options: {
+    continuationDelegationId?: string;
+    continuationDepth?: number;
+    slackUserId?: string;
+  } = {},
+): () => void {
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "running",
+    activeTurn: {
+      type: "slack",
+      channelId: "C1",
+      rootThreadTs: "1790000000.000001",
+      messageTs: "1790000000.000002",
+      ...(options.slackUserId === undefined
+        ? {}
+        : { slackUserId: options.slackUserId }),
+      ...(options.continuationDelegationId === undefined
+        ? {}
+        : {
+            continuationDelegationId: options.continuationDelegationId,
+            continuationDepth: options.continuationDepth ?? 1,
+          }),
+      startedAt: "2026-08-13T00:00:00.000Z",
+    },
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+  registry.bindConversation({
+    channelId: "C1",
+    rootThreadTs: "1790000000.000001",
+    agentId: "implementer",
+    sessionId: "source-session",
+  });
+  return registry.reserveAgentTurn("implementer");
+}
+
+function queuedSlackJob(
+  id: string,
+  message: string,
+  createdAt = "2026-08-13T00:00:00.000Z",
+): QueuedDelegationJob {
+  return {
+    version: 1,
+    id,
+    requestKey: `request-${id}`,
+    source: {
+      type: "slack",
+      agentId: "implementer",
+      channelId: "C1",
+      rootThreadTs: "1790000000.000001",
+      messageTs: "1790000000.000002",
+      sessionId: "source-session",
+      adapterSessionId: "source-thread",
+      turnStartedAt: createdAt,
+    },
+    targetAgentId: "reviewer",
+    targetAdapter: "fake",
+    targetChannelId: "C2",
+    targetConversationScope: "channel",
+    consultationScope: "Review implementation changes",
+    permissionDecision: "allow",
+    message,
+    depth: 1,
+    state: "queued",
+    pendingChildIds: [],
+    childOutcomes: [],
+    createdAt,
+    queueExpiresAt: "2099-08-13T00:30:00.000Z",
+    updatedAt: createdAt,
+  };
 }
 
 test("deduplicates one AppOps tool-use hook and blocks a new replay", () => {
@@ -392,7 +596,7 @@ test("deduplicates one AppOps tool-use hook and blocks a new replay", () => {
   assert.doesNotMatch(JSON.stringify(replay), /opaque-hook-proof/u);
 });
 
-test("routes agent.send directly and returns the final Agent response", async (t) => {
+test("accepts agent.send durably and continues the final result", async () => {
   const { service, registry, projected, continuations } = setup();
   registry.addSession({
     id: "source-session",
@@ -405,19 +609,27 @@ test("routes agent.send directly and returns the final Agent response", async (t
       channelId: "C1",
       rootThreadTs: "1710000000.000001",
       messageTs: "1710000000.000002",
+      slackUserId: "U123",
       startedAt: "2026-08-13T00:00:00.000Z",
     },
     createdAt: "2026-08-13T00:00:00.000Z",
     updatedAt: "2026-08-13T00:00:00.000Z",
   });
   registry.setPrimarySession("implementer", "source-session");
+  registry.bindConversation({
+    channelId: "C1",
+    rootThreadTs: "1710000000.000001",
+    agentId: "implementer",
+    sessionId: "source-session",
+  });
   const releaseTurn = registry.reserveAgentTurn("implementer");
-  t.after(releaseTurn);
   const result = await service.agentSend(context(), "reviewer", "Review this");
   assert.equal(result.target, "reviewer");
-  assert.equal(result.status, "completed");
-  assert.equal(result.message, "Looks good");
+  assert.equal(result.status, "queued");
+  assert.match(result.message ?? "", /再送は不要/u);
   assert.ok(result.delegation_id);
+  releaseTurn();
+  await service.waitForIdle();
   assert.deepEqual(
     projected.map((value) => (value as { type: string }).type),
     [
@@ -433,10 +645,901 @@ test("routes agent.send directly and returns the final Agent response", async (t
       (value) =>
         (value as { sourceChannelId?: string }).sourceChannelId === "C1" &&
         (value as { sourceRootThreadTs?: string }).sourceRootThreadTs ===
-          "1710000000.000001",
+          "1710000000.000001" &&
+        (value as { sourceSlackUserId?: string }).sourceSlackUserId === "U123",
     ),
   );
+  assert.equal(continuations.length, 1);
+  assert.match(
+    String((continuations[0] as { result?: string }).result),
+    /Looks good/u,
+  );
+});
+
+test("queues behind a busy Koe and runs exactly once after it becomes idle", async () => {
+  const { service, registry, adapter, continuations } = setup();
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "running",
+    activeTurn: {
+      type: "slack",
+      channelId: "C1",
+      rootThreadTs: "1710000000.000010",
+      messageTs: "1710000000.000011",
+      startedAt: "2026-08-13T00:00:00.000Z",
+    },
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+  registry.bindConversation({
+    channelId: "C1",
+    rootThreadTs: "1710000000.000010",
+    agentId: "implementer",
+    sessionId: "source-session",
+  });
+  const releaseSource = registry.reserveAgentTurn("implementer");
+  const releaseTarget = registry.reserveAgentTurn("reviewer");
+
+  const accepted = await service.agentSend(
+    context("implementer", "busy-queue-1"),
+    "reviewer",
+    "Review after busy",
+  );
+  assert.equal(accepted.status, "queued");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(adapter.sentTexts.includes("Review after busy"), false);
+
+  releaseTarget();
+  releaseSource();
+  await service.waitForIdle();
+  assert.equal(
+    adapter.sentTexts.filter((text) => text === "Review after busy").length,
+    1,
+  );
+  assert.equal(continuations.length, 1);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("preserves insertion-order FIFO when accepted jobs share one timestamp", async () => {
+  const now = "2026-08-13T00:00:00.000Z";
+  const { service, adapter } = setup({
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-thread" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1790000000.000001",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.replaceQueuedDelegations([
+        queuedSlackJob("z-first", "First at same timestamp", now),
+        queuedSlackJob("a-second", "Second at same timestamp", now),
+      ]);
+    },
+  });
+
+  await service.waitForIdle();
+  assert.ok(
+    adapter.sentTexts.indexOf("First at same timestamp") <
+      adapter.sentTexts.indexOf("Second at same timestamp"),
+  );
+});
+
+test("waits for nested queued children before returning the parent result", async () => {
+  const adapter = new NestedQueueFakeAdapter();
+  const { service, registry, continuations, projected } = setup({
+    adapter,
+    allowSecurityConsultationFromReviewer: true,
+    reviewerConversationScope: "slack_thread",
+  });
+  registry.addSession({
+    id: "source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "source-thread" },
+    status: "running",
+    activeTurn: {
+      type: "slack",
+      channelId: "C1",
+      rootThreadTs: "1710000000.000020",
+      messageTs: "1710000000.000021",
+      slackUserId: "U123",
+      startedAt: "2026-08-13T00:00:00.000Z",
+    },
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+  });
+  registry.setPrimarySession("implementer", "source-session");
+  registry.bindConversation({
+    channelId: "C1",
+    rootThreadTs: "1710000000.000020",
+    agentId: "implementer",
+    sessionId: "source-session",
+  });
+  const releaseSource = registry.reserveAgentTurn("implementer");
+  adapter.requestChild = async () => {
+    const child = await service.agentSend(
+      context("reviewer", "nested-child-1"),
+      "security",
+      "Child review",
+    );
+    assert.equal(child.status, "queued");
+  };
+
+  const parent = await service.agentSend(
+    context("implementer", "nested-parent-1"),
+    "reviewer",
+    "Parent review",
+  );
+  assert.equal(parent.status, "queued");
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.equal(continuations.length, 1);
+  assert.equal(
+    (continuations[0] as { delegationId?: string }).delegationId,
+    parent.delegation_id,
+  );
+  assert.match(
+    String((continuations[0] as { result?: string }).result),
+    /Integrated child result/u,
+  );
+  assert.doesNotMatch(
+    String((continuations[0] as { result?: string }).result),
+    /Child consultation accepted/u,
+  );
+  assert.equal(adapter.sentTexts.filter((text) => text === "Child review").length, 1);
+  assert.ok(adapter.sentTexts.some((text) => text.includes("子Koeの遅延結果")));
+  assert.ok(
+    projected
+      .filter((value) => (value as { type?: string }).type === "delegation.started")
+      .every(
+        (value) =>
+          (value as { sourceSlackUserId?: string }).sourceSlackUserId === "U123",
+      ),
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("atomically continues a parent when its child finishes before the parent turn", async () => {
+  const adapter = new ChildCompletionRaceFakeAdapter();
+  const { service, registry, continuations } = setup({
+    adapter,
+    allowSecurityConsultationFromReviewer: true,
+    reviewerConversationScope: "slack_thread",
+  });
+  const releaseSource = bindActiveSource(registry);
+  adapter.requestChild = async () => {
+    await service.agentSend(
+      context("reviewer", "race-child"),
+      "security",
+      "Child review",
+    );
+  };
+  adapter.waitForChildDelivery = async () => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const parent = registry.listQueuedDelegations("reviewer")[0];
+      if ((parent?.childOutcomes.length ?? 0) > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error("child outcome was not delivered to the running parent");
+  };
+
+  await service.agentSend(
+    context("implementer", "race-parent"),
+    "reviewer",
+    "Race parent review",
+  );
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.equal(continuations.length, 1);
+  assert.ok(adapter.sentTexts.some((text) => text.includes("子Koeの遅延結果")));
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("retains children and resumes safely when a parent turn fails", async () => {
+  const adapter = new FailingParentQueueFakeAdapter();
+  const { service, registry, continuations } = setup({
+    adapter,
+    allowSecurityConsultationFromReviewer: true,
+    reviewerConversationScope: "slack_thread",
+  });
+  const releaseSource = bindActiveSource(registry);
+  adapter.requestChild = async () => {
+    await service.agentSend(
+      context("reviewer", "failing-parent-child"),
+      "security",
+      "Child review",
+    );
+  };
+
+  await service.agentSend(
+    context("implementer", "failing-parent"),
+    "reviewer",
+    "Failing parent review",
+  );
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.equal(continuations.length, 1);
+  assert.ok(
+    adapter.sentTexts.some(
+      (text) =>
+        text.includes("子Koeの遅延結果") &&
+        text.includes("parent turn failed after accepting child"),
+    ),
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("does not report an interrupted parent with a pending child as completed", async () => {
+  const adapter = new InterruptedParentQueueFakeAdapter();
+  const { service, registry, continuations } = setup({
+    adapter,
+    allowSecurityConsultationFromReviewer: true,
+    reviewerConversationScope: "slack_thread",
+  });
+  const releaseSource = bindActiveSource(registry);
+  adapter.requestChild = async () => {
+    await service.agentSend(
+      context("reviewer", "interrupted-parent-child"),
+      "security",
+      "Child review",
+    );
+  };
+
+  await service.agentSend(
+    context("implementer", "interrupted-parent"),
+    "reviewer",
+    "Interrupted parent review",
+  );
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.equal(continuations.length, 1);
+  assert.match(
+    String((continuations[0] as { result?: string }).result),
+    /cancelled.*interrupted.*Child Koe results were preserved/ui,
+  );
+  assert.equal(
+    adapter.sentTexts.filter((text) => text.includes("子Koeの遅延結果")).length,
+    0,
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("allows target work to continue while source-result delivery is waiting", async () => {
+  const { service, registry, adapter } = setup();
+  const releaseSource = bindActiveSource(registry);
+
+  await service.agentSend(
+    context("implementer", "head-of-line-first"),
+    "reviewer",
+    "First independent review",
+  );
+  await service.agentSend(
+    context("implementer", "head-of-line-second"),
+    "reviewer",
+    "Second independent review",
+  );
+  for (let attempt = 0; attempt < 100 && adapter.sentTexts.length < 2; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  assert.deepEqual(adapter.sentTexts.slice(0, 2), [
+    "First independent review",
+    "Second independent review",
+  ]);
+  releaseSource();
+  await service.waitForIdle();
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("consumes one delayed continuation atomically under parallel sends", async () => {
+  const { service, registry } = setup();
+  const releaseSource = bindActiveSource(registry, {
+    continuationDelegationId: "prior-result",
+    continuationDepth: 1,
+  });
+
+  const results = await Promise.allSettled([
+    service.agentSend(
+      context("implementer", "parallel-continuation-a"),
+      "reviewer",
+      "First next step",
+    ),
+    service.agentSend(
+      context("implementer", "parallel-continuation-b"),
+      "reviewer",
+      "Second next step",
+    ),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  const rejection = results.find((result) => result.status === "rejected");
+  assert.ok(rejection?.status === "rejected");
+  assert.ok(
+    rejection.reason instanceof McpServiceError &&
+      rejection.reason.code === "DELEGATION_CONTINUATION_ALREADY_USED",
+  );
+  assert.equal(registry.listQueuedDelegations().length, 1);
+
+  releaseSource();
+  await service.waitForIdle();
+});
+
+test("bounds failed source delivery without blocking later target work", async () => {
+  const harness = setup({ continuationFails: true, replyFails: true });
+  const releaseSource = bindActiveSource(harness.registry);
+
+  await harness.service.agentSend(
+    context("implementer", "delivery-failure-first"),
+    "reviewer",
+    "First delivery failure",
+  );
+  await harness.service.waitForIdle();
+  assert.equal(harness.continuationAttempts, 1);
+  assert.equal(harness.replyAttempts, 1);
+  assert.equal(harness.registry.listQueuedDelegations()[0]?.state, "result_pending");
+
+  await harness.service.agentSend(
+    context("implementer", "delivery-failure-second"),
+    "reviewer",
+    "Second still executes",
+  );
+  await harness.service.waitForIdle();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(
+    harness.adapter.sentTexts.filter((text) => text === "Second still executes").length,
+    1,
+  );
+  assert.equal(harness.continuationAttempts, 2);
+  assert.equal(harness.replyAttempts, 2);
+  assert.equal(harness.registry.listQueuedDelegations().length, 2);
+  assert.deepEqual(harness.service.agentStatus(context(), "reviewer"), {
+    agent_id: "reviewer",
+    status: "idle",
+    session_id: harness.registry.getPrimarySession("reviewer")?.id,
+    queue_status: "blocked",
+    queued_delegations: 2,
+    pending_deliveries: 2,
+  });
+  releaseSource();
+});
+
+test("escapes Slack mentions in the raw saved-result fallback", async () => {
+  const harness = setup({
+    adapter: new MentionResultFakeAdapter(),
+    continuationFails: true,
+  });
+  const releaseSource = bindActiveSource(harness.registry);
+
+  await harness.service.agentSend(
+    context("implementer", "raw-mention-fallback"),
+    "reviewer",
+    "Return mention-like text",
+  );
+  releaseSource();
+  await harness.service.waitForIdle();
+
+  const rawReply = String(harness.posts.at(-1)?.[2]);
+  assert.doesNotMatch(rawReply, /<!channel>|<@U123>/u);
+  assert.match(rawReply, /&lt;!channel&gt;.*&lt;@U123&gt;/u);
+  assert.deepEqual(harness.registry.listQueuedDelegations(), []);
+});
+
+test("revalidates the source binding after waiting for the target lease", async () => {
+  const { service, registry, adapter, posts } = setup();
+  const releaseSource = bindActiveSource(registry);
+  const releaseTarget = registry.reserveAgentTurn("reviewer");
+
+  await service.agentSend(
+    context("implementer", "binding-changed-while-waiting"),
+    "reviewer",
+    "Must not run after source rebind",
+  );
+  registry.addSession({
+    id: "replacement-source-session",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "replacement-source-thread" },
+    status: "idle",
+    createdAt: "2026-08-13T00:01:00.000Z",
+    updatedAt: "2026-08-13T00:01:00.000Z",
+  });
+  registry.replaceConversation({
+    channelId: "C1",
+    rootThreadTs: "1790000000.000001",
+    agentId: "implementer",
+    sessionId: "replacement-source-session",
+  });
+  registry.setPrimarySession("implementer", "replacement-source-session");
+  releaseTarget();
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.equal(adapter.sentTexts.includes("Must not run after source rebind"), false);
+  assert.match(String(posts.at(-1)?.[2]), /source Slack conversation changed/u);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("rejects a recovered queued continuation after its target backend changes", async () => {
+  const now = "2026-08-13T00:00:00.000Z";
+  const { service, registry, adapter, continuations } = setup({
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-backend" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1710000000.000070",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.addSession({
+        id: "target-session",
+        agentId: "reviewer",
+        adapter: "fake",
+        adapterSession: { id: "replacement-backend" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("reviewer", "target-session");
+      prepared.replaceQueuedDelegations([{
+        version: 1,
+        id: "recovered-target-rebind",
+        requestKey: "recovered-target-rebind-request",
+        source: {
+          type: "slack",
+          agentId: "implementer",
+          channelId: "C1",
+          rootThreadTs: "1710000000.000070",
+          messageTs: "1710000000.000071",
+          sessionId: "source-session",
+          adapterSessionId: "source-backend",
+          turnStartedAt: now,
+        },
+        targetAgentId: "reviewer",
+        targetAdapter: "fake",
+        targetChannelId: "C2",
+        targetConversationScope: "channel",
+        consultationScope: "Review implementation changes",
+        permissionDecision: "allow",
+        message: "saved sensitive child result",
+        depth: 1,
+        state: "queued",
+        pendingChildIds: [],
+        childOutcomes: [],
+        targetSessionId: "target-session",
+        targetAdapterSessionId: "original-backend",
+        createdAt: now,
+        queueExpiresAt: "2099-08-13T00:30:00.000Z",
+        updatedAt: now,
+      }]);
+    },
+  });
+
+  await service.waitForIdle();
+
+  assert.equal(adapter.sentTexts.includes("saved sensitive child result"), false);
+  assert.match(
+    String((continuations.at(-1) as { result?: string } | undefined)?.result),
+    /target session binding changed/u,
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("persists a completed outcome before a transient terminal projection failure", async () => {
+  const { service, registry, adapter, continuations } = setup({
+    projectionFailsOnceOn: "delegation.completed",
+  });
+  const releaseSource = bindActiveSource(registry);
+
+  await service.agentSend(
+    context("implementer", "terminal-projection-failure"),
+    "reviewer",
+    "Finish despite terminal projection failure",
+  );
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.equal(adapter.sendCalls, 2);
+  assert.equal(continuations.length, 1);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("does not acknowledge or execute a queue entry when persistence fails", async () => {
+  let persistCalls = 0;
+  const { service, registry, adapter } = setup({
+    onStateChanged: async () => {
+      persistCalls += 1;
+      throw new Error("state unavailable");
+    },
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-thread" },
+        status: "running",
+        activeTurn: {
+          type: "slack",
+          channelId: "C1",
+          rootThreadTs: "1710000000.000030",
+          messageTs: "1710000000.000031",
+          startedAt: "2026-08-13T00:00:00.000Z",
+        },
+        createdAt: "2026-08-13T00:00:00.000Z",
+        updatedAt: "2026-08-13T00:00:00.000Z",
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1710000000.000030",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.reserveAgentTurn("implementer");
+    },
+  });
+
+  await assert.rejects(
+    () => service.agentSend(
+      context("implementer", "persist-failure-1"),
+      "reviewer",
+      "Must not run",
+    ),
+    /state unavailable/u,
+  );
+  assert.equal(persistCalls, 1);
+  assert.equal(adapter.sentTexts.includes("Must not run"), false);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("does not hot-loop a target worker after post-acceptance persistence failure", async () => {
+  let failWrites = false;
+  let writeAttempts = 0;
+  const { service, registry, adapter, projectionErrors } = setup({
+    onStateChanged: async () => {
+      writeAttempts += 1;
+      if (failWrites) throw new Error("persistent queue storage unavailable");
+    },
+  });
+  const releaseSource = bindActiveSource(registry);
+  const releaseTarget = registry.reserveAgentTurn("reviewer");
+
+  await service.agentSend(
+    context("implementer", "worker-persistence-failure"),
+    "reviewer",
+    "Remain queued after persistence failure",
+  );
+  failWrites = true;
+  releaseTarget();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const attemptsAfterFailure = writeAttempts;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(writeAttempts, attemptsAfterFailure);
+  assert.equal(adapter.sentTexts.length, 0);
+  assert.equal(registry.listQueuedDelegations()[0]?.state, "queued");
+  assert.equal(projectionErrors.length, 1);
+  releaseSource();
+});
+
+test("reports a recovered running job as unknown without re-executing it", async () => {
+  const now = "2026-08-13T00:00:00.000Z";
+  const { service, registry, adapter, continuations } = setup({
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-thread" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1710000000.000040",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.replaceQueuedDelegations([{
+        version: 1,
+        id: "recovered-running-job",
+        requestKey: "recovered-request",
+        source: {
+          type: "slack",
+          agentId: "implementer",
+          channelId: "C1",
+          rootThreadTs: "1710000000.000040",
+          messageTs: "1710000000.000041",
+          sessionId: "source-session",
+          adapterSessionId: "source-thread",
+          turnStartedAt: now,
+        },
+        targetAgentId: "reviewer",
+        targetAdapter: "fake",
+        targetChannelId: "C2",
+        targetConversationScope: "channel",
+        consultationScope: "Review implementation changes",
+        permissionDecision: "allow",
+        message: "Potential side effect",
+        depth: 1,
+        state: "running",
+        pendingChildIds: [],
+        childOutcomes: [],
+        createdAt: now,
+        queueExpiresAt: "2099-08-13T00:30:00.000Z",
+        updatedAt: now,
+      }]);
+    },
+  });
+
+  await service.waitForIdle();
+  assert.equal(adapter.sentTexts.includes("Potential side effect"), false);
+  assert.equal(continuations.length, 1);
+  assert.match(
+    String((continuations[0] as { result?: string }).result),
+    /unknown/u,
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("does not re-execute a recovered running parent after its child completes", async () => {
+  const now = "2026-08-13T00:00:00.000Z";
+  const { service, registry, adapter, continuations } = setup({
+    allowSecurityConsultationFromReviewer: true,
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-thread" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1710000000.000045",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.addSession({
+        id: "parent-session",
+        agentId: "reviewer",
+        adapter: "fake",
+        adapterSession: { id: "parent-thread" },
+        status: "running",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("reviewer", "parent-session");
+      prepared.replaceQueuedDelegations([
+        {
+          version: 1,
+          id: "recovered-parent",
+          requestKey: "recovered-parent-request",
+          source: {
+            type: "slack",
+            agentId: "implementer",
+            channelId: "C1",
+            rootThreadTs: "1710000000.000045",
+            messageTs: "1710000000.000046",
+            sessionId: "source-session",
+            adapterSessionId: "source-thread",
+            turnStartedAt: now,
+          },
+          targetAgentId: "reviewer",
+          targetAdapter: "fake",
+          targetChannelId: "C2",
+          targetConversationScope: "channel",
+          consultationScope: "Review implementation changes",
+          permissionDecision: "allow",
+          message: "Parent may have side effects",
+          depth: 1,
+          state: "running",
+          pendingChildIds: ["recovered-child"],
+          childOutcomes: [],
+          targetSessionId: "parent-session",
+          targetAdapterSessionId: "parent-thread",
+          createdAt: now,
+          queueExpiresAt: "2099-08-13T00:30:00.000Z",
+          updatedAt: now,
+        },
+        {
+          version: 1,
+          id: "recovered-child",
+          requestKey: "recovered-child-request",
+          source: {
+            type: "job",
+            agentId: "reviewer",
+            ownerJobId: "recovered-parent",
+            sessionId: "parent-session",
+            adapterSessionId: "parent-thread",
+            turnStartedAt: now,
+          },
+          targetAgentId: "security",
+          targetAdapter: "fake",
+          targetChannelId: "C3",
+          targetConversationScope: "channel",
+          consultationScope: "Request a bounded security review",
+          permissionDecision: "allow",
+          message: "Recovered child work",
+          depth: 2,
+          causationParentId: "recovered-parent",
+          state: "queued",
+          pendingChildIds: [],
+          childOutcomes: [],
+          createdAt: now,
+          queueExpiresAt: "2099-08-13T00:30:00.000Z",
+          updatedAt: now,
+        },
+      ]);
+    },
+  });
+
+  await service.waitForIdle();
+  assert.equal(adapter.sentTexts.includes("Parent may have side effects"), false);
+  assert.equal(
+    adapter.sentTexts.filter((text) => text === "Recovered child work").length,
+    1,
+  );
+  assert.equal(continuations.length, 1);
+  assert.match(
+    String((continuations[0] as { result?: string }).result),
+    /unknown.*Child Koe results were preserved/u,
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("recovers a started source delivery through raw Slack output only", async () => {
+  const now = "2026-08-13T00:00:00.000Z";
+  const { service, registry, adapter, continuations, posts } = setup({
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-thread" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1710000000.000047",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.replaceQueuedDelegations([{
+        version: 1,
+        id: "recovered-delivery",
+        requestKey: "recovered-delivery-request",
+        source: {
+          type: "slack",
+          agentId: "implementer",
+          channelId: "C1",
+          rootThreadTs: "1710000000.000047",
+          messageTs: "1710000000.000048",
+          sessionId: "source-session",
+          adapterSessionId: "source-thread",
+          turnStartedAt: now,
+        },
+        targetAgentId: "reviewer",
+        targetAdapter: "fake",
+        targetChannelId: "C2",
+        targetConversationScope: "channel",
+        consultationScope: "Review implementation changes",
+        permissionDecision: "allow",
+        message: "Already completed work",
+        depth: 1,
+        state: "delivering",
+        pendingChildIds: [],
+        childOutcomes: [],
+        sourceContinuationStarted: true,
+        outcome: { status: "completed", text: "Saved completed result" },
+        createdAt: now,
+        queueExpiresAt: "2099-08-13T00:30:00.000Z",
+        updatedAt: now,
+      }]);
+    },
+  });
+
+  await service.waitForIdle();
+  assert.equal(adapter.sendCalls, 0);
   assert.equal(continuations.length, 0);
+  assert.equal(posts.length, 1);
+  assert.match(String(posts[0]?.[2]), /Saved completed result/u);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+});
+
+test("executes a certainly-unstarted queued job after runtime recovery", async () => {
+  const now = "2026-08-13T00:00:00.000Z";
+  const { service, registry, adapter, continuations } = setup({
+    prepareRegistry: (prepared) => {
+      prepared.addSession({
+        id: "source-session",
+        agentId: "implementer",
+        adapter: "fake",
+        adapterSession: { id: "source-thread" },
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+      });
+      prepared.setPrimarySession("implementer", "source-session");
+      prepared.bindConversation({
+        channelId: "C1",
+        rootThreadTs: "1710000000.000050",
+        agentId: "implementer",
+        sessionId: "source-session",
+      });
+      prepared.replaceQueuedDelegations([{
+        version: 1,
+        id: "recovered-queued-job",
+        requestKey: "recovered-queued-request",
+        source: {
+          type: "slack",
+          agentId: "implementer",
+          channelId: "C1",
+          rootThreadTs: "1710000000.000050",
+          messageTs: "1710000000.000051",
+          sessionId: "source-session",
+          adapterSessionId: "source-thread",
+          turnStartedAt: now,
+        },
+        targetAgentId: "reviewer",
+        targetAdapter: "fake",
+        targetChannelId: "C2",
+        targetConversationScope: "channel",
+        consultationScope: "Review implementation changes",
+        permissionDecision: "allow",
+        message: "Recovered safe review",
+        depth: 1,
+        state: "queued",
+        pendingChildIds: [],
+        childOutcomes: [],
+        createdAt: now,
+        queueExpiresAt: "2099-08-13T00:30:00.000Z",
+        updatedAt: now,
+      }]);
+    },
+  });
+
+  await service.waitForIdle();
+  assert.equal(
+    adapter.sentTexts.filter((text) => text === "Recovered safe review").length,
+    1,
+  );
+  assert.equal(continuations.length, 1);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
 });
 
 test("binds a thread-scoped Koe visit to its projected Slack root before execution", async () => {
@@ -462,7 +1565,7 @@ test("binds a thread-scoped Koe visit to its projected Slack root before executi
   );
 });
 
-test("captures agent.send return routing from an active thread-scoped source session", async (t) => {
+test("captures agent.send return routing from an active thread-scoped source session", async () => {
   const { service, registry, projected } = setup({
     implementerConversationScope: "slack_thread",
   });
@@ -489,9 +1592,10 @@ test("captures agent.send return routing from an active thread-scoped source ses
     sessionId: "source-thread-session",
   });
   const release = registry.reserveAgentTurn("implementer");
-  t.after(release);
 
   await service.agentSend(context(), "reviewer", "Review this request");
+  release();
+  await service.waitForIdle();
 
   assert.equal(registry.getPrimarySession("implementer"), undefined);
   assert.ok(
@@ -558,7 +1662,7 @@ test("rejects an unconfigured target before a permissive Router can send", async
   assert.deepEqual(projected, []);
 });
 
-test("continues a delayed agent.send result on the original Slack-bound Koe", async () => {
+test("keeps an accepted queued delegation after the source request aborts", async () => {
   const adapter = new SlowFakeAdapter();
   const {
     service,
@@ -584,6 +1688,12 @@ test("continues a delayed agent.send result on the original Slack-bound Koe", as
     updatedAt: "2026-08-13T00:00:00.000Z",
   });
   registry.setPrimarySession("implementer", "source-session");
+  registry.bindConversation({
+    channelId: "C1",
+    rootThreadTs: "1710000000.000001",
+    agentId: "implementer",
+    sessionId: "source-session",
+  });
   const releaseSourceTurn = registry.reserveAgentTurn("implementer");
   const controller = new AbortController();
   const requestId = "agent.send:slow:1";
@@ -592,7 +1702,8 @@ test("continues a delayed agent.send result on the original Slack-bound Koe", as
     signal: controller.signal,
     requestId,
   } as const;
-  const pending = service.agentSend(sendContext, "reviewer", "Slow review");
+  const accepted = await service.agentSend(sendContext, "reviewer", "Slow review");
+  assert.equal(accepted.status, "queued");
   await adapter.entered;
 
   registry.updateSessionStatus(
@@ -601,30 +1712,16 @@ test("continues a delayed agent.send result on the original Slack-bound Koe", as
     "2026-08-13T00:01:00.000Z",
   );
   controller.abort();
-  await assert.rejects(
-    pending,
-    (error) =>
-      error instanceof McpServiceError && error.code === "REQUEST_CANCELLED",
-  );
   assert.equal(service.isIdle(), false);
   const idle = service.waitForIdle();
   adapter.finish();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(continuations.length, 1);
-  assert.equal(continuationEvents.length, 0);
   releaseSourceTurn();
-
-  const result = await service.agentSend(
-    context("implementer", requestId),
-    "reviewer",
-    "Slow review",
-  );
-  assert.equal(result.message, "Slow review completed");
+  await idle;
   assert.equal(continuations.length, 1);
   const firstContinuation = continuations[0] as {
     readonly delegationId: string;
   };
-  assert.notEqual(result.delegation_id, firstContinuation.delegationId);
+  assert.equal(accepted.delegation_id, firstContinuation.delegationId);
   assert.deepEqual(continuations[0], {
     delegationId: firstContinuation.delegationId,
     sourceAgentId: "implementer",
@@ -645,23 +1742,14 @@ test("continues a delayed agent.send result on the original Slack-bound Koe", as
     ),
   );
   assert.equal(registry.getPrimarySession("implementer")?.id, "source-session");
-  assert.deepEqual(
-    await service.agentSend(
-      context("implementer", requestId),
-      "reviewer",
-      "Slow review",
-    ),
-    result,
-  );
   assert.equal(continuations.length, 1);
-  assert.equal(adapter.sendCalls, 3);
+  assert.equal(adapter.sendCalls, 2);
   assert.equal(adapter.interruptCalls, 0);
   assert.ok(
     adapter.sentTexts.some((text) =>
       /元依頼で明示された次のKoe工程.*一工程だけ/su.test(text),
     ),
   );
-  await idle;
   assert.equal(service.isIdle(), true);
 });
 
@@ -734,6 +1822,38 @@ test("rejects an invisible delegated Git approval instead of stranding the targe
     },
   ]);
   assert.equal(projectionErrors.length, 1);
+});
+
+test("rejects an invisible Git approval inside an accepted queued turn", async () => {
+  const adapter = new StructuredInputFakeAdapter();
+  const { service, registry, continuations, projectionErrors } = setup({
+    adapter,
+    projectionFailsOnceOn: "delegation.agent_event",
+  });
+  const releaseSource = bindActiveSource(registry);
+
+  const accepted = await service.agentSend(
+    context("implementer", "queued-invisible-git-input"),
+    "reviewer",
+    "Prepare safely in queue",
+  );
+  assert.equal(accepted.status, "queued");
+  releaseSource();
+  await service.waitForIdle();
+
+  assert.deepEqual(adapter.responses, [
+    {
+      requestId: "codex-input:11111111-1111-4111-8111-111111111111",
+      optionId: "reject",
+    },
+  ]);
+  assert.equal(projectionErrors.length >= 1, true);
+  assert.equal(continuations.length, 1);
+  assert.match(
+    String((continuations[0] as { result?: string }).result),
+    /failed.*Slack projection interrupted/u,
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
 });
 
 test("cancels an invisible delegated native approval instead of stranding the target turn", async () => {
@@ -1230,6 +2350,68 @@ test("binds a routing-free slack.reply to the caller's active originating thread
   }
 });
 
+test("applies allow-once approval to a routing-free message reply", async (t) => {
+  const { service, registry, posts, approvals } = setup({
+    ownChannelWrite: "approval",
+  });
+  let requestId: string | undefined;
+  approvals.setPresenter(async (request) => {
+    requestId = request.requestId;
+  });
+  const release = bindActiveSource(registry);
+  t.after(release);
+
+  const replying = service.slackReply(
+    context("implementer", "slack.reply:bound-message-allow-once:1"),
+    undefined,
+    undefined,
+    "Approved current-thread reply",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 0);
+
+  await approvals.resolve(requestId ?? "", "allow_once");
+  assert.deepEqual(await replying, {
+    channel: "C1",
+    ts: "1710000000.000002",
+    thread_ts: "1790000000.000001",
+  });
+  assert.deepEqual(posts, [[
+    "C1",
+    "1790000000.000001",
+    "Approved current-thread reply",
+  ]]);
+});
+
+test("keeps a routing-free message reply unposted after approval cancellation", async (t) => {
+  const { service, registry, posts, approvals } = setup({
+    ownChannelWrite: "approval",
+  });
+  let requestId: string | undefined;
+  approvals.setPresenter(async (request) => {
+    requestId = request.requestId;
+  });
+  const release = bindActiveSource(registry);
+  t.after(release);
+
+  const replying = service.slackReply(
+    context("implementer", "slack.reply:bound-message-cancel:1"),
+    undefined,
+    undefined,
+    "Cancelled current-thread reply",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 0);
+
+  await approvals.resolve(requestId ?? "", "cancel");
+  await assert.rejects(
+    replying,
+    (error) =>
+      error instanceof McpServiceError && error.code === "PERMISSION_DENIED",
+  );
+  assert.equal(posts.length, 0);
+});
+
 test("does not require approval for an attachment reply bound to the active originating thread", async (t) => {
   const workspace = await mkdtemp(join(tmpdir(), "taishi-mcp-bound-media-"));
   t.after(() => rm(workspace, { recursive: true, force: true }));
@@ -1361,7 +2543,7 @@ test("does not confuse reused client request IDs with different agent.send calls
   );
 });
 
-test("namespaces transport retries to the active Slack turn", async (t) => {
+test("namespaces transport retries to the active Slack turn", async () => {
   const { service, registry, adapter } = setup();
   registry.addSession({
     id: "source-session",
@@ -1373,6 +2555,12 @@ test("namespaces transport retries to the active Slack turn", async (t) => {
     updatedAt: "2026-08-21T00:00:00.000Z",
   });
   registry.setPrimarySession("implementer", "source-session");
+  registry.bindConversation({
+    channelId: "C1",
+    rootThreadTs: "1710000000.000001",
+    agentId: "implementer",
+    sessionId: "source-session",
+  });
 
   const request = context("implementer", "agent.send:number:7");
   const firstRelease = registry.reserveAgentTurn("implementer");
@@ -1393,7 +2581,6 @@ test("namespaces transport retries to the active Slack turn", async (t) => {
     "2026-08-21T00:01:00.000Z",
   );
   const secondRelease = registry.reserveAgentTurn("implementer");
-  t.after(secondRelease);
   registry.beginSessionTurn("source-session", {
     type: "slack",
     channelId: "C1",
@@ -1402,9 +2589,13 @@ test("namespaces transport retries to the active Slack turn", async (t) => {
     startedAt: "2026-08-21T00:01:01.000Z",
   }, "2026-08-21T00:01:01.000Z");
   await service.agentSend(request, "reviewer", "Review this");
+  secondRelease();
+  await service.waitForIdle();
 
-  assert.equal(adapter.sendCalls, 2);
-  assert.deepEqual(adapter.sentTexts, ["Review this", "Review this"]);
+  assert.equal(
+    adapter.sentTexts.filter((text) => text === "Review this").length,
+    2,
+  );
 });
 
 test("lists and reports configured Agent state while rejecting unknown callers", () => {

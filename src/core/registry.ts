@@ -9,10 +9,16 @@ import type {
   ConversationBinding,
   CoreStateSnapshot,
   PendingWorkspaceGitSystemRejection,
+  QueuedDelegationJob,
   SessionId,
   SlackChannelId,
   SlackRootThreadTs,
 } from "./types.js";
+
+const MAX_QUEUED_DELEGATIONS = 256;
+const MAX_QUEUED_DELEGATIONS_PER_TARGET = 32;
+const MAX_QUEUED_DELEGATION_PAYLOAD_BYTES = 1_048_576;
+const MAX_QUEUED_DELEGATION_STATE_BYTES = 32 * 1_048_576;
 
 function conversationKey(
   channelId: SlackChannelId,
@@ -62,12 +68,18 @@ export class InMemoryAgentRegistry {
   readonly #activeAgentTurnLeases = new Map<AgentId, symbol>();
   readonly #agentTurnWaiters = new Map<
     AgentId,
-    Array<(release: () => void) => void>
+    Array<{
+      readonly resolve: (release: () => void) => void;
+      readonly reject: (error: unknown) => void;
+      readonly signal?: AbortSignal;
+      readonly abort?: () => void;
+    }>
   >();
   readonly #idleWaiters = new Set<() => void>();
   readonly #activatedSessionIds = new Set<SessionId>();
   readonly #handledDelegationResults = new Set<string>();
   readonly #usedContinuationDelegations = new Set<string>();
+  readonly #queuedDelegations = new Map<string, QueuedDelegationJob>();
   readonly #handledSlackEvents = new Set<string>();
   readonly #pendingWorkspaceGitSystemRejections = new Map<
     string,
@@ -222,6 +234,180 @@ export class InMemoryAgentRegistry {
     this.#usedContinuationDelegations.delete(delegationId);
   }
 
+  listQueuedDelegations(targetAgentId?: AgentId): readonly QueuedDelegationJob[] {
+    const jobs = [...this.#queuedDelegations.values()];
+    return (targetAgentId === undefined
+      ? jobs
+      : jobs.filter((job) => job.targetAgentId === targetAgentId)
+    ).map((job) => structuredClone(job));
+  }
+
+  getQueuedDelegation(id: string): QueuedDelegationJob | undefined {
+    const job = this.#queuedDelegations.get(id);
+    return job === undefined ? undefined : structuredClone(job);
+  }
+
+  getQueuedDelegationByRequestKey(requestKey: string): QueuedDelegationJob | undefined {
+    const job = [...this.#queuedDelegations.values()].find(
+      (candidate) => candidate.requestKey === requestKey,
+    );
+    return job === undefined ? undefined : structuredClone(job);
+  }
+
+  /** Applies the stricter ingress budget only while accepting new work. */
+  assertQueuedDelegationAdmission(jobs: readonly QueuedDelegationJob[]): void {
+    assertQueueCountCapacity(jobs);
+    const payloadBytes = jobs.reduce(
+      (total, job) => total + new TextEncoder().encode(job.message).byteLength,
+      0,
+    );
+    if (payloadBytes > MAX_QUEUED_DELEGATION_PAYLOAD_BYTES) {
+      throw new CoreError(
+        "INVALID_STATE_SNAPSHOT",
+        "Queued delegation admission payload limit exceeded",
+      );
+    }
+  }
+
+  replaceQueuedDelegations(jobs: readonly QueuedDelegationJob[]): void {
+    assertQueueCapacity(jobs);
+    const replacement = new Map<string, QueuedDelegationJob>();
+    const requestKeys = new Set<string>();
+    for (const job of jobs) {
+      validateQueuedDelegation(job, this);
+      if (replacement.has(job.id) || requestKeys.has(job.requestKey)) {
+        throw new CoreError(
+          "INVALID_STATE_SNAPSHOT",
+          "Duplicate queued delegation identity",
+        );
+      }
+      replacement.set(job.id, structuredClone(job));
+      requestKeys.add(job.requestKey);
+    }
+    for (const job of replacement.values()) {
+      if (job.source.type !== "job") continue;
+      const parent = replacement.get(job.source.ownerJobId);
+      if (
+        parent === undefined ||
+        parent.targetAgentId !== job.source.agentId ||
+        !parent.pendingChildIds.includes(job.id)
+      ) {
+        throw new CoreError(
+          "INVALID_STATE_SNAPSHOT",
+          `Invalid parent binding for delegation job ${job.id}`,
+        );
+      }
+    }
+    for (const job of replacement.values()) {
+      for (const childId of job.pendingChildIds) {
+        const child = replacement.get(childId);
+        if (
+          child === undefined ||
+          child.source.type !== "job" ||
+          child.source.ownerJobId !== job.id
+        ) {
+          throw new CoreError(
+            "INVALID_STATE_SNAPSHOT",
+            `Invalid child binding for delegation job ${job.id}`,
+          );
+        }
+      }
+    }
+    for (const job of replacement.values()) {
+      const seen = new Set<string>();
+      let current: QueuedDelegationJob | undefined = job;
+      while (current?.source.type === "job") {
+        if (seen.has(current.id)) {
+          throw new CoreError(
+            "INVALID_STATE_SNAPSHOT",
+            "Delegation jobs contain a cyclic parent relationship",
+          );
+        }
+        seen.add(current.id);
+        current = replacement.get(current.source.ownerJobId);
+      }
+    }
+    this.#queuedDelegations.clear();
+    for (const [id, job] of replacement) this.#queuedDelegations.set(id, job);
+  }
+
+  enqueueQueuedDelegation(job: QueuedDelegationJob): void {
+    validateQueuedDelegation(job, this);
+    if (this.#queuedDelegations.has(job.id)) {
+      throw new CoreError(
+        "INVALID_STATE_SNAPSHOT",
+        `Delegation job ${job.id} already exists`,
+      );
+    }
+    if (
+      [...this.#queuedDelegations.values()].some(
+        (candidate) => candidate.requestKey === job.requestKey,
+      )
+    ) {
+      throw new CoreError(
+        "INVALID_STATE_SNAPSHOT",
+        `Delegation request ${job.requestKey} already exists`,
+      );
+    }
+    const admitted = [...this.#queuedDelegations.values(), job];
+    this.assertQueuedDelegationAdmission(admitted);
+    assertQueueCapacity(admitted);
+    if (job.source.type === "job") {
+      const parent = this.#queuedDelegations.get(job.source.ownerJobId);
+      if (parent === undefined) {
+        throw new CoreError(
+          "INVALID_STATE_SNAPSHOT",
+          `Parent delegation job ${job.source.ownerJobId} is unavailable`,
+        );
+      }
+      if (parent.targetAgentId !== job.source.agentId) {
+        throw new CoreError(
+          "INVALID_STATE_SNAPSHOT",
+          `Parent delegation job ${parent.id} does not belong to ${job.source.agentId}`,
+        );
+      }
+      if (parent.pendingChildIds.includes(job.id)) {
+        throw new CoreError(
+          "INVALID_STATE_SNAPSHOT",
+          `Parent delegation job ${parent.id} already owns child ${job.id}`,
+        );
+      }
+      this.#queuedDelegations.set(parent.id, {
+        ...parent,
+        pendingChildIds: [...parent.pendingChildIds, job.id],
+        updatedAt: job.updatedAt,
+      });
+    }
+    this.#queuedDelegations.set(job.id, structuredClone(job));
+  }
+
+  replaceQueuedDelegation(job: QueuedDelegationJob): void {
+    validateQueuedDelegation(job, this);
+    if (!this.#queuedDelegations.has(job.id)) {
+      throw new CoreError(
+        "INVALID_STATE_SNAPSHOT",
+        `Delegation job ${job.id} is unavailable`,
+      );
+    }
+    const replacement = [...this.#queuedDelegations.values()].map((candidate) =>
+      candidate.id === job.id ? job : candidate,
+    );
+    assertQueueCapacity(replacement);
+    this.#queuedDelegations.set(job.id, structuredClone(job));
+  }
+
+  removeQueuedDelegation(id: string): void {
+    const job = this.#queuedDelegations.get(id);
+    if (job === undefined) return;
+    if (job.pendingChildIds.length > 0) {
+      throw new CoreError(
+        "INVALID_STATE_SNAPSHOT",
+        `Delegation job ${id} still has pending children`,
+      );
+    }
+    this.#queuedDelegations.delete(id);
+  }
+
   hasHandledSlackEvent(eventId: string): boolean {
     return this.#handledSlackEvents.has(eventId);
   }
@@ -278,14 +464,42 @@ export class InMemoryAgentRegistry {
   }
 
   /** FIFO lease used by human messages so rapid Slack posts are not dropped. */
-  async waitForAgentTurn(agentId: AgentId): Promise<() => void> {
+  async waitForAgentTurn(
+    agentId: AgentId,
+    signal?: AbortSignal,
+  ): Promise<() => void> {
     this.requireAgent(agentId);
+    if (signal?.aborted === true) {
+      throw new CoreError("REQUEST_CANCELLED", `Turn wait for Agent ${agentId} was cancelled`);
+    }
     if (!this.#activeAgentTurnLeases.has(agentId)) {
       return this.#grantAgentTurn(agentId);
     }
-    return new Promise<() => void>((resolve) => {
+    return new Promise<() => void>((resolve, reject) => {
       const waiters = this.#agentTurnWaiters.get(agentId) ?? [];
-      waiters.push(resolve);
+      const waiter: {
+        readonly resolve: (release: () => void) => void;
+        readonly reject: (error: unknown) => void;
+        readonly signal?: AbortSignal;
+        abort?: () => void;
+      } = { resolve, reject, ...(signal === undefined ? {} : { signal }) };
+      if (signal !== undefined) {
+        waiter.abort = () => {
+          const current = this.#agentTurnWaiters.get(agentId);
+          const index = current?.indexOf(waiter) ?? -1;
+          if (index >= 0) current!.splice(index, 1);
+          if (current?.length === 0) this.#agentTurnWaiters.delete(agentId);
+          reject(
+            new CoreError(
+              "REQUEST_CANCELLED",
+              `Turn wait for Agent ${agentId} was cancelled`,
+            ),
+          );
+          this.#resolveIdleWaitersIfIdle();
+        };
+        signal.addEventListener("abort", waiter.abort, { once: true });
+      }
+      waiters.push(waiter);
       this.#agentTurnWaiters.set(agentId, waiters);
     });
   }
@@ -334,7 +548,10 @@ export class InMemoryAgentRegistry {
           this.#agentTurnWaiters.delete(agentId);
         }
         if (next !== undefined) {
-          next(this.#grantAgentTurn(agentId));
+          if (next.signal !== undefined && next.abort !== undefined) {
+            next.signal.removeEventListener("abort", next.abort);
+          }
+          next.resolve(this.#grantAgentTurn(agentId));
         } else {
           this.#resolveIdleWaitersIfIdle();
         }
@@ -591,6 +808,7 @@ export class InMemoryAgentRegistry {
       ),
       handledDelegationResults: [...this.#handledDelegationResults],
       usedContinuationDelegations: [...this.#usedContinuationDelegations],
+      queuedDelegations: this.listQueuedDelegations(),
       handledSlackEvents: [...this.#handledSlackEvents],
       pendingWorkspaceGitSystemRejections:
         this.listPendingWorkspaceGitSystemRejections(),
@@ -623,12 +841,131 @@ export class InMemoryAgentRegistry {
     for (const delegationId of snapshot.usedContinuationDelegations ?? []) {
       this.recordUsedContinuationDelegation(delegationId);
     }
+    this.replaceQueuedDelegations(snapshot.queuedDelegations ?? []);
     for (const eventId of snapshot.handledSlackEvents ?? []) {
       this.recordHandledSlackEvent(eventId);
     }
     this.replacePendingWorkspaceGitSystemRejections(
       snapshot.pendingWorkspaceGitSystemRejections ?? [],
     );
+  }
+}
+
+function assertQueueCapacity(jobs: readonly QueuedDelegationJob[]): void {
+  assertQueueCountCapacity(jobs);
+  const stateBytes = new TextEncoder().encode(JSON.stringify(jobs)).byteLength;
+  if (stateBytes > MAX_QUEUED_DELEGATION_STATE_BYTES) {
+    throw new CoreError(
+      "INVALID_STATE_SNAPSHOT",
+      "Queued delegation durable state limit exceeded",
+    );
+  }
+}
+
+function assertQueueCountCapacity(jobs: readonly QueuedDelegationJob[]): void {
+  if (jobs.length > MAX_QUEUED_DELEGATIONS) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Too many queued delegations");
+  }
+  const counts = new Map<string, number>();
+  for (const job of jobs) {
+    counts.set(job.targetAgentId, (counts.get(job.targetAgentId) ?? 0) + 1);
+  }
+  if ([...counts.values()].some((count) => count > MAX_QUEUED_DELEGATIONS_PER_TARGET)) {
+    throw new CoreError(
+      "INVALID_STATE_SNAPSHOT",
+      "Too many queued delegations for one Koe",
+    );
+  }
+}
+
+function validateQueuedDelegation(
+  job: QueuedDelegationJob,
+  registry: InMemoryAgentRegistry,
+): void {
+  const nonEmpty = [
+    job.id,
+    job.requestKey,
+    job.source.agentId,
+    job.source.sessionId,
+    job.source.adapterSessionId,
+    job.source.turnStartedAt,
+    job.targetAgentId,
+    job.targetAdapter,
+    job.targetChannelId,
+    job.targetConversationScope,
+    job.consultationScope,
+    job.message,
+    job.createdAt,
+    job.queueExpiresAt,
+    job.updatedAt,
+  ];
+  if (job.version !== 1 || nonEmpty.some((value) => value.trim().length === 0)) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid queued delegation");
+  }
+  if (!Number.isSafeInteger(job.depth) || job.depth < 1 || job.depth > 32) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation depth");
+  }
+  if (Number.isNaN(Date.parse(job.createdAt)) ||
+      Number.isNaN(Date.parse(job.queueExpiresAt)) ||
+      Number.isNaN(Date.parse(job.updatedAt))) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation timestamp");
+  }
+  const sourceAgent = registry.requireAgent(job.source.agentId);
+  registry.requireAgent(job.targetAgentId);
+  const sourceSession = registry.requireSession(job.source.sessionId);
+  if (
+    sourceSession.agentId !== sourceAgent.id ||
+    sourceSession.adapterSession.id !== job.source.adapterSessionId
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation source binding");
+  }
+  if (new Set(job.pendingChildIds).size !== job.pendingChildIds.length) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Duplicate pending child delegation");
+  }
+  const childOutcomeIds = job.childOutcomes.map((child) => child.childJobId);
+  if (
+    new Set(childOutcomeIds).size !== childOutcomeIds.length ||
+    childOutcomeIds.some((id) => job.pendingChildIds.includes(id))
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid child delegation outcomes");
+  }
+  const terminalPending = job.state === "result_pending" || job.state === "delivering";
+  if (
+    (terminalPending && job.outcome === undefined) ||
+    (!terminalPending && job.outcome !== undefined) ||
+    (job.outcome !== undefined && job.outcome.text.trim().length === 0)
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation outcome");
+  }
+  if (
+    (job.targetSessionId === undefined) !==
+      (job.targetAdapterSessionId === undefined) ||
+    (job.targetRootThreadTs !== undefined && job.targetSessionId === undefined)
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation target session");
+  }
+  if (
+    job.state === "waiting_for_children" &&
+    job.pendingChildIds.length === 0
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Delegation wait has no pending child");
+  }
+  if (job.resumeMessage !== undefined && job.state !== "queued") {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation resume input");
+  }
+  if (
+    job.turnFailure !== undefined &&
+    (job.turnFailure.text.trim().length === 0 ||
+      (job.state !== "waiting_for_children" && job.state !== "queued"))
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation turn failure");
+  }
+  if (
+    job.sourceContinuationStarted !== undefined &&
+    (job.source.type !== "slack" ||
+      (job.state !== "result_pending" && job.state !== "delivering"))
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid source delivery fence");
   }
 }
 

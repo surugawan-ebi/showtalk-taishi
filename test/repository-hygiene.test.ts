@@ -57,7 +57,7 @@ async function isIgnored(
   }
 }
 
-test("ignores generated admin override sidecars without hiding public files", async () => {
+test("ignores machine-local workbench files without hiding public files", async () => {
   const repository = await mkdtemp(join(tmpdir(), "showtalk-hygiene-"));
   try {
     const templateDirectory = join(repository, "empty-git-template");
@@ -77,6 +77,7 @@ test("ignores generated admin override sidecars without hiding public files", as
       "private/state/admin-config-overrides.v1.json",
       "private/state/admin-config-overrides.v1.json.lock",
       "private/state/.admin-config-overrides.1234.tmp",
+      "tmp/local-mcp-workspace/private-state.json",
     ]) {
       assert.equal(
         await isIgnored(repository, path, gitEnvironment),
@@ -89,6 +90,7 @@ test("ignores generated admin override sidecars without hiding public files", as
       "README.md",
       "examples/config.example.yaml",
       "src/config/schema.ts",
+      "src/tmp/example.ts",
       "test/fixtures/admin-config-overrides.v1.example.json",
     ]) {
       assert.equal(
