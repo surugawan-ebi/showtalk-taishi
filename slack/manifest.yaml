@@ -1,0 +1,33 @@
+_metadata:
+  major_version: 1
+
+display_information:
+  name: ShowTalk Taishi
+  description: A local-first switchboard for AI coding agents.
+  background_color: "#33235b"
+
+features:
+  bot_user:
+    display_name: Taishi
+    always_online: false
+
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - channels:read
+      - chat:write
+      - chat:write.customize
+      - files:read
+      - files:write
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+  interactivity:
+    is_enabled: true
+  is_hosted: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

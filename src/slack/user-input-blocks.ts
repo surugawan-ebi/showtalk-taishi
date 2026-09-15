@@ -1,0 +1,826 @@
+import type { KnownBlock } from "@slack/types";
+
+import type {
+  AgentGitApprovalInputResponse,
+  WorkspaceGitApprovalPlan,
+} from "../core/index.js";
+
+export const USER_INPUT_ACTION_PREFIX = "taishi.git_plan.";
+export const USER_INPUT_PATH_ACTION_PREFIX = `${USER_INPUT_ACTION_PREFIX}paths.`;
+export const USER_INPUT_BODY_ACTION_PREFIX = `${USER_INPUT_ACTION_PREFIX}body.`;
+
+const MAX_STORED_GIT_APPROVAL_DETAILS = 128;
+const MAX_TERMINAL_GIT_APPROVAL_REQUESTS = 4_096;
+
+export interface UserInputActionValue {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly channelId: string;
+  readonly rootThreadTs: string;
+  readonly messageTs: string;
+}
+
+/**
+ * The action token is safe to render before Slack assigns the message
+ * timestamp. The callback binds it to the exact message timestamp supplied by
+ * Slack before looking up the process-local plan.
+ */
+export interface UserInputActionToken {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly channelId: string;
+  readonly rootThreadTs: string;
+}
+
+export type UserInputPathVisibility = "show" | "hide";
+export type UserInputBodyVisibility = "show" | "hide";
+
+export interface WorkspaceGitApprovalBlockOptions {
+  readonly pathsExpanded?: boolean;
+  readonly allowPathToggle?: boolean;
+  readonly bodyExpanded?: boolean;
+  readonly allowBodyToggle?: boolean;
+  readonly expiresAt?: string;
+}
+
+export interface WorkspaceGitApprovalDisplayState {
+  readonly pathsExpanded: boolean;
+  readonly bodyExpanded: boolean;
+}
+
+export interface WorkspaceGitApprovalDetails {
+  readonly prompt: string;
+  readonly plan: WorkspaceGitApprovalPlan;
+  readonly routing: UserInputActionValue;
+  readonly expiresAt: number;
+  readonly fallbackText: string;
+  /** Bound App Server session; required before a manual human decision is sent. */
+  readonly sessionId?: string;
+  readonly sourceUserMention?: string;
+  readonly display: WorkspaceGitApprovalDisplayState;
+}
+
+/** Process-local display state for one exact, message-bound Git approval card. */
+export class WorkspaceGitApprovalDetailsStore {
+  readonly #entries = new Map<string, WorkspaceGitApprovalDetails>();
+  readonly #actionTails = new Map<string, Promise<void>>();
+  readonly #terminalRequestIds = new Set<string>();
+  #denyAllApprovals = false;
+
+  remember(details: WorkspaceGitApprovalDetails): void {
+    const key = approvalDetailsKey(details.routing);
+    this.#entries.delete(key);
+    this.#entries.set(key, Object.freeze({
+      ...details,
+      plan: details.plan,
+      routing: Object.freeze({ ...details.routing }),
+      display: Object.freeze({ ...details.display }),
+    }));
+    while (this.#entries.size > MAX_STORED_GIT_APPROVAL_DETAILS) {
+      const oldest = this.#entries.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#entries.delete(oldest);
+    }
+  }
+
+  get(routing: UserInputActionValue): WorkspaceGitApprovalDetails | undefined {
+    if (
+      this.#denyAllApprovals ||
+      this.#terminalRequestIds.has(routing.requestId)
+    ) return undefined;
+    return this.#entries.get(approvalDetailsKey(routing));
+  }
+
+  getForRequest(
+    requestId: string,
+    channelId: string,
+    rootThreadTs: string,
+  ): WorkspaceGitApprovalDetails | undefined {
+    if (this.#denyAllApprovals || this.#terminalRequestIds.has(requestId)) {
+      return undefined;
+    }
+    return this.#findForRequest(requestId, channelId, rootThreadTs);
+  }
+
+  /** Returns inert route data needed only to remove a terminal Slack card. */
+  getForTerminalProjection(
+    requestId: string,
+    channelId: string,
+    rootThreadTs: string,
+  ): WorkspaceGitApprovalDetails | undefined {
+    return this.#findForRequest(requestId, channelId, rootThreadTs);
+  }
+
+  getIncludingTerminal(
+    routing: UserInputActionValue,
+  ): WorkspaceGitApprovalDetails | undefined {
+    return this.#entries.get(approvalDetailsKey(routing));
+  }
+
+  #findForRequest(
+    requestId: string,
+    channelId: string,
+    rootThreadTs: string,
+  ): WorkspaceGitApprovalDetails | undefined {
+    let match: WorkspaceGitApprovalDetails | undefined;
+    for (const details of this.#entries.values()) {
+      if (
+        details.routing.requestId !== requestId ||
+        details.routing.channelId !== channelId ||
+        details.routing.rootThreadTs !== rootThreadTs
+      ) {
+        continue;
+      }
+      if (match !== undefined) return undefined;
+      match = details;
+    }
+    return match;
+  }
+
+  updateDisplay(
+    routing: UserInputActionValue,
+    display: WorkspaceGitApprovalDisplayState,
+  ): void {
+    const key = approvalDetailsKey(routing);
+    const current = this.#entries.get(key);
+    if (current === undefined) return;
+    this.#entries.set(key, Object.freeze({
+      ...current,
+      display: Object.freeze({ ...display }),
+    }));
+  }
+
+  forget(routing: UserInputActionValue): void {
+    this.#entries.delete(approvalDetailsKey(routing));
+  }
+
+  /** Makes a terminal request non-actionable without losing its Slack route. */
+  invalidateRequest(requestId: string): void {
+    if (this.#terminalRequestIds.has(requestId) || this.#denyAllApprovals) return;
+    if (this.#terminalRequestIds.size >= MAX_TERMINAL_GIT_APPROVAL_REQUESTS) {
+      // Never evict a tombstone and accidentally revive an in-flight post.
+      this.#denyAllApprovals = true;
+      return;
+    }
+    this.#terminalRequestIds.add(requestId);
+  }
+
+  releaseTerminalRequest(requestId: string): void {
+    if (!this.#denyAllApprovals) this.#terminalRequestIds.delete(requestId);
+  }
+
+  async serialize<T>(
+    routing: UserInputActionValue,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const key = approvalDetailsKey(routing);
+    const previous = this.#actionTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolveCurrent) => {
+      release = resolveCurrent;
+    });
+    const tail = previous.catch(() => undefined).then(() => current);
+    this.#actionTails.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await action();
+    } finally {
+      release();
+      if (this.#actionTails.get(key) === tail) this.#actionTails.delete(key);
+    }
+  }
+}
+
+export function buildWorkspaceGitApprovalBlocks(
+  prompt: string,
+  plan: WorkspaceGitApprovalPlan,
+  value: UserInputActionValue | UserInputActionToken,
+  options: WorkspaceGitApprovalBlockOptions = {},
+): KnownBlock[] {
+  const pathsExpanded = options.pathsExpanded ?? true;
+  const allowPathToggle = options.allowPathToggle ?? false;
+  const bodyExpanded = options.bodyExpanded ?? true;
+  const allowBodyToggle = options.allowBodyToggle ?? false;
+  const expiresAt = options.expiresAt ?? plan.expiresAt;
+  const blocks: KnownBlock[] = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Git操作の承認待ち*\n${escapeSlack(prompt)}`,
+      },
+    },
+    {
+      type: "section",
+      fields: planFields(plan),
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          `*Operation ID*\n\`${plan.operationId}\`\n` +
+          `*Plan hash*\n\`${plan.planHash}\`\n` +
+          `*期限*\n${escapeSlack(expiresAt)}`,
+      },
+    },
+  ];
+  if (
+    plan.operation !== "github_repository_settings" &&
+    plan.operation !== "history_reset"
+  ) {
+    blocks.push(pathSummaryBlock(plan.paths.length, value, {
+      pathsExpanded,
+      allowPathToggle,
+    }));
+    if (pathsExpanded) {
+      const pathChunks = exactPathChunks(plan.paths);
+      blocks.push(...pathChunks.map((text): KnownBlock => ({
+        type: "section",
+        text: { type: "plain_text", text, emoji: false },
+      })));
+    }
+  }
+  for (const [label, value] of exactPlanTexts(plan)) {
+    blocks.push(...exactTextChunks(label, value).map((text): KnownBlock => ({
+      type: "section",
+      text: { type: "plain_text", text, emoji: false },
+    })));
+  }
+  if (plan.pullRequestBody !== undefined) {
+    blocks.push(bodySummaryBlock(plan.pullRequestBody, value, {
+      bodyExpanded,
+      allowBodyToggle,
+    }));
+    if (bodyExpanded) {
+      blocks.push(...exactTextChunks("Draft PR body", plan.pullRequestBody).map(
+        (text): KnownBlock => ({
+          type: "section",
+          text: { type: "plain_text", text, emoji: false },
+        }),
+      ));
+    }
+  }
+  if (blocks.length > 48) {
+    throw new Error("The exact Git plan is too large for Slack Block Kit");
+  }
+  const encoded = JSON.stringify(actionToken(value));
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "承認して実行", emoji: true },
+        style: "primary",
+        action_id: `${USER_INPUT_ACTION_PREFIX}approve`,
+        value: encoded,
+        confirm: {
+          title: { type: "plain_text", text: "このGit操作を承認しますか？" },
+          text: {
+            type: "mrkdwn",
+            text:
+              "表示されたexact planを承認し、同じCodex turnで実行前の再検証へ進みます。",
+          },
+          confirm: { type: "plain_text", text: "承認して実行" },
+          deny: { type: "plain_text", text: "戻る" },
+        },
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "拒否・保留", emoji: true },
+        action_id: `${USER_INPUT_ACTION_PREFIX}reject`,
+        value: encoded,
+      },
+    ],
+  });
+  return blocks;
+}
+
+export function buildExpiredWorkspaceGitApprovalBlocks(
+  plan: WorkspaceGitApprovalPlan,
+  expiresAt: string,
+): KnownBlock[] {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          "*:warning: Git操作の承認期限が切れました*\n" +
+          "この計画は実行できません。必要な場合は、同じ依頼をもう一度送って承認画面を再作成してください。",
+      },
+    },
+    {
+      type: "section",
+      fields: planFields(plan).slice(0, 4),
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `期限: ${escapeSlack(expiresAt)} ・ 状態: 期限切れ（実行不可）`,
+        },
+      ],
+    },
+  ];
+}
+
+export function buildUnavailableWorkspaceGitApprovalBlocks(): KnownBlock[] {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          "*:warning: このGit承認は利用できません*\n" +
+          "期限切れ、処理済み、またはGateway再起動前の承認画面です。" +
+          "このボタンからは実行・再開できません。必要なGit操作を新しいメッセージとして依頼してください。",
+      },
+    },
+  ];
+}
+
+export function parseUserInputDecision(
+  actionId: string,
+): AgentGitApprovalInputResponse["optionId"] | undefined {
+  if (!actionId.startsWith(USER_INPUT_ACTION_PREFIX)) return undefined;
+  const decision = actionId.slice(USER_INPUT_ACTION_PREFIX.length);
+  return decision === "approve" || decision === "reject"
+    ? decision
+    : undefined;
+}
+
+export function parseUserInputPathVisibility(
+  actionId: string,
+): UserInputPathVisibility | undefined {
+  if (!actionId.startsWith(USER_INPUT_PATH_ACTION_PREFIX)) return undefined;
+  const visibility = actionId.slice(USER_INPUT_PATH_ACTION_PREFIX.length);
+  return visibility === "show" || visibility === "hide"
+    ? visibility
+    : undefined;
+}
+
+export function parseUserInputBodyVisibility(
+  actionId: string,
+): UserInputBodyVisibility | undefined {
+  if (!actionId.startsWith(USER_INPUT_BODY_ACTION_PREFIX)) return undefined;
+  const visibility = actionId.slice(USER_INPUT_BODY_ACTION_PREFIX.length);
+  return visibility === "show" || visibility === "hide"
+    ? visibility
+    : undefined;
+}
+
+export function parseUserInputActionValue(value: string): UserInputActionValue {
+  if (value.length < 1 || value.length > 1_000) {
+    throw new Error("Invalid Git approval action payload");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("Invalid Git approval action payload");
+  }
+  const record = asRecord(parsed);
+  if (
+    record === undefined ||
+    record.version !== 1 ||
+    typeof record.requestId !== "string" ||
+    !/^codex-input:[0-9a-f-]{36}$/iu.test(record.requestId) ||
+    typeof record.channelId !== "string" ||
+    !/^C[A-Z0-9]{1,127}$/u.test(record.channelId) ||
+    typeof record.rootThreadTs !== "string" ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(record.rootThreadTs) ||
+    typeof record.messageTs !== "string" ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(record.messageTs) ||
+    Object.keys(record).length !== 5 ||
+    countLiteralKey(value, "version") !== 1 ||
+    countLiteralKey(value, "requestId") !== 1 ||
+    countLiteralKey(value, "channelId") !== 1 ||
+    countLiteralKey(value, "rootThreadTs") !== 1 ||
+    countLiteralKey(value, "messageTs") !== 1
+  ) {
+    throw new Error("Invalid Git approval action payload");
+  }
+  return {
+    version: 1,
+    requestId: record.requestId,
+    channelId: record.channelId,
+    rootThreadTs: record.rootThreadTs,
+    messageTs: record.messageTs,
+  };
+}
+
+/** Parses the message-independent token used by newly posted approval cards. */
+export function parseUserInputActionToken(value: string): UserInputActionToken {
+  if (value.length < 1 || value.length > 1_000) {
+    throw new Error("Invalid Git approval action payload");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("Invalid Git approval action payload");
+  }
+  const record = asRecord(parsed);
+  if (
+    record === undefined ||
+    record.version !== 1 ||
+    typeof record.requestId !== "string" ||
+    !/^codex-input:[0-9a-f-]{36}$/iu.test(record.requestId) ||
+    typeof record.channelId !== "string" ||
+    !/^C[A-Z0-9]{1,127}$/u.test(record.channelId) ||
+    typeof record.rootThreadTs !== "string" ||
+    !/^\d{1,20}\.\d{1,20}$/u.test(record.rootThreadTs) ||
+    Object.keys(record).length !== 4 ||
+    countLiteralKey(value, "version") !== 1 ||
+    countLiteralKey(value, "requestId") !== 1 ||
+    countLiteralKey(value, "channelId") !== 1 ||
+    countLiteralKey(value, "rootThreadTs") !== 1 ||
+    countLiteralKey(value, "messageTs") !== 0
+  ) {
+    throw new Error("Invalid Git approval action payload");
+  }
+  return {
+    version: 1,
+    requestId: record.requestId,
+    channelId: record.channelId,
+    rootThreadTs: record.rootThreadTs,
+  };
+}
+
+function planFields(
+  plan: WorkspaceGitApprovalPlan,
+): Array<{ type: "mrkdwn"; text: string }> {
+  const operation = operationLabel(plan.operation);
+  if (plan.operation === "github_repository_settings") {
+    return [
+      field("操作", operation),
+      field("Repository", plan.repoId),
+      field("Mode", plan.mode),
+      field("変更項目", repositorySettingsChangedFields(plan).join(", ")),
+    ];
+  }
+  if (plan.operation === "history_reset") {
+    return [
+      field("操作", operation),
+      field("Repository", plan.repoId),
+      field("Branch", plan.branch),
+      field("現在のmain", plan.expectedHead),
+      field("保持するtree", plan.expectedTree),
+      field("Snapshot", plan.expectedSnapshotId),
+      field("削除branch", `${plan.deleteBranches.length}件`),
+      field("Tag", `${plan.expectedTags.length}件（変更しない）`),
+      field("保護設定", plan.branchProtection.protected ? "一時停止後に復元" : "なし"),
+      field("署名必須", plan.branchProtection.requiredSignatures ? "有効" : "無効"),
+    ];
+  }
+  const fields = [
+    field("操作", operation),
+    field("Repository", plan.repoId),
+    ...(plan.environment === undefined
+      ? []
+      : [field("Environment", plan.environment)]),
+    field(
+      "Branch",
+      plan.operation === "main_update"
+        ? plan.currentBranch ?? "detached HEAD"
+        : plan.branch,
+    ),
+    ...(plan.operation === "existing_pull_request_update"
+      ? []
+      : [field("Mode", plan.mode)]),
+    field("HEAD", plan.expectedHead ?? "unborn"),
+    field(
+      "Worktree",
+      plan.operation === "existing_pull_request_update"
+        ? plan.temporaryWorkspaceId
+        : plan.worktreeId ?? "該当なし（PR操作）",
+    ),
+    ...(plan.expectedSnapshotId === undefined
+      ? []
+      : [field("Snapshot", plan.expectedSnapshotId)]),
+    ...(plan.pushTarget === undefined
+      ? []
+      : [field("Push target", plan.pushTarget)]),
+    ...(plan.pullRequestBaseBranch === undefined
+      ? []
+      : [field("Draft PR base", plan.pullRequestBaseBranch)]),
+    ...(plan.pullRequestNumber === undefined
+      ? []
+      : [field("Pull Request", `#${plan.pullRequestNumber}`)]),
+    ...(plan.baseBranch === undefined
+      ? []
+      : [field("Base", plan.baseBranch)]),
+    ...(plan.mergeMethod === undefined
+      ? []
+      : [field("Merge method", plan.mergeMethod)]),
+    ...(plan.operation === "pull_request_ready" ||
+        plan.operation === "pull_request_merge"
+      ? [field("Head owner", plan.headRepositoryOwner)]
+      : []),
+  ];
+  if (fields.length > 10) {
+    throw new Error("The Git plan has too many summary fields for Slack Block Kit");
+  }
+  return fields;
+}
+
+function pathSummaryBlock(
+  pathCount: number,
+  routing: UserInputActionValue | UserInputActionToken,
+  options: {
+    readonly pathsExpanded: boolean;
+    readonly allowPathToggle: boolean;
+  },
+): KnownBlock {
+  const summary = pathCount === 0
+    ? "*変更ファイル*\nなし"
+    : `*変更ファイル*\n${pathCount}件`;
+  if (!options.allowPathToggle || pathCount === 0) {
+    return {
+      type: "section",
+      text: { type: "mrkdwn", text: summary },
+    };
+  }
+  const visibility: UserInputPathVisibility = options.pathsExpanded
+    ? "hide"
+    : "show";
+  return {
+    type: "section",
+    text: { type: "mrkdwn", text: summary },
+    accessory: {
+      type: "button",
+      text: {
+        type: "plain_text",
+        text: options.pathsExpanded ? "一覧を閉じる" : "変更ファイルを表示",
+        emoji: true,
+      },
+      action_id: `${USER_INPUT_PATH_ACTION_PREFIX}${visibility}`,
+      value: JSON.stringify(actionToken(routing)),
+    },
+  };
+}
+
+function bodySummaryBlock(
+  body: string,
+  routing: UserInputActionValue | UserInputActionToken,
+  options: {
+    readonly bodyExpanded: boolean;
+    readonly allowBodyToggle: boolean;
+  },
+): KnownBlock {
+  const summary = `*Draft PR body*\n${[...body].length}文字`;
+  if (!options.allowBodyToggle) {
+    return {
+      type: "section",
+      text: { type: "mrkdwn", text: summary },
+    };
+  }
+  const visibility: UserInputBodyVisibility = options.bodyExpanded
+    ? "hide"
+    : "show";
+  return {
+    type: "section",
+    text: { type: "mrkdwn", text: summary },
+    accessory: {
+      type: "button",
+      text: {
+        type: "plain_text",
+        text: options.bodyExpanded ? "PR本文を閉じる" : "PR本文を表示",
+        emoji: true,
+      },
+      action_id: `${USER_INPUT_BODY_ACTION_PREFIX}${visibility}`,
+      value: JSON.stringify(actionToken(routing)),
+    },
+  };
+}
+
+function field(label: string, value: string): { type: "mrkdwn"; text: string } {
+  return { type: "mrkdwn", text: `*${label}*\n${escapeSlack(value)}` };
+}
+
+function exactPathChunks(paths: readonly string[]): string[] {
+  if (paths.length === 0) return ["*Paths*\nなし"];
+  const lines = paths.map((path) => `• ${visibleJsonString(path)}`);
+  const chunks: string[] = [];
+  let current = "Paths";
+  for (const line of lines) {
+    if (line.length > 2_850) {
+      throw new Error("A Git plan path is too large for Slack Block Kit");
+    }
+    if (current.length + line.length + 1 > 2_900) {
+      chunks.push(current);
+      current = "Paths（続き）";
+    }
+    current += `\n${line}`;
+  }
+  chunks.push(current);
+  return chunks;
+}
+
+function exactPlanTexts(
+  plan: WorkspaceGitApprovalPlan,
+): ReadonlyArray<readonly [string, string]> {
+  if (plan.operation === "github_repository_settings") {
+    return [
+      [
+        "変更前のRepository設定",
+        JSON.stringify(repositorySettingsStateForDisplay(plan.repositorySettingsBefore)),
+      ],
+      [
+        "承認する変更内容",
+        JSON.stringify(repositorySettingsDesiredForDisplay(plan.repositorySettingsDesired)),
+      ],
+      [
+        "承認後のRepository設定",
+        JSON.stringify(
+          repositorySettingsStateForDisplay(plan.repositorySettingsResultingState),
+        ),
+      ],
+    ];
+  }
+  if (plan.operation === "history_reset") {
+    return [
+      ["Commit message", plan.commitMessage],
+      ["削除するremote branches", JSON.stringify(plan.deleteBranches)],
+      ["変更しないtags", JSON.stringify(plan.expectedTags)],
+      ["復元するbranch protection", JSON.stringify({
+        protected: plan.branchProtection.protected,
+        fingerprint: plan.branchProtection.fingerprint,
+        configuration: plan.branchProtection.configuration,
+        required_signatures: plan.branchProtection.requiredSignatures,
+        rulesets: plan.branchProtection.rulesets.map((ruleset) => ({
+          id: ruleset.id,
+          source_type: ruleset.sourceType,
+          target: ruleset.target,
+          enforcement: ruleset.enforcement,
+          applies_to_main: ruleset.appliesToMain,
+          mutable: ruleset.mutable,
+          fingerprint: ruleset.fingerprint,
+          configuration: ruleset.configuration,
+        })),
+      })],
+      ["Root commit metadata", JSON.stringify({
+        author_name: plan.commitMetadata.authorName,
+        author_email: plan.commitMetadata.authorEmail,
+        committer_name: plan.commitMetadata.committerName,
+        committer_email: plan.commitMetadata.committerEmail,
+      })],
+      [
+        "不可逆性",
+        [
+          "mainの公開履歴を親なしの1コミットへ置換し、列挙されたremote branchを削除します。",
+          ...plan.limitations,
+        ].join("\n"),
+      ],
+    ];
+  }
+  return [
+    ...(plan.commitMessage === undefined
+      ? []
+      : [["Commit message", plan.commitMessage] as const]),
+    ...(plan.pullRequestTitle === undefined
+      ? []
+      : [["Draft PR title", plan.pullRequestTitle] as const]),
+    ...(plan.pullRequestBaseBranch === undefined
+      ? []
+      : [["Draft PR base", plan.pullRequestBaseBranch] as const]),
+    ...(plan.operation === "pull_request_ready" ||
+        plan.operation === "pull_request_merge"
+      ? [["Pull Request title", plan.targetPullRequestTitle] as const]
+      : []),
+  ];
+}
+
+function exactTextChunks(label: string, value: string): string[] {
+  const encoded = visibleJsonString(value);
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < encoded.length) {
+    const heading = chunks.length === 0 ? label : `${label}（続き）`;
+    const budget = 2_900 - heading.length - 1;
+    let end = Math.min(offset + budget, encoded.length);
+    if (
+      end < encoded.length &&
+      end > offset &&
+      isHighSurrogate(encoded.charCodeAt(end - 1))
+    ) {
+      end -= 1;
+    }
+    const body = encoded.slice(offset, end);
+    chunks.push(`${heading}\n${body}`);
+    offset += body.length;
+  }
+  return chunks.length === 0 ? [`${label}\n""`] : chunks;
+}
+
+function isHighSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+function visibleJsonString(value: string): string {
+  return JSON.stringify(value).replace(
+    /[\u202a-\u202e\u2066-\u2069]/gu,
+    (character) => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`,
+  );
+}
+
+function operationLabel(operation: WorkspaceGitApprovalPlan["operation"]): string {
+  switch (operation) {
+    case "git_publication":
+      return "Git公開 / Draft PR";
+    case "pull_request_ready":
+      return "Pull RequestをReady化";
+    case "pull_request_merge":
+      return "Pull Requestをmerge";
+    case "existing_pull_request_update":
+      return "既存Pull Requestを更新";
+    case "github_repository_settings":
+      return "GitHub Repository設定を変更";
+    case "main_update":
+      return "ローカルmainをfast-forward更新";
+    case "history_reset":
+      return "公開Git履歴を1コミットへ初期化";
+  }
+}
+
+function repositorySettingsChangedFields(
+  plan: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>,
+): string[] {
+  const fields: string[] = [];
+  if (Object.hasOwn(plan.repositorySettingsDesired, "description")) {
+    fields.push("description");
+  }
+  if (Object.hasOwn(plan.repositorySettingsDesired, "topics")) {
+    fields.push("topics");
+  }
+  if (Object.hasOwn(plan.repositorySettingsDesired, "dependabotSecurityUpdates")) {
+    fields.push("Dependabot Security Updates");
+  }
+  return fields;
+}
+
+function repositorySettingsStateForDisplay(
+  state: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsBefore"],
+): Record<string, unknown> {
+  return {
+    description: state.description,
+    topics: state.topics,
+    dependabot_security_updates: state.dependabotSecurityUpdates,
+  };
+}
+
+function repositorySettingsDesiredForDisplay(
+  desired: Extract<WorkspaceGitApprovalPlan, {
+    operation: "github_repository_settings";
+  }>["repositorySettingsDesired"],
+): Record<string, unknown> {
+  return {
+    ...(Object.hasOwn(desired, "description")
+      ? { description: desired.description }
+      : {}),
+    ...(Object.hasOwn(desired, "topics") ? { topics: desired.topics } : {}),
+    ...(Object.hasOwn(desired, "dependabotSecurityUpdates")
+      ? { dependabot_security_updates: desired.dependabotSecurityUpdates }
+      : {}),
+  };
+}
+
+function escapeSlack(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function countLiteralKey(value: string, key: string): number {
+  return [...value.matchAll(new RegExp(`"${key}"\\s*:`, "g"))].length;
+}
+
+function approvalDetailsKey(value: UserInputActionValue): string {
+  return [
+    value.requestId,
+    value.channelId,
+    value.rootThreadTs,
+    value.messageTs,
+  ].join("\u0000");
+}
+
+function actionToken(
+  value: UserInputActionValue | UserInputActionToken,
+): UserInputActionToken {
+  return {
+    version: 1,
+    requestId: value.requestId,
+    channelId: value.channelId,
+    rootThreadTs: value.rootThreadTs,
+  };
+}
