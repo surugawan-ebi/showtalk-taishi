@@ -684,6 +684,104 @@ function notifyRepositorySettingsPlan(server: FakeAppServer): void {
   });
 }
 
+function notifyHistoryResetPlan(server: FakeAppServer): void {
+  const approvalScope = {
+    kind: "history_reset",
+    repo_id: "showtalk-taishi",
+    target_branch: "main",
+    expected_remote_main_sha: "b".repeat(40),
+    expected_tree_sha: "c".repeat(40),
+    expected_snapshot_id: "d".repeat(64),
+    expected_remote_branches: [
+      { name: "agent/old", sha: "a".repeat(40) },
+      { name: "main", sha: "b".repeat(40) },
+    ],
+    delete_branches: [{ name: "agent/old", sha: "a".repeat(40) }],
+    expected_tags: [],
+    branch_protection: {
+      protected: true,
+      fingerprint: "e".repeat(64),
+      configuration: {
+        required_status_checks: {
+          strict: true,
+          contexts: ["verify"],
+        },
+      },
+      required_signatures: false,
+      rulesets: [],
+    },
+    commit_message: "Initial public OSS snapshot",
+    commit_metadata: {
+      author_name: "example",
+      author_email: "example@users.noreply.github.com",
+      committer_name: "example",
+      committer_email: "example@users.noreply.github.com",
+    },
+  };
+  const scope = {
+    kind: approvalScope.kind,
+    repo_id: approvalScope.repo_id,
+    target_branch: approvalScope.target_branch,
+    expected_remote_main_sha: approvalScope.expected_remote_main_sha,
+    expected_tree_sha: approvalScope.expected_tree_sha,
+    expected_snapshot_id: approvalScope.expected_snapshot_id,
+    expected_remote_branches: structuredClone(approvalScope.expected_remote_branches),
+    delete_branches: structuredClone(approvalScope.delete_branches),
+    expected_tags: structuredClone(approvalScope.expected_tags),
+    branch_protection: {
+      protected: approvalScope.branch_protection.protected,
+      fingerprint: approvalScope.branch_protection.fingerprint,
+      required_signatures: approvalScope.branch_protection.required_signatures,
+      rulesets: [],
+    },
+    commit_message: approvalScope.commit_message,
+    limitations: [
+      "Only the cataloged GitHub refs are changed.",
+      "Existing clones and forks cannot be erased.",
+    ],
+  };
+  const argumentsValue = {
+    repo_id: "showtalk-taishi",
+    delete_branches: ["agent/old"],
+    commit_message: "Initial public OSS snapshot",
+    expected_remote_main_sha: "b".repeat(40),
+    ttl_minutes: 30,
+  };
+  const item = {
+    type: "mcpToolCall",
+    id: "mcp-history-reset-plan-1",
+    server: "workspace-git",
+    tool: "prepare_history_reset",
+    arguments: argumentsValue,
+  };
+  server.notify("item/started", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: { ...item, status: "inProgress" },
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: {
+      ...item,
+      status: "completed",
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "55555555-5555-4555-8555-555555555555",
+          approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
+          approval_target: "history_reset_showtalk-taishi",
+          plan_hash: "f".repeat(64),
+          scope,
+          approval_scope: approvalScope,
+          execute_tool: "execute_approved_history_reset",
+          external_write: false,
+        },
+      },
+    },
+  });
+}
+
 function repositorySettingsExecutionItem() {
   return {
     type: "mcpToolCall",
@@ -4357,6 +4455,53 @@ test("accepts an exact Git approval when App Server omits schema-default fields"
   assert.equal(server.errorResponses.length, 0);
   assert.deepEqual(server.userInputResponses, [{
     id: 921,
+    response: {
+      answers: { git_approval: { answers: ["拒否・保留"] } },
+    },
+  }]);
+});
+
+test("binds an exact history-reset plan to the fixed Git approval request", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+  let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Reset public history after exact approval",
+      source: { type: "human" },
+    })) {
+      if (event.type !== "user_input.requested") continue;
+      requested = event;
+      await adapter.respondToUserInput(session, {
+        requestId: event.requestId,
+        optionId: "reject",
+      });
+      server.notify("turn/completed", {
+        threadId: "thr_1",
+        turn: { id: "turn_1", status: "completed" },
+      });
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyHistoryResetPlan(server);
+  server.request({
+    id: 924,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await consuming;
+
+  assert.equal(requested?.plan.operation, "history_reset");
+  if (requested?.plan.operation === "history_reset") {
+    assert.equal(requested.plan.branch, "main");
+    assert.equal(requested.plan.deleteBranches[0]?.name, "agent/old");
+    assert.equal(requested.plan.expectedTree, "c".repeat(40));
+  }
+  assert.equal(server.errorResponses.length, 0);
+  assert.deepEqual(server.userInputResponses, [{
+    id: 924,
     response: {
       answers: { git_approval: { answers: ["拒否・保留"] } },
     },

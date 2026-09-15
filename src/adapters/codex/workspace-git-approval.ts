@@ -3,6 +3,10 @@ import { isDeepStrictEqual } from "node:util";
 import type {
   WorkspaceGitApprovalPlan,
   WorkspaceGitDependabotSecurityUpdateState,
+  WorkspaceGitHistoryResetCommitMetadata,
+  WorkspaceGitHistoryResetProtection,
+  WorkspaceGitHistoryResetRef,
+  WorkspaceGitHistoryResetRuleset,
   WorkspaceGitPublicationMode,
   WorkspaceGitRepositorySettingsDesired,
   WorkspaceGitRepositorySettingsState,
@@ -54,6 +58,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       item.tool !== "prepare_pull_request_operation" &&
       item.tool !== "prepare_existing_pull_request_update" &&
       item.tool !== "prepare_github_repository_settings" &&
+      item.tool !== "prepare_history_reset" &&
       item.tool !== "update_repository_main")
   ) {
     return undefined;
@@ -79,6 +84,8 @@ export function normalizeWorkspaceGitPrepareCompletion(
         ? "execute_approved_existing_pull_request_update"
         : item.tool === "prepare_github_repository_settings"
           ? "execute_approved_github_repository_settings"
+          : item.tool === "prepare_history_reset"
+            ? "execute_approved_history_reset"
           : "execute_approved_main_update";
   if (output.execute_tool !== expectedExecuteTool || output.external_write !== false) {
     throw new Error("workspace-git returned an invalid approval execution boundary");
@@ -106,6 +113,210 @@ export function normalizeWorkspaceGitPrepareCompletion(
   const repoId = boundedString(scope.repo_id, 128, "repository ID");
   if (repoId !== boundedString(argumentsRecord.repo_id, 128, "repository input")) {
     throw new Error("workspace-git pending plan repository does not match its input");
+  }
+
+  if (item.tool === "prepare_history_reset") {
+    if (!hasOnlyKeys(argumentsRecord, [
+      "repo_id",
+      "delete_branches",
+      "commit_message",
+      "expected_remote_main_sha",
+      "ttl_minutes",
+      "environment",
+    ])) {
+      throw new Error("workspace-git history reset input is invalid");
+    }
+    validateApprovalTtl(argumentsRecord.ttl_minutes, "history reset");
+    if (!hasExactKeys(scope, [
+      "kind",
+      "repo_id",
+      "target_branch",
+      "expected_remote_main_sha",
+      "expected_tree_sha",
+      "expected_snapshot_id",
+      "expected_remote_branches",
+      "delete_branches",
+      "expected_tags",
+      "branch_protection",
+      "commit_message",
+      "limitations",
+    ])) {
+      throw new Error("workspace-git history reset scope is invalid");
+    }
+    if (!hasExactKeys(approvalScope, [
+      "kind",
+      "repo_id",
+      "target_branch",
+      "expected_remote_main_sha",
+      "expected_tree_sha",
+      "expected_snapshot_id",
+      "expected_remote_branches",
+      "delete_branches",
+      "expected_tags",
+      "branch_protection",
+      "commit_message",
+      "commit_metadata",
+    ])) {
+      throw new Error("workspace-git history reset approval scope is invalid");
+    }
+    if (scope.kind !== "history_reset" || scope.target_branch !== "main") {
+      throw new Error("workspace-git history reset target is invalid");
+    }
+    if (
+      approvalScope.kind !== "history_reset" ||
+      approvalScope.repo_id !== scope.repo_id ||
+      approvalScope.target_branch !== scope.target_branch
+    ) {
+      throw new Error("workspace-git history reset approval target is invalid");
+    }
+    const expectedHead = boundedString(
+      scope.expected_remote_main_sha,
+      40,
+      "history reset expected main",
+    );
+    const expectedTree = boundedString(
+      scope.expected_tree_sha,
+      40,
+      "history reset expected tree",
+    );
+    const expectedSnapshotId = boundedString(
+      scope.expected_snapshot_id,
+      64,
+      "history reset expected snapshot",
+    );
+    if (
+      !GIT_SHA.test(expectedHead) ||
+      !GIT_SHA.test(expectedTree) ||
+      !SNAPSHOT.test(expectedSnapshotId)
+    ) {
+      throw new Error("workspace-git history reset snapshot is invalid");
+    }
+    if (
+      argumentsRecord.expected_remote_main_sha !== undefined &&
+      boundedString(
+          argumentsRecord.expected_remote_main_sha,
+          40,
+          "history reset expected main input",
+        ) !== expectedHead
+    ) {
+      throw new Error("workspace-git history reset main does not match its input");
+    }
+    const expectedRemoteBranches = validatedHistoryResetRefs(
+      scope.expected_remote_branches,
+      "remote branches",
+    );
+    const deleteBranches = validatedHistoryResetRefs(
+      scope.delete_branches,
+      "deleted branches",
+    );
+    const expectedTags = validatedHistoryResetRefs(scope.expected_tags, "tags");
+    const approvalRemoteBranches = validatedHistoryResetRefs(
+      approvalScope.expected_remote_branches,
+      "approval remote branches",
+    );
+    const approvalDeleteBranches = validatedHistoryResetRefs(
+      approvalScope.delete_branches,
+      "approval deleted branches",
+    );
+    const approvalTags = validatedHistoryResetRefs(
+      approvalScope.expected_tags,
+      "approval tags",
+    );
+    if (
+      !isDeepStrictEqual(expectedRemoteBranches, approvalRemoteBranches) ||
+      !isDeepStrictEqual(deleteBranches, approvalDeleteBranches) ||
+      !isDeepStrictEqual(expectedTags, approvalTags)
+    ) {
+      throw new Error("workspace-git history reset public refs do not match approval scope");
+    }
+    const mainBranches = expectedRemoteBranches.filter((entry) => entry.name === "main");
+    if (mainBranches.length !== 1 || mainBranches[0]?.sha !== expectedHead) {
+      throw new Error("workspace-git history reset remote main is invalid");
+    }
+    const remoteByName = new Map(
+      expectedRemoteBranches.map((entry) => [entry.name, entry.sha]),
+    );
+    if (
+      deleteBranches.some((entry) =>
+        entry.name === "main" || remoteByName.get(entry.name) !== entry.sha
+      )
+    ) {
+      throw new Error("workspace-git history reset deletion set is invalid");
+    }
+    const inputDeleteBranches = validatedHistoryResetBranchNames(
+      argumentsRecord.delete_branches,
+      "delete branch input",
+    );
+    if (!sameStrings(deleteBranches.map((entry) => entry.name), inputDeleteBranches)) {
+      throw new Error("workspace-git history reset branches do not match their input");
+    }
+    const commitMessage = boundedTrimmedString(
+      scope.commit_message,
+      500,
+      "history reset commit message",
+    );
+    if (
+      commitMessage !== boundedTrimmedString(
+        argumentsRecord.commit_message,
+        500,
+        "history reset commit message input",
+      )
+    ) {
+      throw new Error("workspace-git history reset commit message does not match input");
+    }
+    const branchProtection = validatedHistoryResetProtection(
+      approvalScope.branch_protection,
+    );
+    validateHistoryResetPublicProtection(scope.branch_protection, branchProtection);
+    const commitMetadata = validatedHistoryResetCommitMetadata(
+      approvalScope.commit_metadata,
+    );
+    const limitations = validatedHistoryResetLimitations(scope.limitations);
+    if (
+      approvalScope.expected_remote_main_sha !== expectedHead ||
+      approvalScope.expected_tree_sha !== expectedTree ||
+      approvalScope.expected_snapshot_id !== expectedSnapshotId ||
+      approvalScope.commit_message !== commitMessage
+    ) {
+      throw new Error("workspace-git history reset public scope does not match approval scope");
+    }
+    const approvalTarget = boundedString(
+      output.approval_target,
+      256,
+      "approval target",
+    );
+    if (approvalTarget !== `history_reset_${repoId}`) {
+      throw new Error("workspace-git approval target does not match history reset");
+    }
+    const environment = optionalBoundedString(
+      argumentsRecord.environment,
+      64,
+    ) ?? "development";
+    return {
+      turnId,
+      plan: bindApprovalScope({
+        operationId,
+        planHash,
+        approvalTarget,
+        operation: "history_reset",
+        repoId,
+        environment,
+        mode: "history_reset",
+        paths: [] as const,
+        branch: "main",
+        expectedHead,
+        expectedSnapshotId,
+        expectedTree,
+        commitMessage,
+        expectedRemoteBranches,
+        deleteBranches,
+        expectedTags,
+        branchProtection,
+        commitMetadata,
+        limitations,
+        expiresAt,
+      }, approvalScope),
+    };
   }
 
   if (item.tool === "update_repository_main") {
@@ -990,7 +1201,56 @@ function approvalScopeForPlan(
         expected_head: plan.expectedHead,
         expected_snapshot_id: plan.expectedSnapshotId,
       };
+    case "history_reset":
+      return {
+        kind: "history_reset",
+        repo_id: plan.repoId,
+        target_branch: plan.branch,
+        expected_remote_main_sha: plan.expectedHead,
+        expected_tree_sha: plan.expectedTree,
+        expected_snapshot_id: plan.expectedSnapshotId,
+        expected_remote_branches: historyResetRefsForApproval(plan.expectedRemoteBranches),
+        delete_branches: historyResetRefsForApproval(plan.deleteBranches),
+        expected_tags: historyResetRefsForApproval(plan.expectedTags),
+        branch_protection: historyResetProtectionForApproval(plan.branchProtection),
+        commit_message: plan.commitMessage,
+        commit_metadata: {
+          author_name: plan.commitMetadata.authorName,
+          author_email: plan.commitMetadata.authorEmail,
+          committer_name: plan.commitMetadata.committerName,
+          committer_email: plan.commitMetadata.committerEmail,
+        },
+      };
   }
+}
+
+function historyResetRefsForApproval(
+  refs: readonly WorkspaceGitHistoryResetRef[],
+): Array<{ name: string; sha: string }> {
+  return refs.map((entry) => ({ name: entry.name, sha: entry.sha }));
+}
+
+function historyResetProtectionForApproval(
+  protection: WorkspaceGitHistoryResetProtection,
+): Record<string, unknown> {
+  return {
+    protected: protection.protected,
+    fingerprint: protection.fingerprint,
+    configuration: protection.configuration === null
+      ? null
+      : structuredClone(protection.configuration),
+    required_signatures: protection.requiredSignatures,
+    rulesets: protection.rulesets.map((ruleset) => ({
+      id: ruleset.id,
+      source_type: ruleset.sourceType,
+      target: ruleset.target,
+      enforcement: ruleset.enforcement,
+      applies_to_main: ruleset.appliesToMain,
+      mutable: ruleset.mutable,
+      fingerprint: ruleset.fingerprint,
+      configuration: structuredClone(ruleset.configuration),
+    })),
+  };
 }
 
 function approvalSettingsState(
@@ -1053,10 +1313,381 @@ function freezePlan<T extends WorkspaceGitApprovalPlan>(plan: T): T {
       ),
     }) as unknown as T;
   }
+  if (plan.operation === "history_reset") {
+    return Object.freeze({
+      ...plan,
+      paths: Object.freeze([]),
+      expectedRemoteBranches: freezeHistoryResetRefs(plan.expectedRemoteBranches),
+      deleteBranches: freezeHistoryResetRefs(plan.deleteBranches),
+      expectedTags: freezeHistoryResetRefs(plan.expectedTags),
+      branchProtection: freezeHistoryResetProtection(plan.branchProtection),
+      commitMetadata: Object.freeze({ ...plan.commitMetadata }),
+      limitations: Object.freeze([...plan.limitations]),
+    }) as unknown as T;
+  }
   return Object.freeze({
     ...plan,
     paths: Object.freeze([...plan.paths]),
   }) as unknown as T;
+}
+
+function validateApprovalTtl(value: unknown, label: string): void {
+  if (
+    value !== undefined &&
+    (!Number.isSafeInteger(value) || (value as number) < 5 || (value as number) > 60)
+  ) {
+    throw new Error(`workspace-git ${label} TTL is invalid`);
+  }
+}
+
+function validatedHistoryResetRefs(
+  value: unknown,
+  label: string,
+): readonly WorkspaceGitHistoryResetRef[] {
+  if (!Array.isArray(value) || value.length > 100) {
+    throw new Error(`workspace-git history reset ${label} are invalid`);
+  }
+  const refs = value.map((entry) => {
+    const record = requiredRecord(entry, `history reset ${label} entry`);
+    if (!hasExactKeys(record, ["name", "sha"])) {
+      throw new Error(`workspace-git history reset ${label} are invalid`);
+    }
+    const name = validatedGitRefName(record.name, label);
+    const sha = boundedString(record.sha, 40, `history reset ${label} SHA`);
+    if (!GIT_SHA.test(sha)) {
+      throw new Error(`workspace-git history reset ${label} SHA is invalid`);
+    }
+    return { name, sha };
+  });
+  const names = refs.map((entry) => entry.name);
+  if (!sameStrings(names, [...new Set(names)].sort())) {
+    throw new Error(`workspace-git history reset ${label} are not canonical`);
+  }
+  return freezeHistoryResetRefs(refs);
+}
+
+function validatedHistoryResetBranchNames(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > 100) {
+    throw new Error(`workspace-git history reset ${label} is invalid`);
+  }
+  const names = value.map((entry) => validatedGitRefName(entry, label));
+  const canonical = [...new Set(names)].sort();
+  if (canonical.length !== names.length) {
+    throw new Error(`workspace-git history reset ${label} contains duplicates`);
+  }
+  return canonical;
+}
+
+function validatedGitRefName(value: unknown, label: string): string {
+  const name = boundedString(value, 256, `history reset ${label} name`);
+  if (
+    /[\0-\x20\x7f~^:?*[\\]/u.test(name) ||
+    name.startsWith("/") ||
+    name.endsWith("/") ||
+    name.startsWith(".") ||
+    name.endsWith(".") ||
+    name.endsWith(".lock") ||
+    name.includes("..") ||
+    name.includes("//") ||
+    name.includes("@{")
+  ) {
+    throw new Error(`workspace-git history reset ${label} name is invalid`);
+  }
+  return name;
+}
+
+function validatedHistoryResetProtection(
+  value: unknown,
+): WorkspaceGitHistoryResetProtection {
+  const protection = requiredRecord(value, "history reset branch protection");
+  if (!hasExactKeys(protection, [
+    "protected",
+    "fingerprint",
+    "configuration",
+    "required_signatures",
+    "rulesets",
+  ])) {
+    throw new Error("workspace-git history reset branch protection is invalid");
+  }
+  if (
+    typeof protection.protected !== "boolean" ||
+    typeof protection.required_signatures !== "boolean"
+  ) {
+    throw new Error("workspace-git history reset branch protection is invalid");
+  }
+  const fingerprint = boundedString(
+    protection.fingerprint,
+    64,
+    "history reset branch protection fingerprint",
+  );
+  if (!SHA256.test(fingerprint)) {
+    throw new Error("workspace-git history reset branch protection fingerprint is invalid");
+  }
+  const configuration = protection.configuration === null
+    ? null
+    : validatedHistoryResetJsonRecord(
+        protection.configuration,
+        "branch protection configuration",
+      );
+  if (!Array.isArray(protection.rulesets) || protection.rulesets.length > 100) {
+    throw new Error("workspace-git history reset rulesets are invalid");
+  }
+  const rulesets = protection.rulesets.map((entry) =>
+    validatedHistoryResetRuleset(entry)
+  );
+  const ids = rulesets.map((entry) => entry.id);
+  if (!sameNumbers(ids, [...new Set(ids)].sort((left, right) => left - right))) {
+    throw new Error("workspace-git history reset rulesets are not canonical");
+  }
+  const effectivelyProtected = configuration !== null ||
+    rulesets.some((entry) => entry.appliesToMain && entry.enforcement === "active");
+  if (protection.protected !== effectivelyProtected) {
+    throw new Error("workspace-git history reset protection state is inconsistent");
+  }
+  return freezeHistoryResetProtection({
+    protected: protection.protected,
+    fingerprint,
+    configuration,
+    requiredSignatures: protection.required_signatures,
+    rulesets,
+  });
+}
+
+function validateHistoryResetPublicProtection(
+  value: unknown,
+  expected: WorkspaceGitHistoryResetProtection,
+): void {
+  const protection = requiredRecord(value, "history reset public branch protection");
+  if (!hasExactKeys(protection, [
+    "protected",
+    "fingerprint",
+    "required_signatures",
+    "rulesets",
+  ])) {
+    throw new Error("workspace-git history reset public branch protection is invalid");
+  }
+  if (!Array.isArray(protection.rulesets) || protection.rulesets.length > 100) {
+    throw new Error("workspace-git history reset public rulesets are invalid");
+  }
+  const rulesets = protection.rulesets.map((entry) => {
+    const ruleset = requiredRecord(entry, "history reset public ruleset");
+    if (!hasExactKeys(ruleset, [
+      "id",
+      "source_type",
+      "target",
+      "enforcement",
+      "applies_to_main",
+      "mutable",
+      "fingerprint",
+    ])) {
+      throw new Error("workspace-git history reset public ruleset is invalid");
+    }
+    return {
+      id: positiveInteger(ruleset.id, "history reset public ruleset ID"),
+      source_type: boundedString(
+        ruleset.source_type,
+        64,
+        "history reset public ruleset source",
+      ),
+      target: boundedString(
+        ruleset.target,
+        64,
+        "history reset public ruleset target",
+      ),
+      enforcement: boundedString(
+        ruleset.enforcement,
+        64,
+        "history reset public ruleset enforcement",
+      ),
+      applies_to_main: ruleset.applies_to_main,
+      mutable: ruleset.mutable,
+      fingerprint: boundedString(
+        ruleset.fingerprint,
+        64,
+        "history reset public ruleset fingerprint",
+      ),
+    };
+  });
+  if (
+    typeof protection.protected !== "boolean" ||
+    typeof protection.required_signatures !== "boolean" ||
+    !isDeepStrictEqual({
+      protected: protection.protected,
+      fingerprint: protection.fingerprint,
+      required_signatures: protection.required_signatures,
+      rulesets,
+    }, {
+      protected: expected.protected,
+      fingerprint: expected.fingerprint,
+      required_signatures: expected.requiredSignatures,
+      rulesets: expected.rulesets.map((ruleset) => ({
+        id: ruleset.id,
+        source_type: ruleset.sourceType,
+        target: ruleset.target,
+        enforcement: ruleset.enforcement,
+        applies_to_main: ruleset.appliesToMain,
+        mutable: ruleset.mutable,
+        fingerprint: ruleset.fingerprint,
+      })),
+    })
+  ) {
+    throw new Error("workspace-git history reset public protection does not match approval scope");
+  }
+}
+
+function validatedHistoryResetLimitations(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    throw new Error("workspace-git history reset limitations are invalid");
+  }
+  let total = 0;
+  const limitations = value.map((entry) => {
+    const limitation = boundedTrimmedString(
+      entry,
+      1_000,
+      "history reset limitation",
+    );
+    total += limitation.length;
+    return limitation;
+  });
+  if (total > 5_000) {
+    throw new Error("workspace-git history reset limitations are too large");
+  }
+  return Object.freeze(limitations);
+}
+
+function validatedHistoryResetRuleset(value: unknown): WorkspaceGitHistoryResetRuleset {
+  const ruleset = requiredRecord(value, "history reset ruleset");
+  if (!hasExactKeys(ruleset, [
+    "id",
+    "source_type",
+    "target",
+    "enforcement",
+    "applies_to_main",
+    "mutable",
+    "fingerprint",
+    "configuration",
+  ])) {
+    throw new Error("workspace-git history reset ruleset is invalid");
+  }
+  const id = positiveInteger(ruleset.id, "history reset ruleset ID");
+  const sourceType = boundedString(ruleset.source_type, 64, "history reset ruleset source");
+  const target = boundedString(ruleset.target, 64, "history reset ruleset target");
+  const enforcement = boundedString(
+    ruleset.enforcement,
+    64,
+    "history reset ruleset enforcement",
+  );
+  const fingerprint = boundedString(
+    ruleset.fingerprint,
+    64,
+    "history reset ruleset fingerprint",
+  );
+  if (
+    !SHA256.test(fingerprint) ||
+    typeof ruleset.applies_to_main !== "boolean" ||
+    typeof ruleset.mutable !== "boolean"
+  ) {
+    throw new Error("workspace-git history reset ruleset is invalid");
+  }
+  return Object.freeze({
+    id,
+    sourceType,
+    target,
+    enforcement,
+    appliesToMain: ruleset.applies_to_main,
+    mutable: ruleset.mutable,
+    fingerprint,
+    configuration: validatedHistoryResetJsonRecord(
+      ruleset.configuration,
+      "ruleset configuration",
+    ),
+  });
+}
+
+function validatedHistoryResetCommitMetadata(
+  value: unknown,
+): WorkspaceGitHistoryResetCommitMetadata {
+  const metadata = requiredRecord(value, "history reset commit metadata");
+  if (!hasExactKeys(metadata, [
+    "author_name",
+    "author_email",
+    "committer_name",
+    "committer_email",
+  ])) {
+    throw new Error("workspace-git history reset commit metadata is invalid");
+  }
+  const normalize = (entry: unknown, label: string, max: number): string => {
+    const text = boundedString(entry, max, `history reset ${label}`);
+    if (/[\0\r\n]/u.test(text)) {
+      throw new Error(`workspace-git history reset ${label} is invalid`);
+    }
+    return text;
+  };
+  return Object.freeze({
+    authorName: normalize(metadata.author_name, "author name", 256),
+    authorEmail: normalize(metadata.author_email, "author email", 320),
+    committerName: normalize(metadata.committer_name, "committer name", 256),
+    committerEmail: normalize(metadata.committer_email, "committer email", 320),
+  });
+}
+
+function validatedHistoryResetJsonRecord(
+  value: unknown,
+  label: string,
+): Readonly<Record<string, unknown>> {
+  const record = requiredRecord(value, `history reset ${label}`);
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(record);
+  } catch {
+    throw new Error(`workspace-git history reset ${label} is invalid`);
+  }
+  if (encoded.length > 100_000) {
+    throw new Error(`workspace-git history reset ${label} is too large`);
+  }
+  const clone: unknown = JSON.parse(encoded);
+  if (!isDeepStrictEqual(record, clone)) {
+    throw new Error(`workspace-git history reset ${label} is not JSON-safe`);
+  }
+  return freezeHistoryResetJson(requiredRecord(clone, `history reset ${label}`));
+}
+
+function freezeHistoryResetJson(
+  value: Record<string, unknown>,
+): Readonly<Record<string, unknown>> {
+  for (const entry of Object.values(value)) {
+    if (Array.isArray(entry)) {
+      for (const item of entry) {
+        const itemRecord = asRecord(item);
+        if (itemRecord !== undefined) freezeHistoryResetJson(itemRecord);
+      }
+      Object.freeze(entry);
+    } else {
+      const entryRecord = asRecord(entry);
+      if (entryRecord !== undefined) freezeHistoryResetJson(entryRecord);
+    }
+  }
+  return Object.freeze(value);
+}
+
+function freezeHistoryResetRefs(
+  refs: readonly WorkspaceGitHistoryResetRef[],
+): readonly WorkspaceGitHistoryResetRef[] {
+  return Object.freeze(refs.map((entry) => Object.freeze({ ...entry })));
+}
+
+function freezeHistoryResetProtection(
+  value: WorkspaceGitHistoryResetProtection,
+): WorkspaceGitHistoryResetProtection {
+  return Object.freeze({
+    ...value,
+    rulesets: Object.freeze(value.rulesets.map((entry) => Object.freeze({
+      ...entry,
+      configuration: freezeHistoryResetJson(
+        structuredClone(entry.configuration) as Record<string, unknown>,
+      ),
+    }))),
+  });
 }
 
 function validatedRepositorySettingsState(
@@ -1304,6 +1935,11 @@ function isMergeMethod(value: string | undefined): value is "merge" | "squash" |
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length &&
+    left.every((value, index) => value === right[index]);
+}
+
+function sameNumbers(left: readonly number[], right: readonly number[]): boolean {
   return left.length === right.length &&
     left.every((value, index) => value === right[index]);
 }

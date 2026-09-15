@@ -307,6 +307,64 @@ interface WorkspaceGitMainUpdateApprovalPlan extends WorkspaceGitApprovalPlanBas
   readonly mergeMethod?: never;
 }
 
+export interface WorkspaceGitHistoryResetRef {
+  readonly name: string;
+  readonly sha: string;
+}
+
+export interface WorkspaceGitHistoryResetRuleset {
+  readonly id: number;
+  readonly sourceType: string;
+  readonly target: string;
+  readonly enforcement: string;
+  readonly appliesToMain: boolean;
+  readonly mutable: boolean;
+  readonly fingerprint: string;
+  readonly configuration: Readonly<Record<string, unknown>>;
+}
+
+export interface WorkspaceGitHistoryResetProtection {
+  readonly protected: boolean;
+  readonly fingerprint: string;
+  readonly configuration: Readonly<Record<string, unknown>> | null;
+  readonly requiredSignatures: boolean;
+  readonly rulesets: readonly WorkspaceGitHistoryResetRuleset[];
+}
+
+export interface WorkspaceGitHistoryResetCommitMetadata {
+  readonly authorName: string;
+  readonly authorEmail: string;
+  readonly committerName: string;
+  readonly committerEmail: string;
+}
+
+interface WorkspaceGitHistoryResetApprovalPlan
+  extends WorkspaceGitApprovalPlanBase {
+  readonly operation: "history_reset";
+  readonly mode: "history_reset";
+  readonly paths: readonly [];
+  readonly branch: "main";
+  readonly expectedHead: string;
+  readonly expectedSnapshotId: string;
+  readonly expectedTree: string;
+  readonly worktreeId?: never;
+  readonly commitMessage: string;
+  readonly pushTarget?: never;
+  readonly pullRequestTitle?: never;
+  readonly pullRequestBody?: never;
+  readonly pullRequestBaseBranch?: never;
+  readonly pullRequestNumber?: never;
+  readonly pullRequestUrl?: never;
+  readonly baseBranch?: never;
+  readonly mergeMethod?: never;
+  readonly expectedRemoteBranches: readonly WorkspaceGitHistoryResetRef[];
+  readonly deleteBranches: readonly WorkspaceGitHistoryResetRef[];
+  readonly expectedTags: readonly WorkspaceGitHistoryResetRef[];
+  readonly branchProtection: WorkspaceGitHistoryResetProtection;
+  readonly commitMetadata: WorkspaceGitHistoryResetCommitMetadata;
+  readonly limitations: readonly string[];
+}
+
 /** Exact workspace-git plan that is safe to project onto the Slack approval UI. */
 export type WorkspaceGitApprovalPlan =
   | WorkspaceGitInitialCommitApprovalPlan
@@ -315,7 +373,8 @@ export type WorkspaceGitApprovalPlan =
   | WorkspaceGitPullRequestApprovalPlan
   | WorkspaceGitExistingPullRequestUpdateApprovalPlan
   | WorkspaceGitRepositorySettingsApprovalPlan
-  | WorkspaceGitMainUpdateApprovalPlan;
+  | WorkspaceGitMainUpdateApprovalPlan
+  | WorkspaceGitHistoryResetApprovalPlan;
 
 export interface AgentGitApprovalInputResponse {
   readonly requestId: string;

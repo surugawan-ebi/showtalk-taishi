@@ -225,7 +225,10 @@ export function buildWorkspaceGitApprovalBlocks(
       },
     },
   ];
-  if (plan.operation !== "github_repository_settings") {
+  if (
+    plan.operation !== "github_repository_settings" &&
+    plan.operation !== "history_reset"
+  ) {
     blocks.push(pathSummaryBlock(plan.paths.length, value, {
       pathsExpanded,
       allowPathToggle,
@@ -458,6 +461,20 @@ function planFields(
       field("変更項目", repositorySettingsChangedFields(plan).join(", ")),
     ];
   }
+  if (plan.operation === "history_reset") {
+    return [
+      field("操作", operation),
+      field("Repository", plan.repoId),
+      field("Branch", plan.branch),
+      field("現在のmain", plan.expectedHead),
+      field("保持するtree", plan.expectedTree),
+      field("Snapshot", plan.expectedSnapshotId),
+      field("削除branch", `${plan.deleteBranches.length}件`),
+      field("Tag", `${plan.expectedTags.length}件（変更しない）`),
+      field("保護設定", plan.branchProtection.protected ? "一時停止後に復元" : "なし"),
+      field("署名必須", plan.branchProtection.requiredSignatures ? "有効" : "無効"),
+    ];
+  }
   const fields = [
     field("操作", operation),
     field("Repository", plan.repoId),
@@ -623,6 +640,42 @@ function exactPlanTexts(
       ],
     ];
   }
+  if (plan.operation === "history_reset") {
+    return [
+      ["Commit message", plan.commitMessage],
+      ["削除するremote branches", JSON.stringify(plan.deleteBranches)],
+      ["変更しないtags", JSON.stringify(plan.expectedTags)],
+      ["復元するbranch protection", JSON.stringify({
+        protected: plan.branchProtection.protected,
+        fingerprint: plan.branchProtection.fingerprint,
+        configuration: plan.branchProtection.configuration,
+        required_signatures: plan.branchProtection.requiredSignatures,
+        rulesets: plan.branchProtection.rulesets.map((ruleset) => ({
+          id: ruleset.id,
+          source_type: ruleset.sourceType,
+          target: ruleset.target,
+          enforcement: ruleset.enforcement,
+          applies_to_main: ruleset.appliesToMain,
+          mutable: ruleset.mutable,
+          fingerprint: ruleset.fingerprint,
+          configuration: ruleset.configuration,
+        })),
+      })],
+      ["Root commit metadata", JSON.stringify({
+        author_name: plan.commitMetadata.authorName,
+        author_email: plan.commitMetadata.authorEmail,
+        committer_name: plan.commitMetadata.committerName,
+        committer_email: plan.commitMetadata.committerEmail,
+      })],
+      [
+        "不可逆性",
+        [
+          "mainの公開履歴を親なしの1コミットへ置換し、列挙されたremote branchを削除します。",
+          ...plan.limitations,
+        ].join("\n"),
+      ],
+    ];
+  }
   return [
     ...(plan.commitMessage === undefined
       ? []
@@ -687,6 +740,8 @@ function operationLabel(operation: WorkspaceGitApprovalPlan["operation"]): strin
       return "GitHub Repository設定を変更";
     case "main_update":
       return "ローカルmainをfast-forward更新";
+    case "history_reset":
+      return "公開Git履歴を1コミットへ初期化";
   }
 }
 

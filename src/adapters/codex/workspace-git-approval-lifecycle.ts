@@ -519,6 +519,17 @@ export function sameExactWorkspaceGitApprovalPlan(
         right.repositorySettingsResultingState,
       );
   }
+  if (left.operation === "history_reset" || right.operation === "history_reset") {
+    return left.operation === "history_reset" &&
+      right.operation === "history_reset" &&
+      left.expectedTree === right.expectedTree &&
+      isDeepStrictEqual(left.expectedRemoteBranches, right.expectedRemoteBranches) &&
+      isDeepStrictEqual(left.deleteBranches, right.deleteBranches) &&
+      isDeepStrictEqual(left.expectedTags, right.expectedTags) &&
+      isDeepStrictEqual(left.branchProtection, right.branchProtection) &&
+      isDeepStrictEqual(left.commitMetadata, right.commitMetadata) &&
+      isDeepStrictEqual(left.limitations, right.limitations);
+  }
   return true;
 }
 
@@ -570,6 +581,8 @@ function exactExecutionTool(plan: WorkspaceGitApprovalPlan): string {
       return "execute_approved_github_repository_settings";
     case "main_update":
       return "execute_approved_main_update";
+    case "history_reset":
+      return "execute_approved_history_reset";
   }
 }
 

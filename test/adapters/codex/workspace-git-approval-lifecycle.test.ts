@@ -115,6 +115,63 @@ function mainUpdateExecutionItem(outcome: "updated" | "skipped") {
   };
 }
 
+function historyResetPlan(): WorkspaceGitApprovalPlan {
+  return {
+    operationId: "55555555-5555-4555-8555-555555555555",
+    planHash: "f".repeat(64),
+    approvalTarget: "history_reset_showtalk-taishi",
+    operation: "history_reset",
+    repoId: "showtalk-taishi",
+    environment: "development",
+    mode: "history_reset",
+    paths: [],
+    branch: "main",
+    expectedHead: "b".repeat(40),
+    expectedSnapshotId: "d".repeat(64),
+    expectedTree: "c".repeat(40),
+    commitMessage: "Initial public OSS snapshot",
+    expectedRemoteBranches: [
+      { name: "agent/old", sha: "a".repeat(40) },
+      { name: "main", sha: "b".repeat(40) },
+    ],
+    deleteBranches: [{ name: "agent/old", sha: "a".repeat(40) }],
+    expectedTags: [],
+    branchProtection: {
+      protected: false,
+      fingerprint: "e".repeat(64),
+      configuration: null,
+      requiredSignatures: false,
+      rulesets: [],
+    },
+    commitMetadata: {
+      authorName: "example",
+      authorEmail: "example@users.noreply.github.com",
+      committerName: "example",
+      committerEmail: "example@users.noreply.github.com",
+    },
+    limitations: ["Existing clones and forks cannot be erased."],
+    expiresAt: "2026-09-15T20:00:00+09:00",
+  };
+}
+
+function historyResetExecutionItem(outcome: "applied" | "failed") {
+  const exact = historyResetPlan();
+  return {
+    type: "mcpToolCall",
+    id: `history-reset-${outcome}`,
+    server: "workspace-git",
+    tool: "execute_approved_history_reset",
+    status: "completed",
+    arguments: { operation_id: exact.operationId },
+    result: {
+      structuredContent: {
+        operation_id: exact.operationId,
+        status: outcome,
+      },
+    },
+  };
+}
+
 test("binds exactly one plan and preserves conflicting plans as ambiguous", () => {
   const lifecycle = new WorkspaceGitApprovalLifecycle();
   const exact = plan();
@@ -151,6 +208,28 @@ test("recognizes updated and skipped main-update executions as terminal outcomes
       { kind: "executed" },
     );
   }
+});
+
+test("observes only the exact history-reset execute tool", () => {
+  const lifecycle = new WorkspaceGitApprovalLifecycle();
+  const exact = historyResetPlan();
+  lifecycle.beginApprovedExecution("session", exact);
+  lifecycle.observeItem("session", historyResetExecutionItem("applied"));
+  assert.deepEqual(
+    lifecycle.assessTurnCompletion("session", "idle", true),
+    { kind: "executed" },
+  );
+
+  const substituted = new WorkspaceGitApprovalLifecycle();
+  substituted.rememberPlan("session", "turn", exact);
+  const changed = {
+    ...exact,
+    deleteBranches: [{ name: "agent/other", sha: "a".repeat(40) }],
+  } as WorkspaceGitApprovalPlan;
+  substituted.rememberPlan("session", "turn", changed);
+  assert.deepEqual(substituted.inspectPlanBinding("session", "turn"), {
+    kind: "ambiguous",
+  });
 });
 
 test("treats changed exact-plan fields as ambiguous even when public IDs match", () => {

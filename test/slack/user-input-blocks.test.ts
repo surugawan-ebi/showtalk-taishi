@@ -84,6 +84,50 @@ const mainUpdatePlan = {
   expiresAt: "2026-09-09T01:00:00+09:00",
 } satisfies WorkspaceGitApprovalPlan;
 
+const historyResetPlan = {
+  operationId: "55555555-5555-4555-8555-555555555555",
+  planHash: "f".repeat(64),
+  approvalTarget: "history_reset_showtalk-taishi",
+  operation: "history_reset",
+  repoId: "showtalk-taishi",
+  environment: "development",
+  mode: "history_reset",
+  paths: [],
+  branch: "main",
+  expectedHead: "b".repeat(40),
+  expectedSnapshotId: "d".repeat(64),
+  expectedTree: "c".repeat(40),
+  commitMessage: "Initial public OSS snapshot",
+  expectedRemoteBranches: [
+    { name: "agent/old", sha: "a".repeat(40) },
+    { name: "main", sha: "b".repeat(40) },
+  ],
+  deleteBranches: [{ name: "agent/old", sha: "a".repeat(40) }],
+  expectedTags: [],
+  branchProtection: {
+    protected: true,
+    fingerprint: "e".repeat(64),
+    configuration: {
+      required_status_checks: {
+        strict: true,
+        contexts: ["verify"],
+      },
+    },
+    requiredSignatures: false,
+    rulesets: [],
+  },
+  commitMetadata: {
+    authorName: "example",
+    authorEmail: "example@users.noreply.github.com",
+    committerName: "example",
+    committerEmail: "example@users.noreply.github.com",
+  },
+  limitations: [
+    "既存clone、fork、Pull Request refs、GitHub cache等の完全消去は保証されません。",
+  ],
+  expiresAt: "2026-09-15T20:00:00+09:00",
+} satisfies WorkspaceGitApprovalPlan;
+
 test("renders an exact Git plan while keeping it out of the action value", () => {
   const blocks = buildWorkspaceGitApprovalBlocks("この計画を承認しますか？", plan, routing);
   const rendered = JSON.stringify(blocks);
@@ -150,6 +194,35 @@ test("renders a main-update plan as a local fast-forward without a push target",
   assert.match(rendered, /agent\/fix-approval-recovery-v2/u);
   assert.match(rendered, /primary/u);
   assert.doesNotMatch(rendered, /Push target/u);
+});
+
+test("renders a history reset as an explicitly destructive exact Git plan", () => {
+  const blocks = buildWorkspaceGitApprovalBlocks(
+    "公開履歴の初期化を承認しますか？",
+    historyResetPlan,
+    routing,
+  );
+  const rendered = JSON.stringify(blocks);
+  assert.match(rendered, /公開Git履歴を1コミットへ初期化/u);
+  assert.match(rendered, /Initial public OSS snapshot/u);
+  assert.match(rendered, /agent\/old/u);
+  assert.match(rendered, /一時停止後に復元/u);
+  assert.match(rendered, /不可逆性/u);
+  assert.match(rendered, /完全消去は保証されません/u);
+  assert.match(rendered, /承認して実行/u);
+  assert.match(rendered, /拒否・保留/u);
+  assert.doesNotMatch(rendered, /変更ファイル|Worktree|Push target/u);
+
+  const actions = blocks.at(-1);
+  assert.equal(actions?.type, "actions");
+  if (actions?.type !== "actions") return;
+  const encoded = "value" in actions.elements[0]!
+    ? actions.elements[0]!.value
+    : undefined;
+  assert.doesNotMatch(
+    String(encoded),
+    /showtalk-taishi|agent\/old|history_reset/u,
+  );
 });
 
 test("collapses changed files and PR body independently without changing approval actions", () => {

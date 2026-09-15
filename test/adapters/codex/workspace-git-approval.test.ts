@@ -166,6 +166,106 @@ function mainUpdateNotification() {
   };
 }
 
+function historyResetNotification() {
+  const approvalScope = {
+    kind: "history_reset",
+    repo_id: "showtalk-taishi",
+    target_branch: "main",
+    expected_remote_main_sha: "b".repeat(40),
+    expected_tree_sha: "c".repeat(40),
+    expected_snapshot_id: "d".repeat(64),
+    expected_remote_branches: [
+      { name: "agent/old", sha: "a".repeat(40) },
+      { name: "main", sha: "b".repeat(40) },
+    ],
+    delete_branches: [{ name: "agent/old", sha: "a".repeat(40) }],
+    expected_tags: [],
+    branch_protection: {
+      protected: true,
+      fingerprint: "e".repeat(64),
+      configuration: {
+        required_status_checks: {
+          strict: true,
+          contexts: ["verify"],
+          checks: [{ context: "verify", app_id: 15368 }],
+        },
+        enforce_admins: false,
+        required_pull_request_reviews: null,
+        restrictions: null,
+        required_linear_history: false,
+        allow_force_pushes: false,
+        allow_deletions: false,
+        block_creations: false,
+        required_conversation_resolution: true,
+        lock_branch: false,
+        allow_fork_syncing: false,
+      },
+      required_signatures: false,
+      rulesets: [],
+    },
+    commit_message: "Initial public OSS snapshot",
+    commit_metadata: {
+      author_name: "example",
+      author_email: "example@users.noreply.github.com",
+      committer_name: "example",
+      committer_email: "example@users.noreply.github.com",
+    },
+  };
+  const scope = {
+    kind: approvalScope.kind,
+    repo_id: approvalScope.repo_id,
+    target_branch: approvalScope.target_branch,
+    expected_remote_main_sha: approvalScope.expected_remote_main_sha,
+    expected_tree_sha: approvalScope.expected_tree_sha,
+    expected_snapshot_id: approvalScope.expected_snapshot_id,
+    expected_remote_branches: structuredClone(approvalScope.expected_remote_branches),
+    delete_branches: structuredClone(approvalScope.delete_branches),
+    expected_tags: structuredClone(approvalScope.expected_tags),
+    branch_protection: {
+      protected: approvalScope.branch_protection.protected,
+      fingerprint: approvalScope.branch_protection.fingerprint,
+      required_signatures: approvalScope.branch_protection.required_signatures,
+      rulesets: [],
+    },
+    commit_message: approvalScope.commit_message,
+    limitations: [
+      "Only the cataloged GitHub refs are changed.",
+      "Existing clones and forks cannot be erased.",
+    ],
+  };
+  return {
+    threadId: "thr_1",
+    turnId: "turn_history_reset",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp_history_reset",
+      server: "workspace-git",
+      tool: "prepare_history_reset",
+      status: "completed",
+      arguments: {
+        repo_id: "showtalk-taishi",
+        delete_branches: ["agent/old"],
+        commit_message: "Initial public OSS snapshot",
+        expected_remote_main_sha: "b".repeat(40),
+        ttl_minutes: 30,
+      },
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "55555555-5555-4555-8555-555555555555",
+          approval_expires_at: "2026-09-15T20:00:00+09:00",
+          approval_target: "history_reset_showtalk-taishi",
+          plan_hash: "f".repeat(64),
+          scope,
+          approval_scope: approvalScope,
+          execute_tool: "execute_approved_history_reset",
+          external_write: false,
+        },
+      },
+    },
+  };
+}
+
 function existingPullRequestUpdateNotification() {
   return {
     threadId: "thr_1",
@@ -285,6 +385,82 @@ test("captures update_repository_main as an exact main-update approval plan", ()
       expiresAt: "2026-09-09T01:00:00+09:00",
     },
   });
+});
+
+test("captures and freezes an exact destructive history-reset plan", () => {
+  const capture = captureWorkspaceGitPlan(historyResetNotification());
+  assert.ok(capture);
+  assert.equal(capture.plan.operation, "history_reset");
+  if (capture.plan.operation !== "history_reset") return;
+  assert.equal(capture.plan.expectedHead, "b".repeat(40));
+  assert.equal(capture.plan.expectedTree, "c".repeat(40));
+  assert.equal(capture.plan.deleteBranches.length, 1);
+  assert.equal(capture.plan.deleteBranches[0]?.name, "agent/old");
+  assert.equal(capture.plan.branchProtection.protected, true);
+  assert.equal(capture.plan.branchProtection.requiredSignatures, false);
+  assert.equal(capture.plan.commitMetadata.authorName, "example");
+  assert.ok(Object.isFrozen(capture.plan));
+  assert.ok(Object.isFrozen(capture.plan.deleteBranches));
+  assert.ok(Object.isFrozen(capture.plan.branchProtection));
+  assert.ok(Object.isFrozen(capture.plan.approvalScope));
+});
+
+test("accepts a history reset with no additional remote branches to delete", () => {
+  const notification = historyResetNotification();
+  notification.item.arguments.delete_branches = [];
+  notification.item.result.structuredContent.scope.expected_remote_branches = [
+    { name: "main", sha: "b".repeat(40) },
+  ];
+  notification.item.result.structuredContent.scope.delete_branches = [];
+  notification.item.result.structuredContent.approval_scope.expected_remote_branches = [
+    { name: "main", sha: "b".repeat(40) },
+  ];
+  notification.item.result.structuredContent.approval_scope.delete_branches = [];
+
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "history_reset");
+  if (capture?.plan.operation !== "history_reset") return;
+  assert.deepEqual(capture.plan.deleteBranches, []);
+});
+
+test("fails closed when a history-reset boundary is missing or substituted", () => {
+  const missingScope = historyResetNotification();
+  Reflect.deleteProperty(
+    missingScope.item.result.structuredContent,
+    "approval_scope",
+  );
+  assert.throws(
+    () => captureWorkspaceGitPlan(missingScope),
+    /approval scope is invalid/u,
+  );
+
+  const substitutedDeletion = historyResetNotification();
+  substitutedDeletion.item.result.structuredContent.approval_scope.delete_branches = [];
+  assert.throws(
+    () => captureWorkspaceGitPlan(substitutedDeletion),
+    /public refs do not match approval scope/u,
+  );
+
+  const wrongExecute = historyResetNotification();
+  wrongExecute.item.result.structuredContent.execute_tool =
+    "execute_approved_git_publication";
+  assert.throws(
+    () => captureWorkspaceGitPlan(wrongExecute),
+    /invalid approval execution boundary/u,
+  );
+
+  const deletesMain = historyResetNotification();
+  deletesMain.item.arguments.delete_branches = ["main"];
+  deletesMain.item.result.structuredContent.scope.delete_branches = [
+    { name: "main", sha: "b".repeat(40) },
+  ];
+  deletesMain.item.result.structuredContent.approval_scope.delete_branches = [
+    { name: "main", sha: "b".repeat(40) },
+  ];
+  assert.throws(
+    () => captureWorkspaceGitPlan(deletesMain),
+    /deletion set is invalid/u,
+  );
 });
 
 test("rejects substituted main-update execution and state", () => {
