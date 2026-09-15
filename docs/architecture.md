@@ -227,8 +227,8 @@ target app, platform, working directory, lane, version/build, track,
 metadata scope, and automatic-release setting. On approval, ShowTalk records the
 answer for that displayed command only. It does not mint Store-specific bearer
 proofs, rewrite Codex tool arguments, call Store MCP tools, or inspect Store
-credentials. Codex then runs only the approved fastlane command with the shared
-machine-local release env sourced in the shell.
+credentials. Codex then runs only the approved fastlane command with credentials
+and release configuration supplied by the operator outside the repository.
 
 The Store approval record is not a reusable capability and never authorizes a
 different lane, app, version/build, track, metadata scope, or release mode.

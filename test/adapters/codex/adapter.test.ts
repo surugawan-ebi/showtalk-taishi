@@ -787,15 +787,18 @@ async function beginApprovedPublication(
   server: FakeAppServer,
   adapter: CodexAdapter,
   rpcId: number,
-): Promise<{ readonly eventsPromise: Promise<AgentEvent[]> }> {
+): Promise<{
+  readonly events: AgentEvent[];
+  readonly eventsPromise: Promise<AgentEvent[]>;
+}> {
   const session = { id: "thr_1" };
   let requestId = "";
   let releaseRequest!: () => void;
   const requestReady = new Promise<void>((resolve) => {
     releaseRequest = resolve;
   });
+  const events: AgentEvent[] = [];
   const eventsPromise = (async () => {
-    const events: AgentEvent[] = [];
     for await (const event of adapter.sendMessage(session, {
       text: "Publish after approval",
       source: { type: "human" },
@@ -817,7 +820,7 @@ async function beginApprovedPublication(
   });
   await requestReady;
   await adapter.respondToUserInput(session, { requestId, optionId: "approve" });
-  return { eventsPromise };
+  return { events, eventsPromise };
 }
 
 function notifyInitialPushPlan(server: FakeAppServer): void {
@@ -6580,7 +6583,11 @@ test("ignores an old watchdog result after normal completion starts a continuati
     await listGate;
   };
   const adapter = new CodexAdapter(server, { terminalWatchdogMs: 5 });
-  const { eventsPromise } = await beginApprovedPublication(server, adapter, 1007);
+  const { events, eventsPromise } = await beginApprovedPublication(
+    server,
+    adapter,
+    1007,
+  );
   await listEntered;
 
   server.notify("turn/completed", {
@@ -6595,7 +6602,19 @@ test("ignores an old watchdog result after normal completion starts a continuati
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(server.turnStarts.length, 2);
   releaseList();
-  await new Promise((resolve) => setImmediate(resolve));
+  for (
+    let attempt = 0;
+    attempt < 20 &&
+    events.filter((event) =>
+      event.type === "status.changed" && event.status === "running"
+    ).length < 3;
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(events.filter((event) =>
+    event.type === "status.changed" && event.status === "running"
+  ).length, 3);
   server.notify("turn/completed", {
     threadId: "thr_1",
     turn: {
@@ -6606,7 +6625,7 @@ test("ignores an old watchdog result after normal completion starts a continuati
     },
   });
 
-  const events = await eventsPromise;
+  await eventsPromise;
   assert.equal(server.turnStarts.length, 2);
   assert.equal(events.filter((event) =>
     event.type === "error" && event.code === "GIT_APPROVAL_EXECUTION_NOT_OBSERVED"

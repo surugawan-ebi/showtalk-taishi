@@ -78,6 +78,17 @@ Start a fresh Slack-originated diagnostic turn after replacement.
    If this diagnostic tool is absent, or either adapter setting differs, mark
    this stage unverified and stop instead of substituting a Slack write,
    Gateway restart, production service, or production data operation.
+
+   After the native MCP gate, set `live_acceptance_mcp_probe: false` (or
+   remove it) before restoring the normal `approvals_reviewer: auto_review`
+   setting. Validate the final configuration before requesting a restart.
+   Leaving the probe enabled with `auto_review` fails configuration validation:
+   the replacement worker exits before connecting to Slack. Restore the
+   intended compatible settings; do not relax validation or start a second
+   worker. If the installed LaunchAgent is already retrying startup, the
+   corrected configuration is picked up on its next attempt. Confirm a new
+   Slack Socket Mode connection in the operational log; a running supervisor
+   alone does not establish recovery.
 4. When external-action approval code changed, test both accept and reject with
    separate confirmations using question ID `external_action_approval`, the
    exact two fixed labels, non-empty descriptions, and separate `Target:`,

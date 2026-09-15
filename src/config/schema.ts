@@ -239,15 +239,15 @@ export const taishiConfigSchema = z
             model: modelIdSchema.optional(),
             reasoning_effort: reasoningEffortSchema.optional(),
             approval_policy: z
-              .enum(["untrusted", "on-request", "never"])
-              .optional(),
+              .enum(["on-request", "never"])
+              .default("on-request"),
             approvals_reviewer: z
               .enum(["user", "auto_review", "guardian_subagent"])
-              .optional(),
+              .default("auto_review"),
             live_acceptance_mcp_probe: z.boolean().optional(),
             sandbox: z
               .enum(["read-only", "workspace-write", "danger-full-access"])
-              .optional(),
+              .default("workspace-write"),
             env_passthrough: z
               .array(environmentVariableNameSchema)
               .max(64)

@@ -108,10 +108,18 @@ export interface ModelListResponse {
 
 export type ApprovalsReviewer = "user" | "auto_review" | "guardian_subagent";
 
+/**
+ * The App Server wire protocol still exposes `untrusted` as an internal or
+ * derived value. ShowTalk's operator config intentionally accepts only the
+ * current explicit settings: `on-request` and `never`.
+ */
+export type CodexApprovalPolicy = "untrusted" | "on-request" | "never";
+export type ShowTalkApprovalPolicy = Exclude<CodexApprovalPolicy, "untrusted">;
+
 export interface ThreadStartParams {
   model?: string;
   cwd?: string;
-  approvalPolicy?: "untrusted" | "on-request" | "never";
+  approvalPolicy?: CodexApprovalPolicy;
   approvalsReviewer?: ApprovalsReviewer;
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   config?: Readonly<Record<string, CodexJsonValue>>;
@@ -123,7 +131,7 @@ export interface ThreadResumeParams {
   threadId: string;
   model?: string;
   cwd?: string;
-  approvalPolicy?: "untrusted" | "on-request" | "never";
+  approvalPolicy?: CodexApprovalPolicy;
   approvalsReviewer?: ApprovalsReviewer;
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   config?: Readonly<Record<string, CodexJsonValue>>;
@@ -153,7 +161,7 @@ export interface TurnStartParams {
   /** Per-turn client context. Unlike thread settings, this is not sticky. */
   additionalContext?: Readonly<Record<string, CodexAdditionalContextEntry>>;
   cwd?: string;
-  approvalPolicy?: "untrusted" | "on-request" | "never";
+  approvalPolicy?: CodexApprovalPolicy;
   approvalsReviewer?: ApprovalsReviewer;
   model?: string;
   effort?: string;

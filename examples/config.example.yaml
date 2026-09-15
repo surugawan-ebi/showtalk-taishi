@@ -31,15 +31,17 @@ adapters:
     transport: stdio
     # Optional: low, medium, high, xhigh, etc. Omit to use Codex defaults.
     # reasoning_effort: medium
-    # These are also optional. Omit them to inherit the Codex App Server/thread
-    # settings used by Codex App and CLI; set them only for a Taishi override.
-    # approval_policy: on-request
-    # approvals_reviewer: auto_review
+    # ShowTalk defaults to Codex's "Approve for me"-equivalent mode: commands
+    # remain sandboxed and eligible approval requests go to the auto reviewer.
+    approval_policy: on-request
+    approvals_reviewer: auto_review
+    sandbox: workspace-write
     # Enable only while running the documented live MCP approval acceptance gate.
     # The live gate also requires approval_policy: on-request and
     # approvals_reviewer: user.
+    # After the gate, set the probe to false (or remove it) before restoring
+    # auto_review; leaving the probe true prevents the next worker from starting.
     # live_acceptance_mcp_probe: true
-    # sandbox: workspace-write
     # Parent-process credentials are denied by default. Deliberately name any
     # additional build/runtime variable this Koe really needs.
     env_passthrough: []

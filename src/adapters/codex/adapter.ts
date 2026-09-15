@@ -36,6 +36,7 @@ import {
   type PermissionsApprovalResponse,
   type RpcError,
   type RpcId,
+  type ShowTalkApprovalPolicy,
   type ToolRequestUserInputResponse,
   type ThreadResumeParams,
   type ThreadStartParams,
@@ -289,7 +290,7 @@ export interface CodexAdapterOptions {
   model?: string;
   reasoningEffort?: string;
   automaticChoiceMode?: "off" | "ordinary_top_choice";
-  approvalPolicy?: "untrusted" | "on-request" | "never";
+  approvalPolicy?: ShowTalkApprovalPolicy;
   /** Override who reviews approvals; omit to inherit Codex App Server configuration. */
   approvalsReviewer?: ApprovalsReviewer;
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
@@ -354,7 +355,7 @@ export class CodexAdapter implements AgentAdapter {
     model?: string;
     reasoningEffort?: string;
     automaticChoiceMode: CodexAutomaticChoiceMode;
-    approvalPolicy?: "untrusted" | "on-request" | "never";
+    approvalPolicy?: ShowTalkApprovalPolicy;
     approvalsReviewer?: ApprovalsReviewer;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access";
     approvalTimeoutMs: number;

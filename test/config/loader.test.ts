@@ -52,10 +52,10 @@ test("loads config and expands environment references", async () => {
     WORKSPACE: "/tmp/project",
   });
   assert.equal(config.agents.implementer?.workspace.path, "/tmp/project");
-  assert.equal(config.adapters.codex?.approval_policy, undefined);
-  assert.equal(config.adapters.codex?.approvals_reviewer, undefined);
+  assert.equal(config.adapters.codex?.approval_policy, "on-request");
+  assert.equal(config.adapters.codex?.approvals_reviewer, "auto_review");
   assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, undefined);
-  assert.equal(config.adapters.codex?.sandbox, undefined);
+  assert.equal(config.adapters.codex?.sandbox, "workspace-write");
   assert.equal(config.agents.implementer?.adapter_session_id, undefined);
   assert.equal(config.agents.implementer?.consultations, undefined);
   assert.equal(config.agents.implementer?.automatic_choice_mode, "off");
@@ -796,6 +796,27 @@ test("loads explicit Codex permission overrides", async () => {
   assert.equal(config.adapters.codex?.sandbox, "read-only");
 });
 
+test("rejects the removed untrusted Codex approval setting", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "    transport: stdio",
+      "    transport: stdio\n    approval_policy: untrusted",
+    ),
+  );
+  await assert.rejects(
+    loadConfig(path, {
+      STATE_FILE: "/tmp/state.json",
+      APP_TOKEN: "xapp-test",
+      BOT_TOKEN: "xoxb-test",
+      WORKSPACE: "/tmp/project",
+    }),
+    /approval_policy/u,
+  );
+});
+
 test("loads the live acceptance MCP probe only with human approval routing", async () => {
   const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
   const path = join(directory, "config.yaml");
@@ -854,6 +875,44 @@ test("rejects a live acceptance MCP probe without human approval routing", async
       /live_acceptance_mcp_probe requires/u,
     );
   }
+});
+
+test("recovers auto-review config by disabling a leftover live acceptance probe", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-probe-recovery-"));
+  const path = join(directory, "config.yaml");
+  const invalidSource = source.replace(
+    "    transport: stdio",
+    [
+      "    transport: stdio",
+      "    approval_policy: on-request",
+      "    approvals_reviewer: auto_review",
+      "    live_acceptance_mcp_probe: true",
+    ].join("\n"),
+  );
+  const environment = {
+    STATE_FILE: join(directory, "state.json"),
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  };
+  await writeFile(path, invalidSource);
+  await assert.rejects(
+    loadConfig(path, environment),
+    /live_acceptance_mcp_probe requires approvals_reviewer: user/u,
+  );
+
+  await writeFile(
+    path,
+    invalidSource.replace(
+      "live_acceptance_mcp_probe: true",
+      "live_acceptance_mcp_probe: false",
+    ),
+  );
+  const config = await loadConfig(path, environment);
+  assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, false);
+  assert.equal(config.adapters.codex?.approvals_reviewer, "auto_review");
+  assert.equal(config.adapters.codex?.approval_policy, "on-request");
+  assert.equal(config.adapters.codex?.sandbox, "workspace-write");
 });
 
 test("loads a bounded per-Agent Slack display name and icon", async () => {

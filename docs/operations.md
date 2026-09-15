@@ -69,8 +69,8 @@ metadata scope, and automatic-release setting. Taishi records only the approval
 answer for that displayed command; it does not mint Store-specific proofs,
 rewrite tool arguments, call Store MCP tools, or inspect Store credentials.
 After approval, Codex runs only the displayed fastlane command in the target app
-repository after loading the operator-configured private release environment
-outside the repository.
+repository. Operators must supply credentials and release configuration outside
+the repository.
 
 The retired AppOps hook installer and live proof smoke are no longer public
 commands. The standard runtime does not configure an AppOps signer or broker;
