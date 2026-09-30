@@ -3572,7 +3572,11 @@ test("terminalizes a non-blocking ordinary choice when App Server resolves it fi
 
 test("repairs a non-blocking external action before projecting its final approval", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 10,
+    interactionAudit: (event) => audit.push(event),
+  });
   const session = { id: "thr_1" };
   const events: AgentEvent[] = [];
   let releaseChoice!: () => void;
@@ -3655,6 +3659,10 @@ test("repairs a non-blocking external action before projecting its final approva
       ).unref();
     }),
   ]);
+  server.notify("serverRequest/resolved", {
+    threadId: "thr_1",
+    requestId: 902,
+  });
   await consuming;
 
   assert.equal(
@@ -3671,6 +3679,19 @@ test("repairs a non-blocking external action before projecting its final approva
     server.errorResponses[0]?.message ?? "",
     /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED.*isBlocking must be true/su,
   );
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.request_rejected" &&
+    event.rpcId === 902 &&
+    event.outcome === "external_action_blocking_required"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.request_terminalized" &&
+    event.rpcId === 902 &&
+    event.outcome === "resolved_without_local_binding"
+  ));
+  assert.equal(audit.some((event) =>
+    event.event === "structured_input.callback_bound" && event.rpcId === 902
+  ), false);
   assert.deepEqual(server.userInputResponses, [{
     id: 903,
     response: {

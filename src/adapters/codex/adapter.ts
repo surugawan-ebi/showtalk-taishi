@@ -85,6 +85,7 @@ import {
   hasExternalActionApprovalQuestionId,
   hasWorkspaceGitApprovalQuestionId,
   looksLikeWorkspaceGitApproval,
+  MalformedExternalActionApprovalError,
   validateOrdinaryChoiceRequest,
   type ValidatedChoiceQuestion,
 } from "./structured-input.js";
@@ -2428,15 +2429,24 @@ export class CodexAdapter implements AgentAdapter {
         });
         return;
       }
-      if (
-        externalActionApproval &&
-        this.#requestExternalActionApprovalRepair(
+      if (externalActionApproval) {
+        this.#auditStructuredInput(
+          "structured_input.request_rejected",
+          serverRequest.id,
+          {
+            requestId: this.#structuredInputCorrelationId(serverRequest.id).id,
+            sessionId,
+            turnId,
+            outcome: externalActionRepairAuditOutcome(error),
+          },
+        );
+        if (this.#requestExternalActionApprovalRepair(
           serverRequest.id,
           sessionId,
           turnId,
-        )
-      ) {
-        return;
+        )) {
+          return;
+        }
       }
       const reason = publicStructuredInputError(error);
       this.#client.respondError(serverRequest.id, {
@@ -4136,6 +4146,29 @@ function publicStructuredInputError(error: unknown): string {
   return error instanceof Error && error.message.trim().length > 0
     ? error.message.slice(0, 500)
     : "Unsupported ordinary structured input";
+}
+
+function externalActionRepairAuditOutcome(
+  error: unknown,
+): InteractionAuditOutcome {
+  if (!(error instanceof MalformedExternalActionApprovalError)) {
+    return "external_action_request_invalid";
+  }
+  switch (error.reason) {
+    case "blocking_required":
+      return "external_action_blocking_required";
+    case "single_question_required":
+    case "question_id_invalid":
+      return "external_action_question_shape_invalid";
+    case "two_options_required":
+    case "approve_label_invalid":
+    case "reject_label_invalid":
+      return "external_action_option_shape_invalid";
+    case "description_invalid":
+      return "external_action_description_invalid";
+    case "details_invalid":
+      return "external_action_details_invalid";
+  }
 }
 
 function buildTurnInput(request: SendMessageRequest): TurnStartParams["input"] {

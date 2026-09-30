@@ -49,6 +49,9 @@ non-blocking request or `answers: {}` never authorizes the operation. On the fir
 malformed external-action request in a turn, Taishi returns a bounded repair
 instruction to App Server without projecting an error to Slack. A corrected
 request may be retried once; a second malformed request is rejected visibly.
+The interaction audit records only a fixed rejection classifier (blocking,
+question shape, option shape, descriptions, details, or another invalid field),
+never the question, option text, answer, or raw routing identifiers.
 After that bounded retry is exhausted, further external-action confirmations
 in the same turn are refused and cannot produce an approval answer.
 Requests that already carry a reserved approval label still wait through the

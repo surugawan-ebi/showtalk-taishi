@@ -45,8 +45,18 @@ export interface ValidatedChoiceRequest {
   readonly autoResolutionMs?: number;
 }
 
+export type MalformedExternalActionApprovalReason =
+  | "blocking_required"
+  | "single_question_required"
+  | "question_id_invalid"
+  | "two_options_required"
+  | "approve_label_invalid"
+  | "reject_label_invalid"
+  | "description_invalid"
+  | "details_invalid";
+
 export class MalformedExternalActionApprovalError extends Error {
-  constructor() {
+  constructor(readonly reason: MalformedExternalActionApprovalReason) {
     super(
       "External action approval requires exactly one question and the fixed " +
         "approve and reject choices in order, non-empty option descriptions, " +
@@ -106,7 +116,11 @@ export function validateOrdinaryChoiceRequest(
   value: unknown,
 ): ValidatedChoiceRequest {
   const params = requiredRecord(value, "structured input request");
+  const externalActionApproval = hasExternalActionApprovalQuestionId(params);
   if (typeof params.isBlocking !== "boolean") {
+    if (externalActionApproval) {
+      throw new MalformedExternalActionApprovalError("blocking_required");
+    }
     throw new Error("Structured input blocking mode is invalid");
   }
   const threadId = boundedString(params.threadId, "thread ID", MAX_ID_LENGTH);
@@ -120,7 +134,6 @@ export function validateOrdinaryChoiceRequest(
     throw new Error("Ordinary structured input requires between one and three questions");
   }
 
-  const externalActionApproval = hasExternalActionApprovalQuestionId(params);
   let externalActionDetails: ExternalActionApprovalDetails | undefined;
   if (externalActionApproval) {
     const question = asRecord(params.questions[0]);
@@ -132,19 +145,32 @@ export function validateOrdinaryChoiceRequest(
       ? asRecord(options[1])?.description
       : undefined;
     externalActionDetails = parseExternalActionApprovalDetails(question?.question);
+    if (params.isBlocking !== true) {
+      throw new MalformedExternalActionApprovalError("blocking_required");
+    }
+    if (params.questions.length !== 1) {
+      throw new MalformedExternalActionApprovalError("single_question_required");
+    }
+    if (question?.id !== EXTERNAL_ACTION_APPROVAL_QUESTION_ID) {
+      throw new MalformedExternalActionApprovalError("question_id_invalid");
+    }
+    if (!Array.isArray(options) || options.length !== 2) {
+      throw new MalformedExternalActionApprovalError("two_options_required");
+    }
+    if (!isCodexExternalActionApproveLabel(asRecord(options[0])?.label)) {
+      throw new MalformedExternalActionApprovalError("approve_label_invalid");
+    }
+    if (asRecord(options[1])?.label !== "拒否・保留") {
+      throw new MalformedExternalActionApprovalError("reject_label_invalid");
+    }
     if (
-      params.isBlocking !== true ||
-      params.questions.length !== 1 ||
-      question?.id !== EXTERNAL_ACTION_APPROVAL_QUESTION_ID ||
-      !Array.isArray(options) ||
-      options.length !== 2 ||
-      !isCodexExternalActionApproveLabel(asRecord(options[0])?.label) ||
-      asRecord(options[1])?.label !== "拒否・保留" ||
       !isSafeExternalActionText(approveDescription) ||
-      !isSafeExternalActionText(rejectDescription) ||
-      externalActionDetails === undefined
+      !isSafeExternalActionText(rejectDescription)
     ) {
-      throw new MalformedExternalActionApprovalError();
+      throw new MalformedExternalActionApprovalError("description_invalid");
+    }
+    if (externalActionDetails === undefined) {
+      throw new MalformedExternalActionApprovalError("details_invalid");
     }
   }
 
