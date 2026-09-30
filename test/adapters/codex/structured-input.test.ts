@@ -160,7 +160,9 @@ test("accepts reserved labels only as a visibly non-Git external action", () => 
   );
   assert.throws(
     () => validateOrdinaryChoiceRequest({ ...value, isBlocking: false }),
-    MalformedExternalActionApprovalError,
+    (error: unknown) =>
+      error instanceof MalformedExternalActionApprovalError &&
+      error.reason === "blocking_required",
   );
 });
 

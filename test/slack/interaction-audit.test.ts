@@ -108,3 +108,21 @@ test("replaces non-allowlisted outcomes including secret-like tokens", () => {
   );
   assert.doesNotMatch(lines[0] ?? "", /secret_token_123/u);
 });
+
+test("allows only fixed external-action repair classifiers without wire content", () => {
+  const lines: string[] = [];
+  const audit = createInteractionAudit(
+    (line) => lines.push(line),
+    () => 0,
+    { workerId: "worker", buildIdentity: "build" },
+  );
+  audit({
+    event: "structured_input.request_rejected",
+    requestId: "request",
+    outcome: "external_action_blocking_required",
+  });
+  const record = JSON.parse(lines[0] ?? "null") as Record<string, unknown>;
+  assert.equal(record.outcome, "external_action_blocking_required");
+  assert.equal(Object.hasOwn(record, "isBlocking"), false);
+  assert.equal(Object.hasOwn(record, "questions"), false);
+});

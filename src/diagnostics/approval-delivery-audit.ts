@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 export const APPROVAL_DELIVERY_BUILD_IDENTITY =
-  "showtalk-taishi@0.0.1/approval-delivery-v1";
+  "showtalk-taishi@0.0.1/approval-delivery-v2";
 
 export type InteractionAuditEvent =
   | "turn_start.collaboration_mode_attached"
@@ -57,6 +57,12 @@ const INTERACTION_AUDIT_OUTCOMES = [
   "empty_answers_rejected",
   "error",
   "expired",
+  "external_action_blocking_required",
+  "external_action_description_invalid",
+  "external_action_details_invalid",
+  "external_action_option_shape_invalid",
+  "external_action_question_shape_invalid",
+  "external_action_request_invalid",
   "external_unapproved",
   "git_answer_dispatched",
   "invalid_outcome_classifier",
