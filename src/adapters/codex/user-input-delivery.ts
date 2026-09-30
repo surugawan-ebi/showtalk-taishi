@@ -1,4 +1,4 @@
-import type { RpcId } from "./protocol.js";
+import type { RpcId, ToolRequestUserInputResponse } from "./protocol.js";
 
 export type UserInputDeliveryFailureReason =
   | "transport_write_failed"
@@ -105,6 +105,20 @@ export function classifyUserInputDeliveryFailure(
     return "client_error";
   }
   return undefined;
+}
+
+/**
+ * Classifies only the response shape. Question IDs and answer values are never
+ * returned or logged by this diagnostic boundary.
+ */
+export function classifyUserInputResponseShape(
+  response: ToolRequestUserInputResponse,
+): "answers_nonempty" | "answers_empty" {
+  const entries = Object.values(response.answers);
+  return entries.length > 0 &&
+      entries.every((answer) => answer.answers.length > 0)
+    ? "answers_nonempty"
+    : "answers_empty";
 }
 
 function stderrMentionsRpcId(line: string, rpcId: RpcId): boolean {
