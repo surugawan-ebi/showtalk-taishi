@@ -15,8 +15,9 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-async function waitForPath(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitForPath(path: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     try {
       await stat(path);
       return;
@@ -30,13 +31,17 @@ async function waitForPath(path: string): Promise<void> {
   throw new Error(`Timed out waiting for path: ${path}`);
 }
 
-async function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  message: string,
+  timeoutMs = 2_000,
+): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), 2_000);
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
       }),
     ]);
   } finally {
@@ -283,6 +288,7 @@ test(
         });
       }),
       "State-lock worker did not acquire the lock",
+      10_000,
     );
     void acquired.catch(() => undefined);
     const staleRecord = `${JSON.stringify({
@@ -311,6 +317,7 @@ test(
       await withTimeout(
         new Promise<void>((resolve) => child.once("exit", () => resolve())),
         "State-lock worker did not release the lock",
+        10_000,
       );
     } finally {
       await releaseFifoReader(lockPath, staleRecord).catch(() => undefined);

@@ -268,6 +268,13 @@ export class CodexAppServerClient {
     this.respond(id, response);
   }
 
+  async respondToUserInputAndDrain(
+    id: RpcId,
+    response: ToolRequestUserInputResponse,
+  ): Promise<void> {
+    await this.#writeAndDrain({ id, result: response });
+  }
+
   respondToMcpServerElicitation(
     id: RpcId,
     response: McpServerElicitationResponse,
@@ -292,6 +299,20 @@ export class CodexAppServerClient {
     if (!this.#transport.output.write(line)) {
       this.#events.emit("backpressure");
     }
+  }
+
+  async #writeAndDrain(message: object): Promise<void> {
+    const line = `${JSON.stringify(message)}\n`;
+    await new Promise<void>((resolve, reject) => {
+      const accepted = this.#transport.output.write(line, (error) => {
+        if (error !== undefined && error !== null) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+      if (!accepted) this.#events.emit("backpressure");
+    });
   }
 
   #handleLine(line: string): void {

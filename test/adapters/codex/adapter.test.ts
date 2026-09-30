@@ -3229,6 +3229,10 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
   });
 
   await secondReady;
+  assert.equal(
+    events.filter((event) => event.type === "choice.answer_dispatched").length,
+    0,
+  );
   assert.equal(choices[1]?.requestId, choices[0]?.requestId);
   assert.equal(choices[1]?.question.header, "仕上げ");
   assert.deepEqual(choices[1]?.completedAnswers, [{
@@ -3258,6 +3262,10 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
       },
     },
   ]);
+  assert.equal(
+    events.filter((event) => event.type === "choice.answer_dispatched").length,
+    1,
+  );
   assert.equal(
     events.some((event) => event.type === "git_approval.reprepare_required"),
     false,
@@ -4694,6 +4702,113 @@ test("bridges one exact workspace-git publication choice to the same App Server 
   });
   await consuming;
   assert.equal(server.turnStarts.length, 1);
+});
+
+test("returns a fresh Git approval answer after a previous turn was rejected", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server);
+  const session = { id: "thr_1" };
+
+  const runApprovalTurn = async (input: {
+    readonly turnId: string;
+    readonly rpcId: number;
+    readonly operationId: string;
+    readonly planHash: string;
+    readonly optionId: "approve" | "reject";
+  }): Promise<void> => {
+    let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
+    let releaseRequest!: () => void;
+    const requestReady = new Promise<void>((resolve) => {
+      releaseRequest = resolve;
+    });
+    const consuming = (async () => {
+      for await (const event of adapter.sendMessage(session, {
+        text: `Git approval transport retry for ${input.turnId}`,
+        source: { type: "human" },
+      })) {
+        if (event.type === "user_input.requested") {
+          requested = event;
+          releaseRequest();
+        }
+      }
+    })();
+
+    await new Promise((resolve) => setImmediate(resolve));
+    notifyPublicationPlan(server, {
+      itemId: `mcp-plan-${input.turnId}`,
+      turnId: input.turnId,
+      operationId: input.operationId,
+      planHash: input.planHash,
+    });
+    const question = workspaceGitQuestionForTurn(input.turnId);
+    question.itemId = `request-input-${input.turnId}`;
+    question.questions[0]!.question = [
+      "Target: synthetic publication plan",
+      `Scope: ${input.turnId}`,
+      "Impact: test-only App Server response",
+    ].join("\n");
+    server.request({
+      id: input.rpcId,
+      method: "item/tool/requestUserInput",
+      params: question,
+    });
+    await requestReady;
+    await adapter.respondToUserInput(session, {
+      requestId: requested?.requestId ?? "",
+      optionId: input.optionId,
+    });
+    const execution = publicationExecutionItem({
+      itemId: `mcp-execute-${input.turnId}`,
+      operationId: input.operationId,
+    });
+    if (input.optionId === "approve") {
+      server.notify("item/completed", {
+        threadId: "thr_1",
+        turnId: input.turnId,
+        item: execution,
+      });
+    }
+    server.notify("turn/completed", {
+      threadId: "thr_1",
+      turn: {
+        id: input.turnId,
+        status: "completed",
+        itemsView: "full",
+        items: input.optionId === "approve" ? [execution] : [],
+      },
+    });
+    await consuming;
+  };
+
+  await runApprovalTurn({
+    turnId: "turn_1",
+    rpcId: 811,
+    operationId: "11111111-1111-4111-8111-111111111111",
+    planHash: "a".repeat(64),
+    optionId: "reject",
+  });
+  await runApprovalTurn({
+    turnId: "turn_2",
+    rpcId: 812,
+    operationId: "22222222-2222-4222-8222-222222222222",
+    planHash: "d".repeat(64),
+    optionId: "approve",
+  });
+
+  assert.deepEqual(server.userInputResponses, [
+    {
+      id: 811,
+      response: { answers: { git_approval: { answers: ["拒否・保留"] } } },
+    },
+    {
+      id: 812,
+      response: { answers: { git_approval: { answers: ["承認して実行"] } } },
+    },
+  ]);
+  assert.deepEqual(
+    server.turnStarts.map((turn) => turn.collaborationMode?.mode),
+    ["plan", "plan"],
+  );
 });
 
 test("settles a terminal private workspace-git execution without fabricating a human answer", async () => {

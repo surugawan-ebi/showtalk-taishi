@@ -234,6 +234,24 @@ export class SlackThreadProjector {
       case "choice.resolved_externally":
         await this.#resolveChoiceExternally(event.requestId);
         break;
+      case "choice.answer_dispatched":
+        await this.#markChoiceAnswerDispatched(event.requestId);
+        break;
+      case "choice.server_request_resolved":
+        this.#auditChoiceServerRequestResolved(event.requestId);
+        break;
+      case "choice.delivery_failed":
+        await this.#failChoiceDelivery(event.requestId, event.reason);
+        break;
+      case "choice.delivery_signal_unattributed":
+        this.#interactionAudit?.({
+          event: "choice.delivery_signal_unattributed",
+          channelId: this.#channelId,
+          rootThreadTs: this.#rootThreadTs,
+          ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+          outcome: event.reason,
+        });
+        break;
       case "choice.auto_selected":
         this.#turnActivityStarted = true;
         await this.#post(
@@ -1104,6 +1122,95 @@ export class SlackThreadProjector {
         continuation.responderUserId === undefined
           ? blocks
           : [sourceMentionBlock(`<@${continuation.responderUserId}>`), ...blocks],
+    });
+  }
+
+  #auditChoiceServerRequestResolved(requestId: string): void {
+    const display =
+      this.#choiceContinuationStore?.getDispatched(requestId) ??
+      this.#choiceContinuationStore?.getDisplayed(requestId);
+    const auditSessionId = display?.sessionId ?? this.#sessionId;
+    this.#interactionAudit?.({
+      event: "choice.server_request_resolved",
+      requestId,
+      channelId: display?.channelId ?? this.#channelId,
+      rootThreadTs: display?.rootThreadTs ?? this.#rootThreadTs,
+      ...(display?.messageTs === undefined
+        ? {}
+        : { messageTs: display.messageTs }),
+      ...(auditSessionId === undefined ? {} : { sessionId: auditSessionId }),
+      outcome: "answered_or_cleared",
+    });
+  }
+
+  async #markChoiceAnswerDispatched(requestId: string): Promise<void> {
+    const display = this.#choiceContinuationStore?.markDispatched(requestId);
+    const auditSessionId = display?.sessionId ?? this.#sessionId;
+    this.#interactionAudit?.({
+      event: "choice.answer_dispatched",
+      requestId,
+      channelId: display?.channelId ?? this.#channelId,
+      rootThreadTs: display?.rootThreadTs ?? this.#rootThreadTs,
+      ...(display?.messageTs === undefined
+        ? {}
+        : { messageTs: display.messageTs }),
+      ...(auditSessionId === undefined ? {} : { sessionId: auditSessionId }),
+    });
+    if (display === undefined) return;
+    await this.#client.chat.update({
+      channel: display.channelId,
+      ts: display.messageTs,
+      text:
+        display.question.purpose === "external_action_confirmation"
+          ? "外部操作への回答をCodexへ送信しました。受理結果を確認中です。workspace-gitのGit操作は承認されていません。"
+          : "回答をCodexへ送信しました。受理結果を確認中です。",
+      blocks: [],
+    });
+  }
+
+  async #failChoiceDelivery(
+    requestId: string,
+    reason:
+      | "transport_write_failed"
+      | "client_error"
+      | "response_receiver_dropped"
+      | "response_deserialize_failed",
+  ): Promise<void> {
+    const display =
+      this.#choiceContinuationStore?.getDispatched(requestId) ??
+      this.#choiceContinuationStore?.getDisplayed(requestId);
+    const auditSessionId = display?.sessionId ?? this.#sessionId;
+    this.#interactionAudit?.({
+      event: "choice.delivery_failed",
+      requestId,
+      channelId: display?.channelId ?? this.#channelId,
+      rootThreadTs: display?.rootThreadTs ?? this.#rootThreadTs,
+      ...(display?.messageTs === undefined
+        ? {}
+        : { messageTs: display.messageTs }),
+      ...(auditSessionId === undefined ? {} : { sessionId: auditSessionId }),
+      outcome: reason,
+    });
+    if (display === undefined) return;
+    this.#choiceContinuationStore?.forgetDisplayed(requestId, display.messageTs);
+    this.#choiceContinuationStore?.forgetDispatched(requestId);
+    await this.#client.chat.update({
+      channel: display.channelId,
+      ts: display.messageTs,
+      text:
+        display.question.purpose === "external_action_confirmation"
+          ? "Codexへの回答適用に失敗したため、外部操作は未承認のまま停止しました。新しい最終承認が必要です。"
+          : "Codexへの回答適用に失敗しました。必要なら新しい質問からやり直してください。",
+      blocks: [],
+    });
+    this.#interactionAudit?.({
+      event: "choice.card_terminalized",
+      requestId,
+      channelId: display.channelId,
+      rootThreadTs: display.rootThreadTs,
+      messageTs: display.messageTs,
+      sessionId: display.sessionId,
+      outcome: "delivery_failed",
     });
   }
 

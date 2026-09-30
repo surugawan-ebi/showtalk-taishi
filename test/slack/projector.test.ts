@@ -837,6 +837,69 @@ test("terminalizes an externally resolved external approval without continuation
   assert.ok(audit.every((entry) => entry.requestId === requestId));
 });
 
+test("audits resolved as ambiguous and fails a dispatched external approval closed", async () => {
+  const { client, updates } = recordingClient();
+  const audit: InteractionAuditInput[] = [];
+  const store = new StructuredChoiceContinuationStore(
+    () => Date.parse("2026-08-27T00:00:00.000Z"),
+  );
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    choiceContinuationStore: store,
+    interactionAudit: (event) => audit.push(event),
+  });
+  projector.setSessionId("session_1");
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111114";
+
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: "2026-08-27T00:10:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "外部操作の最終確認",
+      prompt: "対象を変更しますか？",
+      options: [
+        { id: "option_1", label: "承認して実行", description: "実行する" },
+        { id: "option_2", label: "拒否・保留", description: "実行しない" },
+      ],
+      allowsOther: false,
+    },
+  });
+  const display = store.getDisplayed(requestId);
+  assert.ok(display);
+
+  await projector.project({ type: "choice.answer_dispatched", requestId });
+  assert.equal(audit.at(-1)?.event, "choice.answer_dispatched");
+  assert.match(String(updates.at(-1)?.text), /受理結果を確認中/u);
+  assert.ok(store.getDispatched(requestId));
+
+  await projector.project({ type: "choice.server_request_resolved", requestId });
+  assert.equal(audit.at(-1)?.event, "choice.server_request_resolved");
+  assert.equal(audit.at(-1)?.outcome, "answered_or_cleared");
+  assert.ok(store.getDispatched(requestId));
+
+  await projector.project({
+    type: "choice.delivery_failed",
+    requestId,
+    reason: "response_deserialize_failed",
+  });
+  assert.equal(store.getDispatched(requestId), undefined);
+  assert.match(String(updates.at(-1)?.text), /外部操作は未承認/u);
+  assert.deepEqual(updates.at(-1)?.blocks, []);
+  assert.deepEqual(
+    audit.slice(-4).map(({ event, outcome }) => [event, outcome]),
+    [
+      ["choice.answer_dispatched", undefined],
+      ["choice.server_request_resolved", "answered_or_cleared"],
+      ["choice.delivery_failed", "response_deserialize_failed"],
+      ["choice.card_terminalized", "delivery_failed"],
+    ],
+  );
+});
+
 test("projects an exact workspace-git plan as Slack buttons in the originating thread", async () => {
   const { client, posts, updates } = recordingClient();
   const projector = new SlackThreadProjector(client, "C1", "100.0", {

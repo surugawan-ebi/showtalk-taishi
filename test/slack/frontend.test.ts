@@ -9,6 +9,7 @@ import {
   choiceReceiptText,
   closeFailedPrivateGitDecisionBeforeRecovery,
   consumeContinuationIterator,
+  deliverChoiceAnswerBeforeReceipt,
   parseHumanSlackMessage,
   parseOrphanedPermissionActionSource,
   parseTrustedApprovalAction,
@@ -66,7 +67,7 @@ test("blocks structured-choice continuation while Gateway restart is pending", (
 test("distinguishes non-Git external-action receipts from ordinary answers", () => {
   assert.equal(
     choiceReceiptText("U0123456789", "external_action_confirmation"),
-    "外部操作への回答を受け付けました（<@U0123456789>）。workspace-gitのGit操作は承認されていません。",
+    "外部操作への回答をCodexへ送信しました（<@U0123456789>）。受理結果を確認中です。workspace-gitのGit操作は承認されていません。",
   );
   assert.equal(
     choiceReceiptText("U0123456789", "external_action_confirmation", true),
@@ -74,8 +75,50 @@ test("distinguishes non-Git external-action receipts from ordinary answers", () 
   );
   assert.equal(
     choiceReceiptText("U0123456789", "ordinary"),
-    "回答を受け付けました（<@U0123456789>）。",
+    "回答をCodexへ送信しました（<@U0123456789>）。受理結果を確認中です。",
   );
+});
+
+test("delivers a structured answer before waiting on its Slack receipt", async () => {
+  const order: string[] = [];
+  let releaseDelivery!: () => void;
+  const deliveryPending = new Promise<void>((resolve) => {
+    releaseDelivery = resolve;
+  });
+  const completed = deliverChoiceAnswerBeforeReceipt(
+    async () => {
+      order.push("delivery-started");
+      await deliveryPending;
+      order.push("delivery-finished");
+    },
+    async () => {
+      order.push("receipt-updated");
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["delivery-started"]);
+  releaseDelivery();
+  await completed;
+  assert.deepEqual(order, [
+    "delivery-started",
+    "delivery-finished",
+    "receipt-updated",
+  ]);
+});
+
+test("does not terminalize a choice card when App Server delivery fails", async () => {
+  let receiptUpdated = false;
+  await assert.rejects(
+    deliverChoiceAnswerBeforeReceipt(
+      async () => Promise.reject(new Error("delivery failed")),
+      async () => {
+        receiptUpdated = true;
+      },
+    ),
+    /delivery failed/u,
+  );
+  assert.equal(receiptUpdated, false);
 });
 
 test("keeps normal OFF available after an autonomy candidate is removed", () => {
