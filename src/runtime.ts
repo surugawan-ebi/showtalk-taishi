@@ -46,6 +46,10 @@ import {
   type RuntimeSlackPort,
 } from "./mcp/index.js";
 import { SlackFrontend } from "./slack/frontend.js";
+import {
+  APPROVAL_DELIVERY_BUILD_IDENTITY,
+  createInteractionAudit,
+} from "./diagnostics/approval-delivery-audit.js";
 import { createSlackMessagePresentation } from "./slack/presentation.js";
 import { WorkspaceGitApprovalDetailsStore } from "./slack/user-input-blocks.js";
 import {
@@ -200,6 +204,14 @@ async function createLockedRuntime(
     throw new Error("Unsupported workspace-git autonomy control broker contract");
   }
   const registry = createRegistry(config, state);
+  const approvalDeliveryAudit = createInteractionAudit(
+    console.info,
+    Date.now,
+    {
+      workerId: randomUUID(),
+      buildIdentity: APPROVAL_DELIVERY_BUILD_IDENTITY,
+    },
+  );
   let recentGatewayRestartReceipts = [
     ...(state.recentGatewayRestartReceipts ?? []),
   ];
@@ -363,6 +375,7 @@ async function createLockedRuntime(
         onGitUserInputResolvedExternally: (requestId) => {
           workspaceGitApprovalDetailsStore.invalidateRequest(requestId);
         },
+        interactionAudit: approvalDeliveryAudit,
         ...(workspaceGitAutomationProvider === undefined
           ? {}
           : {
@@ -434,6 +447,7 @@ async function createLockedRuntime(
       ),
       attachmentRoot,
       permissionApprovals,
+      interactionAudit: approvalDeliveryAudit,
       workspaceGitApprovalDetailsStore,
       ...(workspaceGitDecisionBroker === undefined
         ? {}
