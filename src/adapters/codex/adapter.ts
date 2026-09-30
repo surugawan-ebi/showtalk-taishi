@@ -45,6 +45,7 @@ import {
   type TurnStartParams,
 } from "./protocol.js";
 import type { ServerRequestEvent } from "./app-server-client.js";
+import { UserInputDeliveryTracker } from "./user-input-delivery.js";
 import { CodexModelCatalog } from "./model-catalog.js";
 import {
   normalizeAppOpsPrepareCompletion,
@@ -183,10 +184,15 @@ export interface CodexAppServer {
   respondToFileChangeApproval(id: RpcId, decision: FileChangeApprovalDecision): void;
   respondToPermissionsApproval(id: RpcId, response: PermissionsApprovalResponse): void;
   respondToUserInput(id: RpcId, response: ToolRequestUserInputResponse): void;
+  respondToUserInputAndDrain?(
+    id: RpcId,
+    response: ToolRequestUserInputResponse,
+  ): Promise<void>;
   respondToMcpServerElicitation(id: RpcId, response: McpServerElicitationResponse): void;
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   onServerRequest(listener: (event: ServerRequestEvent) => void): () => void;
   onProtocolError(listener: (error: Error) => void): () => void;
+  onStderr?(listener: (text: string) => void): () => void;
   onClose(listener: (error: Error) => void): () => void;
   respondError(id: RpcId, error: RpcError): void;
 }
@@ -227,6 +233,8 @@ interface PendingChoiceUserInput {
   readonly kind: "choice";
   readonly rpcId: RpcId;
   readonly sessionId: string;
+  readonly turnId: string;
+  readonly itemId: string;
   readonly questions: readonly ValidatedChoiceQuestion[];
   readonly answers: Map<string, readonly string[]>;
   readonly appOpsPlan?: AppOpsApprovalProofPlan;
@@ -237,6 +245,14 @@ interface PendingChoiceUserInput {
 }
 
 type PendingUserInput = PendingGitUserInput | PendingChoiceUserInput;
+
+interface DispatchedChoiceUserInput {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly itemId: string;
+  readonly queue: AsyncEventQueue;
+}
 
 interface ExternallyResolvedGitUserInput {
   readonly sessionId: string;
@@ -373,6 +389,8 @@ export class CodexAdapter implements AgentAdapter {
   readonly #statuses = new Map<string, AgentStatus>();
   readonly #pendingApprovals = new Map<string, PendingApproval>();
   readonly #pendingUserInputs = new Map<string, PendingUserInput>();
+  readonly #userInputDeliveries =
+    new UserInputDeliveryTracker<DispatchedChoiceUserInput>();
   readonly #externallyResolvedGitUserInputs = new Map<
     string,
     ExternallyResolvedGitUserInput
@@ -520,6 +538,7 @@ export class CodexAdapter implements AgentAdapter {
       throw new Error("Codex adapter timeouts must be positive");
     }
     this.#client.onServerRequest((request) => this.#handleServerRequest(request));
+    this.#client.onStderr?.((text) => this.#observeUserInputDeliveryStderr(text));
     this.#client.onClose((error) => this.#failActiveStreams(error));
   }
 
@@ -1348,7 +1367,7 @@ export class CodexAdapter implements AgentAdapter {
     if (!("answer" in response)) {
       throw new Error("Ordinary structured input requires one question answer");
     }
-    const completed = this.#acceptChoiceAnswer(
+    const completed = await this.#acceptChoiceAnswer(
       response.requestId,
       pending,
       response.answer,
@@ -2161,6 +2180,8 @@ export class CodexAdapter implements AgentAdapter {
         kind: "choice",
         rpcId: serverRequest.id,
         sessionId,
+        turnId,
+        itemId: request.itemId,
         questions: request.questions,
         answers: new Map(),
         ...(appOpsCapture === undefined
@@ -2890,6 +2911,13 @@ export class CodexAdapter implements AgentAdapter {
     rpcId: RpcId,
     queue: AsyncEventQueue,
   ): void {
+    const dispatched = this.#userInputDeliveries.markServerResolved(rpcId);
+    if (dispatched !== undefined) {
+      dispatched.queue.push({
+        type: "choice.server_request_resolved",
+        requestId: dispatched.requestId,
+      });
+    }
     const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
     const remainingDeferred: ServerRequestEvent[] = [];
     for (const request of deferred) {
@@ -2999,6 +3027,9 @@ export class CodexAdapter implements AgentAdapter {
         this.#pendingUserInputs.delete(requestId);
       }
     }
+    this.#userInputDeliveries.removeWhere(
+      (receipt) => receipt.sessionId === sessionId,
+    );
   }
 
   #hasPendingGitUserInput(sessionId: string): boolean {
@@ -3205,11 +3236,11 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
-  #acceptChoiceAnswer(
+  async #acceptChoiceAnswer(
     requestId: string,
     pending: PendingChoiceUserInput,
     answer: AgentChoiceAnswer,
-  ): boolean {
+  ): Promise<boolean> {
     const question = pending.questions[pending.currentQuestionIndex];
     if (question === undefined || answer.questionId !== question.id) {
       throw new Error("Structured input answer does not match the current question");
@@ -3285,15 +3316,67 @@ export class CodexAdapter implements AgentAdapter {
     if (pending.appOpsPlan !== undefined) {
       this.#consumeAppOpsApprovalPlan(pending.sessionId, pending.appOpsPlan);
     }
-    this.#client.respondToUserInput(pending.rpcId, {
+    const queue = this.#activeQueues.get(pending.sessionId);
+    if (queue === undefined) {
+      throw new Error("Structured input turn is no longer active");
+    }
+    const receipt: DispatchedChoiceUserInput = {
+      requestId,
+      sessionId: pending.sessionId,
+      turnId: pending.turnId,
+      itemId: pending.itemId,
+      queue,
+    };
+    this.#userInputDeliveries.record(pending.rpcId, receipt);
+    const response = {
       answers: Object.fromEntries(
         [...pending.answers].map(([questionId, answers]) => [
           questionId,
           { answers },
         ]),
       ),
-    });
+    };
+    try {
+      if (this.#client.respondToUserInputAndDrain !== undefined) {
+        await this.#client.respondToUserInputAndDrain(pending.rpcId, response);
+      } else {
+        this.#client.respondToUserInput(pending.rpcId, response);
+      }
+    } catch (error) {
+      this.#userInputDeliveries.remove(pending.rpcId);
+      queue.push({
+        type: "choice.delivery_failed",
+        requestId,
+        reason: "transport_write_failed",
+      });
+      throw error;
+    }
+    if (this.#userInputDeliveries.markServerResolved(pending.rpcId) !== undefined) {
+      queue.push({
+        type: "choice.answer_dispatched",
+        requestId,
+      });
+    }
     return true;
+  }
+
+  #observeUserInputDeliveryStderr(text: string): void {
+    for (const failure of this.#userInputDeliveries.observeStderr(text)) {
+      if (failure.receipt === undefined) {
+        if (this.#activeQueues.size === 1) {
+          this.#activeQueues.values().next().value?.push({
+            type: "choice.delivery_signal_unattributed",
+            reason: failure.reason,
+          });
+        }
+        continue;
+      }
+      failure.receipt.queue.push({
+        type: "choice.delivery_failed",
+        requestId: failure.receipt.requestId,
+        reason: failure.reason,
+      });
+    }
   }
 
   #pushCurrentChoice(

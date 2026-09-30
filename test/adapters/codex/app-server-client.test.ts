@@ -169,7 +169,7 @@ test("correlates responses and exposes server requests", async () => {
       scope: "turn",
     },
   });
-  client.respondToUserInput(101, {
+  await client.respondToUserInputAndDrain(101, {
     answers: { git_approval: { answers: ["承認して実行"] } },
   });
   const [rawUserInputResponse] = transport.readOutput();

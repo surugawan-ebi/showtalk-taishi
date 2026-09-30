@@ -1311,6 +1311,7 @@ export class SlackFrontend {
           readonly channelId: string;
           readonly rootThreadTs: string;
           readonly messageTs: string;
+          readonly purpose?: "external_action_confirmation";
         } | undefined;
         try {
           const { kind, routing, source } = parseTrustedChoiceAction(
@@ -1373,35 +1374,34 @@ export class SlackFrontend {
           if (routing.optionId === undefined) {
             throw new Error("Structured choice option is missing");
           }
-          await this.#gateway.resolveUserInput(
-            routing.channelId,
-            routing.rootThreadTs,
-            {
-              requestId: routing.requestId,
-              answer: {
-                questionId: routing.questionId,
-                optionId: routing.optionId,
-              },
-            },
-          );
+          const selectedOptionId = routing.optionId;
           this.#interactionAudit({
-            event: "choice.answer_applied",
+            event: "choice.answer_recorded",
             ...routing,
           });
-          this.#choiceContinuations.forgetDisplayed(
-            routing.requestId,
-            routing.messageTs,
+          await deliverChoiceAnswerBeforeReceipt(
+            () => this.#gateway.resolveUserInput(
+              routing.channelId,
+              routing.rootThreadTs,
+              {
+                requestId: routing.requestId,
+                answer: {
+                  questionId: routing.questionId,
+                  optionId: selectedOptionId,
+                },
+              },
+            ),
+            () => client.chat.update({
+              channel: source.channelId,
+              ts: source.messageTs,
+              text: choiceReceiptText(source.userId, routing.purpose),
+              blocks: [],
+            }).then(() => this.#interactionAudit({
+              event: "choice.card_terminalized",
+              ...routing,
+              outcome: "answer_dispatched",
+            })).catch((error) => logger.error(error)),
           );
-          await client.chat.update({
-            channel: source.channelId,
-            ts: source.messageTs,
-            text: choiceReceiptText(source.userId, routing.purpose),
-            blocks: [],
-          }).then(() => this.#interactionAudit({
-            event: "choice.card_terminalized",
-            ...routing,
-            outcome: "answered",
-          })).catch((error) => logger.error(error));
         } catch (error) {
           this.#interactionAudit({
             event: "choice.action_failed",
@@ -1410,6 +1410,17 @@ export class SlackFrontend {
           });
           logger.error(error);
           if (userId !== undefined && channelId !== undefined) {
+            if (auditRoute?.messageTs !== undefined) {
+              await client.chat.update({
+                channel: channelId,
+                ts: auditRoute.messageTs,
+                text:
+                  auditRoute.purpose === "external_action_confirmation"
+                    ? "Codexへの回答送信に失敗したため、外部操作は未承認のまま停止しました。新しい最終承認が必要です。"
+                    : "Codexへの回答送信に失敗しました。必要なら新しい質問からやり直してください。",
+                blocks: [],
+              }).catch((updateError) => logger.error(updateError));
+            }
             await client.chat.postEphemeral({
               channel: channelId,
               user: userId,
@@ -1450,30 +1461,46 @@ export class SlackFrontend {
             );
             return;
           }
-          await this.#gateway.resolveUserInput(
-            routing.channelId,
-            routing.rootThreadTs,
-            {
-              requestId: routing.requestId,
-              answer: {
-                questionId: routing.questionId,
-                text: parsed.answer,
+          this.#interactionAudit({
+            event: "choice.answer_recorded",
+            ...routing,
+          });
+          const selectedRouting = routing;
+          await deliverChoiceAnswerBeforeReceipt(
+            () => this.#gateway.resolveUserInput(
+              selectedRouting.channelId,
+              selectedRouting.rootThreadTs,
+              {
+                requestId: selectedRouting.requestId,
+                answer: {
+                  questionId: selectedRouting.questionId,
+                  text: parsed.answer,
+                },
               },
-            },
+            ),
+            () => client.chat.update({
+              channel: selectedRouting.channelId,
+              ts: selectedRouting.messageTs,
+              text: `自由入力の回答をCodexへ送信しました（<@${userId}>）。受理結果を確認中です。`,
+              blocks: [],
+            }).then(() => this.#interactionAudit({
+              event: "choice.card_terminalized",
+              ...selectedRouting,
+              outcome: "answer_dispatched",
+            })).catch((error) => logger.error(error)),
           );
-          this.#choiceContinuations.forgetDisplayed(
-            routing.requestId,
-            routing.messageTs,
-          );
-          await client.chat.update({
-            channel: routing.channelId,
-            ts: routing.messageTs,
-            text: `自由入力の回答を受け付けました（<@${userId}>）。`,
-            blocks: [],
-          }).catch((error) => logger.error(error));
         } catch (error) {
           logger.error(error);
           if (routing !== undefined && userId !== undefined) {
+            await client.chat.update({
+              channel: routing.channelId,
+              ts: routing.messageTs,
+              text:
+                routing.purpose === "external_action_confirmation"
+                  ? "Codexへの回答送信に失敗したため、外部操作は未承認のまま停止しました。新しい最終承認が必要です。"
+                  : "Codexへの回答送信に失敗しました。必要なら新しい質問からやり直してください。",
+              blocks: [],
+            }).catch((updateError) => logger.error(updateError));
             await client.chat.postEphemeral({
               channel: routing.channelId,
               user: userId,
@@ -2711,14 +2738,22 @@ export function choiceReceiptText(
   continued = false,
 ): string {
   if (purpose === "external_action_confirmation") {
-    const accepted = continued
-      ? "外部操作への回答を新しいターンとして受け付けました"
-      : "外部操作への回答を受け付けました";
-    return `${accepted}（<@${userId}>）。workspace-gitのGit操作は承認されていません。`;
+    return continued
+      ? `外部操作への回答を新しいターンとして受け付けました（<@${userId}>）。workspace-gitのGit操作は承認されていません。`
+      : `外部操作への回答をCodexへ送信しました（<@${userId}>）。受理結果を確認中です。workspace-gitのGit操作は承認されていません。`;
   }
   return continued
     ? `回答を新しいターンとして受け付けました（<@${userId}>）。`
-    : `回答を受け付けました（<@${userId}>）。`;
+    : `回答をCodexへ送信しました（<@${userId}>）。受理結果を確認中です。`;
+}
+
+/** Keeps Slack Web API latency out of the App Server callback lifetime. */
+export async function deliverChoiceAnswerBeforeReceipt(
+  deliver: () => Promise<void>,
+  updateReceipt: () => Promise<void>,
+): Promise<void> {
+  await deliver();
+  await updateReceipt();
 }
 
 function structuredChoiceContinuationPrompt(

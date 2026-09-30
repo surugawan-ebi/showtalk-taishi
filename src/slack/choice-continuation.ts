@@ -32,6 +32,7 @@ export interface StructuredChoiceContinuation extends StructuredChoiceDisplay {
 
 export class StructuredChoiceContinuationStore {
   readonly #displayedByRequestId = new Map<string, StructuredChoiceDisplay>();
+  readonly #dispatchedByRequestId = new Map<string, StructuredChoiceDisplay>();
   readonly #continuationsById = new Map<string, StructuredChoiceContinuation>();
   readonly #continuationIdByRequestId = new Map<string, string>();
   readonly #now: () => number;
@@ -50,6 +51,30 @@ export class StructuredChoiceContinuationStore {
     if (current === undefined) return;
     if (messageTs !== undefined && current.messageTs !== messageTs) return;
     this.#displayedByRequestId.delete(requestId);
+  }
+
+  markDispatched(
+    requestId: string,
+    messageTs?: string,
+  ): StructuredChoiceDisplay | undefined {
+    this.#prune();
+    const current =
+      this.#displayedByRequestId.get(requestId) ??
+      this.#dispatchedByRequestId.get(requestId);
+    if (current === undefined) return undefined;
+    if (messageTs !== undefined && current.messageTs !== messageTs) return undefined;
+    this.#displayedByRequestId.delete(requestId);
+    this.#dispatchedByRequestId.set(requestId, current);
+    return current;
+  }
+
+  getDispatched(requestId: string): StructuredChoiceDisplay | undefined {
+    this.#prune();
+    return this.#dispatchedByRequestId.get(requestId);
+  }
+
+  forgetDispatched(requestId: string): void {
+    this.#dispatchedByRequestId.delete(requestId);
   }
 
   getDisplayed(requestId: string): StructuredChoiceDisplay | undefined {
@@ -113,6 +138,9 @@ export class StructuredChoiceContinuationStore {
     for (const [requestId, display] of this.#displayedByRequestId) {
       if (display.expiresAt <= now) this.#displayedByRequestId.delete(requestId);
     }
+    for (const [requestId, display] of this.#dispatchedByRequestId) {
+      if (display.expiresAt <= now) this.#dispatchedByRequestId.delete(requestId);
+    }
     for (const [continuationId, continuation] of this.#continuationsById) {
       if (continuation.expiresAt > now) continue;
       this.#continuationsById.delete(continuationId);
@@ -124,6 +152,13 @@ export class StructuredChoiceContinuationStore {
         | undefined;
       if (oldestRequestId === undefined) break;
       this.#displayedByRequestId.delete(oldestRequestId);
+    }
+    while (this.#dispatchedByRequestId.size > MAX_RETAINED) {
+      const oldestRequestId = this.#dispatchedByRequestId.keys().next().value as
+        | string
+        | undefined;
+      if (oldestRequestId === undefined) break;
+      this.#dispatchedByRequestId.delete(oldestRequestId);
     }
     while (this.#continuationsById.size > MAX_RETAINED) {
       const oldestId = this.#continuationsById.keys().next().value as string | undefined;

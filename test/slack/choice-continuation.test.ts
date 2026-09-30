@@ -141,3 +141,15 @@ test("retains earlier answers from one multi-question request", () => {
     /先に回答した1件も保持/u,
   );
 });
+
+test("retains only routing metadata after an answer is dispatched", () => {
+  const store = new StructuredChoiceContinuationStore(() => 1_000);
+  const display = displayed(60_000);
+  store.rememberDisplayed(display);
+  assert.deepEqual(store.markDispatched(display.requestId, display.messageTs), display);
+  assert.equal(store.getDisplayed(display.requestId), undefined);
+  assert.deepEqual(store.getDispatched(display.requestId), display);
+  assert.equal(store.resolveExternally(display.requestId), undefined);
+  store.forgetDispatched(display.requestId);
+  assert.equal(store.getDispatched(display.requestId), undefined);
+});

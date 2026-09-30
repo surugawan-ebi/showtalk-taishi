@@ -67,8 +67,10 @@ const runtimeOptions: CreateRuntimeOptions = {
   }),
 };
 
-let sawChoice = false;
-let finalText = "";
+let sawRejectedChoice = false;
+let rejectedText = "";
+let sawApprovedChoice = false;
+let approvedText = "";
 const initialRuntime = await createRuntime(config, runtimeOptions);
 let resumedRuntime: Awaited<ReturnType<typeof createRuntime>> | undefined;
 try {
@@ -94,20 +96,62 @@ try {
     rootThreadTs,
     slackUserId: "USMOKE",
     text: [
-      "Ask for the required final confirmation for this non-Git external operation.",
+      "Ask for the required direct request_user_input final confirmation for this non-Git external operation.",
+      "Use question id external_action_approval and the exact two choices 承認して実行 and 拒否・保留.",
       "The exact operation details are:",
-      "Target: isolated request_user_input smoke",
-      "Scope: observe the selected label only; perform no external write",
+      "Target: isolated request_user_input rejection smoke",
+      "Scope: observe the rejected label only; perform no external write",
+      "Impact: no external state change",
+      "After the answer, if and only if it is 拒否・保留, reply exactly TAISHI_USER_INPUT_REJECTED.",
+      "If the answers object is empty or anything differs, reply exactly TAISHI_USER_INPUT_EMPTY.",
+    ].join("\n"),
+  })) {
+    if (result.event.type === "choice.requested") {
+      if (sawRejectedChoice) {
+        throw new Error("Codex requested the rejection smoke confirmation more than once");
+      }
+      sawRejectedChoice = true;
+      // An immediate response can hide a request that loses its blocking
+      // lifetime. Leave time for App Server notifications before answering.
+      await delay(1_500);
+      await resumedRuntime.gateway.resolveSessionUserInput(result.sessionId, {
+        requestId: result.event.requestId,
+        answer: { questionId: result.event.question.id, optionId: "option_2" },
+      });
+    }
+    if (result.event.type === "message.completed" && result.event.text !== undefined) {
+      rejectedText = result.event.text.trim();
+    }
+  }
+  if (!sawRejectedChoice) {
+    throw new Error("Codex did not expose the rejection request_user_input to the Gateway");
+  }
+  if (rejectedText !== "TAISHI_USER_INPUT_REJECTED") {
+    throw new Error(
+      `Codex observed the wrong rejected request_user_input result: ${rejectedText || "<empty>"}`,
+    );
+  }
+
+  for await (const result of resumedRuntime.gateway.handleHumanMessage({
+    channelId,
+    rootThreadTs,
+    slackUserId: "USMOKE",
+    text: [
+      "Retry with a fresh direct request_user_input final confirmation for this non-Git external operation.",
+      "Use question id external_action_approval and the exact two choices 承認して実行 and 拒否・保留.",
+      "The exact operation details are:",
+      "Target: isolated request_user_input approval retry smoke",
+      "Scope: observe the approved label only; perform no external write",
       "Impact: no external state change",
       "After the answer, if and only if it is 承認して実行, reply exactly TAISHI_USER_INPUT_OK.",
       "If the answers object is empty or anything differs, reply exactly TAISHI_USER_INPUT_EMPTY.",
     ].join("\n"),
   })) {
     if (result.event.type === "choice.requested") {
-      if (sawChoice) throw new Error("Codex requested the smoke confirmation more than once");
-      sawChoice = true;
-      // An immediate response can hide a request that loses its blocking
-      // lifetime. Leave time for App Server notifications before answering.
+      if (sawApprovedChoice) {
+        throw new Error("Codex requested the approval retry smoke confirmation more than once");
+      }
+      sawApprovedChoice = true;
       await delay(1_500);
       await resumedRuntime.gateway.resolveSessionUserInput(result.sessionId, {
         requestId: result.event.requestId,
@@ -115,15 +159,19 @@ try {
       });
     }
     if (result.event.type === "message.completed" && result.event.text !== undefined) {
-      finalText = result.event.text.trim();
+      approvedText = result.event.text.trim();
     }
   }
-  if (!sawChoice) throw new Error("Codex did not expose request_user_input to the Gateway");
-  if (finalText !== "TAISHI_USER_INPUT_OK") {
-    throw new Error(`Codex observed the wrong request_user_input result: ${finalText || "<empty>"}`);
+  if (!sawApprovedChoice) {
+    throw new Error("Codex did not expose the approval retry request_user_input to the Gateway");
+  }
+  if (approvedText !== "TAISHI_USER_INPUT_OK") {
+    throw new Error(
+      `Codex observed the wrong approved request_user_input result: ${approvedText || "<empty>"}`,
+    );
   }
   await runMcpElicitationProbe();
-  console.log("ShowTalk Taishi resumed Codex interaction approval smoke: OK");
+  console.log("ShowTalk Taishi rejected-then-retried Codex interaction approval smoke: OK");
 } finally {
   await resumedRuntime?.stop();
   await initialRuntime.stop();

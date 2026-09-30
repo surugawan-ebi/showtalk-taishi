@@ -530,6 +530,37 @@ export type AgentEvent =
       readonly requestId: string;
     }
   | {
+      /** The complete fixed-schema answer was written to the App Server stream. */
+      readonly type: "choice.answer_dispatched";
+      readonly requestId: string;
+    }
+  | {
+      /**
+       * App Server ended the RPC after the client dispatched an answer.
+       * This also covers cleanup and is not proof that the answer decoded.
+       */
+      readonly type: "choice.server_request_resolved";
+      readonly requestId: string;
+    }
+  | {
+      /** A fixed, sanitized App Server delivery failure was correlated. */
+      readonly type: "choice.delivery_failed";
+      readonly requestId: string;
+      readonly reason:
+        | "transport_write_failed"
+        | "client_error"
+        | "response_receiver_dropped"
+        | "response_deserialize_failed";
+    }
+  | {
+      /** A fixed App Server failure was observed but had no exact RPC correlation. */
+      readonly type: "choice.delivery_signal_unattributed";
+      readonly reason:
+        | "client_error"
+        | "response_receiver_dropped"
+        | "response_deserialize_failed";
+    }
+  | {
       /** A Koe-local opt-in selected the first option of an ordinary question. */
       readonly type: "choice.auto_selected";
       readonly header: string;
