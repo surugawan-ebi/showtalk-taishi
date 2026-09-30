@@ -12,6 +12,7 @@ import {
   AgentWorkspaceUnavailableError,
 } from "../../../src/core/index.js";
 import type { ServerRequestEvent } from "../../../src/adapters/codex/app-server-client.js";
+import type { InteractionAuditInput } from "../../../src/diagnostics/approval-delivery-audit.js";
 import { buildCodexMcpThreadConfig } from "../../../src/adapters/codex/mcp-config.js";
 import { CodexRpcError } from "../../../src/adapters/codex/protocol.js";
 import type {
@@ -96,6 +97,7 @@ class FakeAppServer implements CodexAppServer {
   readonly #notifications = new Set<(method: string, params: unknown) => void>();
   readonly #requests = new Set<(event: ServerRequestEvent) => void>();
   readonly #protocolErrors = new Set<(error: Error) => void>();
+  readonly #stderrListeners = new Set<(text: string) => void>();
   readonly #closeListeners = new Set<(error: Error) => void>();
 
   async startThread(params: ThreadStartParams): Promise<CodexThread> {
@@ -309,6 +311,11 @@ class FakeAppServer implements CodexAppServer {
     return () => this.#protocolErrors.delete(listener);
   }
 
+  onStderr(listener: (text: string) => void): () => void {
+    this.#stderrListeners.add(listener);
+    return () => this.#stderrListeners.delete(listener);
+  }
+
   onClose(listener: (error: Error) => void): () => void {
     this.#closeListeners.add(listener);
     return () => this.#closeListeners.delete(listener);
@@ -334,6 +341,10 @@ class FakeAppServer implements CodexAppServer {
 
   request(event: ServerRequestEvent): void {
     for (const listener of this.#requests) listener(event);
+  }
+
+  emitStderr(text: string): void {
+    for (const listener of this.#stderrListeners) listener(text);
   }
 
   closeWithError(error: Error): void {
@@ -2007,7 +2018,8 @@ test("never resurrects a pre-response Git approval resolved by App Server", asyn
 test("rejects a pre-response Git request when the turn completes before start returns", async () => {
   const server = new FakeAppServer();
   const recordedPlans: WorkspaceGitApprovalPlan[] = [];
-  server.startTurnBehavior = async () => {
+  const audit: InteractionAuditInput[] = [];
+  server.startTurnBehavior = async (params) => {
     notifyPublicationPlan(server);
     server.request({
       id: 1008,
@@ -2016,7 +2028,16 @@ test("rejects a pre-response Git request when the turn completes before start re
     });
     server.notify("turn/completed", {
       threadId: "thr_1",
-      turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+      turn: {
+        id: "turn_1",
+        status: "completed",
+        itemsView: "full",
+        items: [{
+          type: "userMessage",
+          id: "user-message-early-terminal",
+          clientId: params.clientUserMessageId,
+        }],
+      },
     });
     return { id: "turn_1", status: "completed" };
   };
@@ -2024,6 +2045,7 @@ test("rejects a pre-response Git request when the turn completes before start re
     recordExternallyResolvedGitPlan: async (plan) => {
       recordedPlans.push(plan);
     },
+    interactionAudit: (event) => audit.push(event),
   });
 
   const events = await collectEvents(adapter.sendMessage(
@@ -2039,6 +2061,32 @@ test("rejects a pre-response Git request when the turn completes before start re
   );
   assert.equal(server.errorResponses.some(({ id }) => id === 1008), true);
   assert.deepEqual(server.userInputResponses, []);
+  assert.deepEqual(
+    audit
+      .filter((event) => event.event.startsWith("turn"))
+      .map(({ event, outcome }) => [event, outcome]),
+    [
+      ["turn_start.collaboration_mode_attached", "configured"],
+      ["turn_start.dispatched", "sent"],
+      ["turn.terminalized", "before_start_bound"],
+      ["turn_start.bound", "terminal_already_observed"],
+    ],
+  );
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.request_received" &&
+    event.outcome === "direct_server_request"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.request_deferred" &&
+    event.outcome === "turn_binding_pending"
+  ));
+  assert.equal(
+    audit.some((event) =>
+      event.event === "structured_input.answer_dispatch_started" ||
+      event.outcome === "empty_answers_rejected"
+    ),
+    false,
+  );
 });
 
 test("rejects deferred Git approval when completion itself claims turn ownership", async () => {
@@ -3272,6 +3320,73 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
   );
 });
 
+test("correlates callback binding, answer dispatch, and receiver drop without answer text", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    interactionAudit: (event) => audit.push(event),
+  });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  let requested!: Extract<AgentEvent, { type: "choice.requested" }>;
+  let releaseRequested!: () => void;
+  const requestReady = new Promise<void>((resolve) => {
+    releaseRequested = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "receiver dropを診断する",
+      source: { type: "human" },
+    })) {
+      events.push(event);
+      if (event.type === "choice.requested") {
+        requested = event;
+        releaseRequested();
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 906,
+    method: "item/tool/requestUserInput",
+    params: ordinaryChoiceQuestion(),
+  });
+  await requestReady;
+  await adapter.respondToUserInput(session, {
+    requestId: requested.requestId,
+    answer: { questionId: "question_1", optionId: "option_2" },
+  });
+  server.emitStderr("could not notify callback for 906: receiver dropped\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  const lifecycle = audit.filter((event) =>
+    event.requestId === requested.requestId || event.rpcId === 906
+  );
+  assert.ok(lifecycle.some((event) =>
+    event.event === "structured_input.callback_bound" &&
+    event.outcome === "slack_choice_callback_bound"
+  ));
+  assert.ok(lifecycle.some((event) =>
+    event.event === "structured_input.answer_dispatch_succeeded" &&
+    event.outcome === "response_written"
+  ));
+  assert.ok(lifecycle.some((event) =>
+    event.event === "structured_input.answer_dispatch_failed" &&
+    event.outcome === "response_receiver_dropped"
+  ));
+  assert.ok(events.some((event) =>
+    event.type === "choice.delivery_failed" &&
+    event.reason === "response_receiver_dropped"
+  ));
+  assert.doesNotMatch(JSON.stringify(audit), /乾燥岩盤平原/u);
+});
+
 test("bridges non-blocking ordinary structured choices from current Codex normalization", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
@@ -3378,7 +3493,11 @@ test("auto-selects the first option for every ordinary question when the Koe opt
 
 test("terminalizes a non-blocking ordinary choice when App Server resolves it first", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 10,
+    interactionAudit: (event) => audit.push(event),
+  });
   const session = { id: "thr_1" };
   const events: AgentEvent[] = [];
   let displayedRequestId = "";
@@ -3435,6 +3554,20 @@ test("terminalizes a non-blocking ordinary choice when App Server resolves it fi
       event.requestId === displayedRequestId,
   ));
   assert.deepEqual(server.userInputResponses, []);
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.request_terminalized" &&
+    event.requestId === displayedRequestId &&
+    event.outcome === "resolved_before_dispatch"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.answer_dispatch_failed" &&
+    event.requestId === displayedRequestId &&
+    event.outcome === "callback_binding_missing"
+  ));
+  assert.equal(
+    audit.some((event) => event.outcome === "empty_answers_rejected"),
+    false,
+  );
 });
 
 test("repairs a non-blocking external action before projecting its final approval", async () => {

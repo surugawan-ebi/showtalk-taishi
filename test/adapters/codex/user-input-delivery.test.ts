@@ -4,7 +4,22 @@ import test from "node:test";
 import {
   UserInputDeliveryTracker,
   classifyUserInputDeliveryFailure,
+  classifyUserInputResponseShape,
 } from "../../../src/adapters/codex/user-input-delivery.js";
+
+test("distinguishes nonempty answers from empty answer responses without content", () => {
+  assert.equal(
+    classifyUserInputResponseShape({
+      answers: { question: { answers: ["secret answer"] } },
+    }),
+    "answers_nonempty",
+  );
+  assert.equal(classifyUserInputResponseShape({ answers: {} }), "answers_empty");
+  assert.equal(
+    classifyUserInputResponseShape({ answers: { question: { answers: [] } } }),
+    "answers_empty",
+  );
+});
 
 test("classifies only fixed request_user_input failure signatures", () => {
   assert.equal(

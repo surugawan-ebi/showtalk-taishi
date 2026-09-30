@@ -109,6 +109,7 @@ import {
 import {
   createInteractionAudit,
   type InteractionAudit,
+  type InteractionAuditOutcome,
 } from "./interaction-audit.js";
 import {
   WORKSPACE_GIT_AUTONOMY_ACTION_PREFIX,
@@ -1406,7 +1407,7 @@ export class SlackFrontend {
           this.#interactionAudit({
             event: "choice.action_failed",
             ...auditRoute,
-            outcome: error instanceof Error ? error.name : "unknown_error",
+            outcome: classifySlackInteractionError(error),
           });
           logger.error(error);
           if (userId !== undefined && channelId !== undefined) {
@@ -1952,7 +1953,7 @@ export class SlackFrontend {
           this.#interactionAudit({
             event: "git_approval.action_failed",
             ...auditRoute,
-            outcome: error instanceof Error ? error.name : "unknown_error",
+            outcome: classifySlackInteractionError(error),
           });
           logger.error(error);
           if (userId !== undefined && channelId !== undefined) {
@@ -2816,6 +2817,14 @@ export async function consumeContinuationIterator<T>(
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function classifySlackInteractionError(
+  error: unknown,
+): InteractionAuditOutcome {
+  if (error instanceof TypeError) return "type_error";
+  if (error instanceof Error) return "error";
+  return "unknown_error";
 }
 
 function humanStatus(status: string): string {

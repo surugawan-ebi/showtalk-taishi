@@ -45,7 +45,15 @@ import {
   type TurnStartParams,
 } from "./protocol.js";
 import type { ServerRequestEvent } from "./app-server-client.js";
-import { UserInputDeliveryTracker } from "./user-input-delivery.js";
+import {
+  classifyUserInputResponseShape,
+  UserInputDeliveryTracker,
+} from "./user-input-delivery.js";
+import type {
+  InteractionAudit,
+  InteractionAuditEvent,
+  InteractionAuditOutcome,
+} from "../../diagnostics/approval-delivery-audit.js";
 import { CodexModelCatalog } from "./model-catalog.js";
 import {
   normalizeAppOpsPrepareCompletion,
@@ -248,6 +256,7 @@ type PendingUserInput = PendingGitUserInput | PendingChoiceUserInput;
 
 interface DispatchedChoiceUserInput {
   readonly requestId: string;
+  readonly rpcId: RpcId;
   readonly sessionId: string;
   readonly turnId: string;
   readonly itemId: string;
@@ -343,6 +352,8 @@ export interface CodexAdapterOptions {
   appOpsApprovalProofSigner?: AppOpsApprovalProofSigner;
   /** One-shot handoff consumed only by Codex's AppOps PreToolUse hook. */
   appOpsApprovalProofBroker?: AppOpsApprovalProofBroker;
+  /** Sanitized approval-delivery lifecycle sink shared with Slack projection. */
+  interactionAudit?: InteractionAudit;
 }
 
 export interface CodexRuntimeModelSettings {
@@ -391,6 +402,11 @@ export class CodexAdapter implements AgentAdapter {
   readonly #pendingUserInputs = new Map<string, PendingUserInput>();
   readonly #userInputDeliveries =
     new UserInputDeliveryTracker<DispatchedChoiceUserInput>();
+  readonly #structuredInputCorrelationIds = new Map<string, {
+    readonly id: string;
+    readonly sessionId?: string;
+    readonly turnId?: string;
+  }>();
   readonly #externallyResolvedGitUserInputs = new Map<
     string,
     ExternallyResolvedGitUserInput
@@ -446,6 +462,7 @@ export class CodexAdapter implements AgentAdapter {
   readonly #appOpsPlansByTurn = new Map<string, AppOpsApprovalPlanCapture[]>();
   readonly #appOpsApprovalProofSigner: AppOpsApprovalProofSigner | undefined;
   readonly #appOpsApprovalProofBroker: AppOpsApprovalProofBroker | undefined;
+  readonly #interactionAudit: InteractionAudit | undefined;
   readonly #loadedSessions = new Set<string>();
   /**
    * App Server ignores resume overrides while a thread is active. These
@@ -473,6 +490,7 @@ export class CodexAdapter implements AgentAdapter {
     this.#koeId = options.koeId;
     this.#appOpsApprovalProofSigner = options.appOpsApprovalProofSigner;
     this.#appOpsApprovalProofBroker = options.appOpsApprovalProofBroker;
+    this.#interactionAudit = options.interactionAudit;
     if (
       this.#workspaceGitAutomationProvider !== undefined &&
       this.#workspaceGitAutomationProvider.contract_version !==
@@ -734,6 +752,7 @@ export class CodexAdapter implements AgentAdapter {
     let ownedTurnId: string | undefined;
     let completingTurnId: string | undefined;
     let clientUserMessageId = randomUUID();
+    let turnStartAcknowledged = false;
     const generatedAttachmentIds = new Set<string>();
     let generatedAttachmentBytes = 0;
     const pushAgentEvent = (event: AgentEvent): void => {
@@ -863,6 +882,22 @@ export class CodexAdapter implements AgentAdapter {
       ownedTurnId = turnId;
       this.#activeTurns.set(session.id, turnId);
     };
+    const auditTurnStart = (
+      event:
+        | "turn_start.collaboration_mode_attached"
+        | "turn_start.dispatched"
+        | "turn_start.bound",
+      outcome: "configured" | "sent" | "active" | "terminal_already_observed",
+      turnId?: string,
+    ): void => {
+      this.#interactionAudit?.({
+        event,
+        requestId: clientUserMessageId,
+        sessionId: session.id,
+        ...(turnId === undefined ? {} : { turnId }),
+        outcome,
+      });
+    };
     const completeTurn = async (
       params: unknown,
       turn: Record<string, unknown> | undefined,
@@ -977,6 +1012,15 @@ export class CodexAdapter implements AgentAdapter {
         return false;
       }
       completingTurnId = completedTurnId;
+      this.#interactionAudit?.({
+        event: "turn.terminalized",
+        requestId: clientUserMessageId,
+        sessionId: session.id,
+        turnId: completedTurnId,
+        outcome: turnStartAcknowledged
+          ? "after_start_bound"
+          : "before_start_bound",
+      });
       clearTerminalWatchdog();
       void completeTurn(params, turn, event).catch((error: unknown) => {
         queue.fail(
@@ -1113,6 +1157,9 @@ export class CodexAdapter implements AgentAdapter {
       approvedPlan: WorkspaceGitApprovalPlan,
     ): void => {
       clientUserMessageId = randomUUID();
+      turnStartAcknowledged = false;
+      auditTurnStart("turn_start.collaboration_mode_attached", "configured");
+      auditTurnStart("turn_start.dispatched", "sent");
       void this.#client
         .startTurn({
           threadId: session.id,
@@ -1148,6 +1195,14 @@ export class CodexAdapter implements AgentAdapter {
           collaborationMode,
         })
         .then((turn) => {
+          turnStartAcknowledged = true;
+          auditTurnStart(
+            "turn_start.bound",
+            terminal || completingTurnId !== undefined
+              ? "terminal_already_observed"
+              : "active",
+            turn.id,
+          );
           if (ownedTurnId !== undefined && ownedTurnId !== turn.id) {
             throw new Error(
               `Codex turn ownership conflict: ${ownedTurnId} != ${turn.id}`,
@@ -1179,6 +1234,9 @@ export class CodexAdapter implements AgentAdapter {
     try {
       this.#statuses.set(session.id, "starting");
       queue.push({ type: "status.changed", status: "starting" });
+      turnStartAcknowledged = false;
+      auditTurnStart("turn_start.collaboration_mode_attached", "configured");
+      auditTurnStart("turn_start.dispatched", "sent");
       const turn = await this.#client.startTurn({
         threadId: session.id,
         clientUserMessageId,
@@ -1199,6 +1257,14 @@ export class CodexAdapter implements AgentAdapter {
           : { effort: this.#options.reasoningEffort }),
         collaborationMode,
       });
+      turnStartAcknowledged = true;
+      auditTurnStart(
+        "turn_start.bound",
+        terminal || completingTurnId !== undefined
+          ? "terminal_already_observed"
+          : "active",
+        turn.id,
+      );
       if (ownedTurnId !== undefined && ownedTurnId !== turn.id) {
         const notifiedTurnId = ownedTurnId;
         await Promise.allSettled([
@@ -1345,6 +1411,12 @@ export class CodexAdapter implements AgentAdapter {
       ) {
         return;
       }
+      this.#interactionAudit?.({
+        event: "structured_input.answer_dispatch_failed",
+        requestId: response.requestId,
+        sessionId: session.id,
+        outcome: "callback_binding_missing",
+      });
       throw new Error(`Unknown structured input request: ${response.requestId}`);
     }
     if (Date.now() >= pending.expiresAt) {
@@ -1511,6 +1583,66 @@ export class CodexAdapter implements AgentAdapter {
     this.#slackPersonasBySession.set(sessionId, configured);
   }
 
+  #structuredInputCorrelationId(
+    rpcId: RpcId,
+    sessionId?: string,
+    turnId?: string,
+  ): {
+    readonly id: string;
+    readonly created: boolean;
+  } {
+    const key = rpcKey(rpcId);
+    const existing = this.#structuredInputCorrelationIds.get(key);
+    if (existing !== undefined) {
+      if (
+        (existing.sessionId === undefined && sessionId !== undefined) ||
+        (existing.turnId === undefined && turnId !== undefined)
+      ) {
+        this.#structuredInputCorrelationIds.set(key, {
+          ...existing,
+          ...(sessionId === undefined ? {} : { sessionId }),
+          ...(turnId === undefined ? {} : { turnId }),
+        });
+      }
+      return { id: existing.id, created: false };
+    }
+    const id = randomUUID();
+    this.#structuredInputCorrelationIds.set(key, {
+      id,
+      ...(sessionId === undefined ? {} : { sessionId }),
+      ...(turnId === undefined ? {} : { turnId }),
+    });
+    return { id, created: true };
+  }
+
+  #structuredInputRequestId(
+    rpcId: RpcId,
+    kind: "choice" | "input",
+  ): string {
+    return `codex-${kind}:${this.#structuredInputCorrelationId(rpcId).id}`;
+  }
+
+  #auditStructuredInput(
+    event: InteractionAuditEvent,
+    rpcId: RpcId,
+    input: {
+      readonly sessionId?: string;
+      readonly turnId?: string;
+      readonly requestId?: string;
+      readonly outcome: InteractionAuditOutcome;
+    },
+  ): void {
+    this.#interactionAudit?.({
+      event,
+      requestId:
+        input.requestId ?? this.#structuredInputCorrelationId(rpcId).id,
+      rpcId,
+      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+      ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
+      outcome: input.outcome,
+    });
+  }
+
   #handleServerRequest(serverRequest: ServerRequestEvent): void {
     const params = asRecord(serverRequest.params);
     const sessionId = typeof params?.threadId === "string" ? params.threadId : undefined;
@@ -1518,6 +1650,26 @@ export class CodexAdapter implements AgentAdapter {
     const requestTurnId = typeof params?.turnId === "string" ? params.turnId : undefined;
     const activeTurnId =
       sessionId === undefined ? undefined : this.#activeTurns.get(sessionId);
+    const isStructuredInput =
+      serverRequest.method === "item/tool/requestUserInput";
+    if (isStructuredInput) {
+      const correlation = this.#structuredInputCorrelationId(
+        serverRequest.id,
+        sessionId,
+        requestTurnId,
+      );
+      if (correlation.created) {
+        this.#auditStructuredInput(
+          "structured_input.request_received",
+          serverRequest.id,
+          {
+            ...(sessionId === undefined ? {} : { sessionId }),
+            ...(requestTurnId === undefined ? {} : { turnId: requestTurnId }),
+            outcome: "direct_server_request",
+          },
+        );
+      }
+    }
     if (
       sessionId !== undefined &&
       queue !== undefined &&
@@ -1527,6 +1679,17 @@ export class CodexAdapter implements AgentAdapter {
     ) {
       const deferred = this.#deferredServerRequestsBySession.get(sessionId) ?? [];
       if (deferred.length >= 64) {
+        if (isStructuredInput) {
+          this.#auditStructuredInput(
+            "structured_input.request_rejected",
+            serverRequest.id,
+            {
+              sessionId,
+              turnId: requestTurnId,
+              outcome: "deferred_queue_full",
+            },
+          );
+        }
         this.#client.respondError(serverRequest.id, {
           code: -32603,
           message: "Too many Codex requests arrived before exact turn correlation",
@@ -1535,6 +1698,17 @@ export class CodexAdapter implements AgentAdapter {
       }
       deferred.push(serverRequest);
       this.#deferredServerRequestsBySession.set(sessionId, deferred);
+      if (isStructuredInput) {
+        this.#auditStructuredInput(
+          "structured_input.request_deferred",
+          serverRequest.id,
+          {
+            sessionId,
+            turnId: requestTurnId,
+            outcome: "turn_binding_pending",
+          },
+        );
+      }
       return;
     }
     if (
@@ -1543,6 +1717,17 @@ export class CodexAdapter implements AgentAdapter {
       requestTurnId === undefined ||
       requestTurnId !== activeTurnId
     ) {
+      if (isStructuredInput) {
+        this.#auditStructuredInput(
+          "structured_input.request_rejected",
+          serverRequest.id,
+          {
+            ...(sessionId === undefined ? {} : { sessionId }),
+            ...(requestTurnId === undefined ? {} : { turnId: requestTurnId }),
+            outcome: "outside_exact_active_turn",
+          },
+        );
+      }
       this.#client.respondError(serverRequest.id, {
         code: -32601,
         message:
@@ -1952,7 +2137,7 @@ export class CodexAdapter implements AgentAdapter {
       }
       const presentManualApproval = () => {
         this.#workspaceGitApprovals.consumeExactPlan(sessionId, params.turnId, plan);
-        const requestId = `codex-input:${randomUUID()}`;
+        const requestId = this.#structuredInputRequestId(serverRequest.id, "input");
         const expirationTimer = setTimeout(() => {
           const pending = this.#pendingUserInputs.get(requestId);
           if (pending === undefined || pending.kind !== "git_approval") return;
@@ -1975,6 +2160,16 @@ export class CodexAdapter implements AgentAdapter {
           expiresAt: now + timeoutMs,
           expirationTimer,
         });
+        this.#auditStructuredInput(
+          "structured_input.callback_bound",
+          serverRequest.id,
+          {
+            requestId,
+            sessionId,
+            turnId: params.turnId,
+            outcome: "slack_git_callback_bound",
+          },
+        );
         this.#statuses.set(sessionId, "waiting_for_approval");
         queue.push({ type: "status.changed", status: "waiting_for_approval" });
         queue.push({
@@ -2154,10 +2349,18 @@ export class CodexAdapter implements AgentAdapter {
             optionLabel: option.label,
           });
         }
-        this.#client.respondToUserInput(serverRequest.id, { answers });
+        const response = { answers };
+        this.#dispatchUntrackedUserInputResponse(
+          serverRequest.id,
+          sessionId,
+          turnId,
+          this.#structuredInputCorrelationId(serverRequest.id).id,
+          response,
+          "automatic_choice",
+        );
         return;
       }
-      const requestId = `codex-choice:${randomUUID()}`;
+      const requestId = this.#structuredInputRequestId(serverRequest.id, "choice");
       const expirationTimer = setTimeout(() => {
         const pending = this.#pendingUserInputs.get(requestId);
         if (pending === undefined || pending.kind !== "choice") return;
@@ -2195,6 +2398,16 @@ export class CodexAdapter implements AgentAdapter {
         expirationTimer,
       };
       this.#pendingUserInputs.set(requestId, pending);
+      this.#auditStructuredInput(
+        "structured_input.callback_bound",
+        serverRequest.id,
+        {
+          requestId,
+          sessionId,
+          turnId,
+          outcome: "slack_choice_callback_bound",
+        },
+      );
       this.#statuses.set(sessionId, "waiting_for_input");
       queue.push({ type: "status.changed", status: "waiting_for_input" });
       this.#pushCurrentChoice(requestId, pending, queue);
@@ -2887,6 +3100,7 @@ export class CodexAdapter implements AgentAdapter {
     this.#workspaceGitAutomationOrigins.clear();
     this.#externallyResolvedGitUserInputs.clear();
     this.#externallyResolvedUserInputBindings.clear();
+    this.#structuredInputCorrelationIds.clear();
     for (const pending of this.#pendingUserInputBindings.values()) {
       clearTimeout(pending.expirationTimer);
     }
@@ -2912,6 +3126,45 @@ export class CodexAdapter implements AgentAdapter {
     queue: AsyncEventQueue,
   ): void {
     const dispatched = this.#userInputDeliveries.markServerResolved(rpcId);
+    const deferredRequest = (
+      this.#deferredServerRequestsBySession.get(sessionId) ?? []
+    ).find((request) => request.id === rpcId);
+    const pendingInput = [...this.#pendingUserInputs.entries()]
+      .find(([, pending]) => pending.rpcId === rpcId);
+    const pendingBinding = this.#pendingUserInputBindings.get(rpcKey(rpcId));
+    const deferredParams = asRecord(deferredRequest?.params);
+    const deferredTurnId =
+      typeof deferredParams?.turnId === "string"
+        ? deferredParams.turnId
+        : undefined;
+    const terminalTurnId =
+      dispatched?.turnId ??
+      pendingInput?.[1].turnId ??
+      pendingBinding?.turnId ??
+      deferredTurnId;
+    const terminalRequestId =
+      dispatched?.requestId ??
+      pendingInput?.[0] ??
+      this.#structuredInputCorrelationIds.get(rpcKey(rpcId))?.id;
+    if (terminalRequestId !== undefined) {
+      this.#auditStructuredInput(
+        "structured_input.request_terminalized",
+        rpcId,
+        {
+          requestId: terminalRequestId,
+          sessionId,
+          ...(terminalTurnId === undefined ? {} : { turnId: terminalTurnId }),
+          outcome:
+            dispatched !== undefined
+              ? "resolved_after_dispatch"
+              : pendingInput !== undefined
+                ? "resolved_before_dispatch"
+                : pendingBinding !== undefined || deferredRequest !== undefined
+                  ? "resolved_before_callback_binding"
+                  : "resolved_without_local_binding",
+        },
+      );
+    }
     if (dispatched !== undefined) {
       dispatched.queue.push({
         type: "choice.server_request_resolved",
@@ -3018,6 +3271,7 @@ export class CodexAdapter implements AgentAdapter {
         binding.turnId,
       );
     }
+    this.#structuredInputCorrelationIds.delete(rpcKey(rpcId));
   }
 
   #removePendingUserInputs(sessionId: string): void {
@@ -3025,11 +3279,17 @@ export class CodexAdapter implements AgentAdapter {
       if (pending.sessionId === sessionId) {
         clearTimeout(pending.expirationTimer);
         this.#pendingUserInputs.delete(requestId);
+        this.#structuredInputCorrelationIds.delete(rpcKey(pending.rpcId));
       }
     }
     this.#userInputDeliveries.removeWhere(
       (receipt) => receipt.sessionId === sessionId,
     );
+    for (const [key, correlation] of this.#structuredInputCorrelationIds) {
+      if (correlation.sessionId === sessionId) {
+        this.#structuredInputCorrelationIds.delete(key);
+      }
+    }
   }
 
   #hasPendingGitUserInput(sessionId: string): boolean {
@@ -3150,9 +3410,16 @@ export class CodexAdapter implements AgentAdapter {
     clearTimeout(pending.expirationTimer);
     this.#pendingUserInputs.delete(requestId);
     try {
-      this.#client.respondToUserInput(pending.rpcId, {
-        answers: { [pending.questionId]: { answers: [label] } },
-      });
+      this.#dispatchUntrackedUserInputResponse(
+        pending.rpcId,
+        pending.sessionId,
+        pending.turnId,
+        requestId,
+        {
+          answers: { [pending.questionId]: { answers: [label] } },
+        },
+        "git_answer_dispatched",
+      );
     } catch (error) {
       if (executionStarted) {
         this.#workspaceGitApprovals.clearApprovedExecution(
@@ -3162,6 +3429,44 @@ export class CodexAdapter implements AgentAdapter {
       }
       throw error;
     }
+  }
+
+  #dispatchUntrackedUserInputResponse(
+    rpcId: RpcId,
+    sessionId: string,
+    turnId: string,
+    requestId: string,
+    response: ToolRequestUserInputResponse,
+    successOutcome: "automatic_choice" | "git_answer_dispatched",
+  ): void {
+    this.#auditStructuredInput(
+      "structured_input.answer_dispatch_started",
+      rpcId,
+      { requestId, sessionId, turnId, outcome: "answers_nonempty_check" },
+    );
+    if (classifyUserInputResponseShape(response) === "answers_empty") {
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        rpcId,
+        { requestId, sessionId, turnId, outcome: "empty_answers_rejected" },
+      );
+      throw new Error("Structured input response has no answers");
+    }
+    try {
+      this.#client.respondToUserInput(rpcId, response);
+    } catch (error) {
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        rpcId,
+        { requestId, sessionId, turnId, outcome: "transport_write_failed" },
+      );
+      throw error;
+    }
+    this.#auditStructuredInput(
+      "structured_input.answer_dispatch_succeeded",
+      rpcId,
+      { requestId, sessionId, turnId, outcome: successOutcome },
+    );
   }
 
   #observeApprovedGitExecution(
@@ -3322,6 +3627,7 @@ export class CodexAdapter implements AgentAdapter {
     }
     const receipt: DispatchedChoiceUserInput = {
       requestId,
+      rpcId: pending.rpcId,
       sessionId: pending.sessionId,
       turnId: pending.turnId,
       itemId: pending.itemId,
@@ -3336,6 +3642,30 @@ export class CodexAdapter implements AgentAdapter {
         ]),
       ),
     };
+    this.#auditStructuredInput(
+      "structured_input.answer_dispatch_started",
+      pending.rpcId,
+      {
+        requestId,
+        sessionId: pending.sessionId,
+        turnId: pending.turnId,
+        outcome: "answers_nonempty_check",
+      },
+    );
+    if (classifyUserInputResponseShape(response) === "answers_empty") {
+      this.#userInputDeliveries.remove(pending.rpcId);
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        pending.rpcId,
+        {
+          requestId,
+          sessionId: pending.sessionId,
+          turnId: pending.turnId,
+          outcome: "empty_answers_rejected",
+        },
+      );
+      throw new Error("Structured input response has no answers");
+    }
     try {
       if (this.#client.respondToUserInputAndDrain !== undefined) {
         await this.#client.respondToUserInputAndDrain(pending.rpcId, response);
@@ -3344,6 +3674,16 @@ export class CodexAdapter implements AgentAdapter {
       }
     } catch (error) {
       this.#userInputDeliveries.remove(pending.rpcId);
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        pending.rpcId,
+        {
+          requestId,
+          sessionId: pending.sessionId,
+          turnId: pending.turnId,
+          outcome: "transport_write_failed",
+        },
+      );
       queue.push({
         type: "choice.delivery_failed",
         requestId,
@@ -3352,6 +3692,16 @@ export class CodexAdapter implements AgentAdapter {
       throw error;
     }
     if (this.#userInputDeliveries.markServerResolved(pending.rpcId) !== undefined) {
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_succeeded",
+        pending.rpcId,
+        {
+          requestId,
+          sessionId: pending.sessionId,
+          turnId: pending.turnId,
+          outcome: "response_written",
+        },
+      );
       queue.push({
         type: "choice.answer_dispatched",
         requestId,
@@ -3371,6 +3721,16 @@ export class CodexAdapter implements AgentAdapter {
         }
         continue;
       }
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        failure.receipt.rpcId,
+        {
+          requestId: failure.receipt.requestId,
+          sessionId: failure.receipt.sessionId,
+          turnId: failure.receipt.turnId,
+          outcome: failure.reason,
+        },
+      );
       failure.receipt.queue.push({
         type: "choice.delivery_failed",
         requestId: failure.receipt.requestId,
