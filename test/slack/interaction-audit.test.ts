@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createInteractionAudit } from "../../src/slack/interaction-audit.js";
+import {
+  createInteractionAudit,
+  type InteractionAuditInput,
+} from "../../src/slack/interaction-audit.js";
 
 test("writes timestamped interaction lifecycle records with only hashed routing refs", () => {
   const lines: string[] = [];
@@ -111,18 +114,60 @@ test("replaces non-allowlisted outcomes including secret-like tokens", () => {
 
 test("allows only fixed external-action repair classifiers without wire content", () => {
   const lines: string[] = [];
+  const syntheticSecret = "synthetic-secret-value-never-log";
   const audit = createInteractionAudit(
     (line) => lines.push(line),
     () => 0,
     { workerId: "worker", buildIdentity: "build" },
   );
-  audit({
-    event: "structured_input.request_rejected",
-    requestId: "request",
-    outcome: "external_action_blocking_required",
-  });
-  const record = JSON.parse(lines[0] ?? "null") as Record<string, unknown>;
-  assert.equal(record.outcome, "external_action_blocking_required");
-  assert.equal(Object.hasOwn(record, "isBlocking"), false);
-  assert.equal(Object.hasOwn(record, "questions"), false);
+  const unsafeAudit = audit as (input: InteractionAuditInput & {
+    readonly isBlocking: boolean;
+    readonly questions: readonly unknown[];
+  }) => void;
+  const outcomes = [
+    "external_action_blocking_required",
+    "external_action_description_invalid",
+    "external_action_details_invalid",
+    "external_action_option_shape_invalid",
+    "external_action_question_shape_invalid",
+    "external_action_request_invalid",
+  ] as const satisfies readonly InteractionAuditInput["outcome"][];
+
+  for (const outcome of outcomes) {
+    unsafeAudit({
+      event: "structured_input.request_rejected",
+      requestId: syntheticSecret,
+      rpcId: syntheticSecret,
+      turnId: syntheticSecret,
+      channelId: syntheticSecret,
+      rootThreadTs: syntheticSecret,
+      messageTs: syntheticSecret,
+      sessionId: syntheticSecret,
+      outcome,
+      isBlocking: false,
+      questions: [{ prompt: syntheticSecret }],
+    });
+  }
+
+  assert.equal(lines.length, outcomes.length);
+  for (const [index, line] of lines.entries()) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.equal(record.outcome, outcomes[index]);
+    assert.deepEqual(Object.keys(record).sort(), [
+      "buildIdentity",
+      "channelRef",
+      "component",
+      "event",
+      "messageRef",
+      "outcome",
+      "requestRef",
+      "rpcRef",
+      "sessionRef",
+      "threadRef",
+      "timestamp",
+      "turnRef",
+      "workerRef",
+    ]);
+    assert.equal(line.includes(syntheticSecret), false);
+  }
 });

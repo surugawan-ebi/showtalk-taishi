@@ -4119,16 +4119,73 @@ test("offers the same bounded repair for every external-action validation failur
   const base = externalActionQuestion();
   const question = base.questions[0];
   assert.ok(question);
-  const cases: readonly [string, unknown][] = [
-    ["blocking", { ...base, isBlocking: "yes" }],
-    ["non-blocking", { ...base, isBlocking: false }],
+  const cases: readonly [string, unknown, InteractionAuditInput["outcome"]][] = [
+    [
+      "blocking",
+      { ...base, isBlocking: "yes" },
+      "external_action_blocking_required",
+    ],
+    [
+      "non-blocking",
+      { ...base, isBlocking: false },
+      "external_action_blocking_required",
+    ],
+    [
+      "question-count",
+      { ...base, questions: [question, ordinaryChoiceQuestion().questions[0]] },
+      "external_action_question_shape_invalid",
+    ],
+    [
+      "option-count",
+      {
+        ...base,
+        questions: [{
+          ...question,
+          options: [
+            ...question.options,
+            { label: "later", description: "not a fixed approval choice" },
+          ],
+        }],
+      },
+      "external_action_option_shape_invalid",
+    ],
+    [
+      "approve-label",
+      {
+        ...base,
+        questions: [{
+          ...question,
+          options: [
+            { ...question.options[0], label: "実行する" },
+            question.options[1],
+          ],
+        }],
+      },
+      "external_action_option_shape_invalid",
+    ],
+    [
+      "reject-label",
+      {
+        ...base,
+        questions: [{
+          ...question,
+          options: [
+            question.options[0],
+            { ...question.options[1], label: "あとで" },
+          ],
+        }],
+      },
+      "external_action_option_shape_invalid",
+    ],
     [
       "secret",
       { ...base, questions: [{ ...question, isSecret: true }] },
+      "external_action_request_invalid",
     ],
     [
       "details",
       { ...base, questions: [{ ...question, question: "Gatewayを再起動しますか？" }] },
+      "external_action_details_invalid",
     ],
     [
       "description",
@@ -4142,14 +4199,27 @@ test("offers the same bounded repair for every external-action validation failur
           ],
         }],
       },
+      "external_action_description_invalid",
     ],
-    ["auto-resolution", { ...base, autoResolutionMs: 1 }],
-    ["item-id", { ...base, itemId: "" }],
+    [
+      "auto-resolution",
+      { ...base, autoResolutionMs: 1 },
+      "external_action_request_invalid",
+    ],
+    [
+      "item-id",
+      { ...base, itemId: "" },
+      "external_action_request_invalid",
+    ],
   ];
 
-  for (const [name, params] of cases) {
+  for (const [name, params, expectedAuditOutcome] of cases) {
     const server = new FakeAppServer();
-    const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 5 });
+    const audit: InteractionAuditInput[] = [];
+    const adapter = new CodexAdapter(server, {
+      gitPlanBindingGraceMs: 5,
+      interactionAudit: (event) => audit.push(event),
+    });
     const eventsPromise = collectEvents(adapter.sendMessage(
       { id: "thr_1" },
       { text: `外部操作の${name}形式を確認する`, source: { type: "human" } },
@@ -4179,6 +4249,14 @@ test("offers the same bounded repair for every external-action validation failur
           event.code === "UNSUPPORTED_STRUCTURED_INPUT",
       ),
       false,
+      name,
+    );
+    assert.ok(
+      audit.some((event) =>
+        event.event === "structured_input.request_rejected" &&
+        event.rpcId === `repair-${name}` &&
+        event.outcome === expectedAuditOutcome
+      ),
       name,
     );
   }
