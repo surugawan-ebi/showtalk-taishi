@@ -613,7 +613,8 @@ Koe posts the visit root in the target channel using the source channel's
 configured presentation. The target Koe's streamed response uses the target
 channel presentation in the same Slack thread. If that visit asks for a
 structured choice, Taishi mentions the authenticated user who originated the
-delegation chain and binds the controls to that user. If the source call originated
+delegation chain and binds the controls to that user. Ordinary target-Koe
+progress and final messages do not mention that user. If the source call originated
 from a live Slack turn, completion or failure is also posted back to that exact
 source Slack thread using the source presentation. The source Koe receives
 the response through MCP and produces its normal final answer there. When a

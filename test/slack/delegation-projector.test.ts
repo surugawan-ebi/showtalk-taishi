@@ -30,6 +30,7 @@ test("projects direct delegation into the target channel as an activity thread",
     sourceAgentId: "implementer",
     sourceChannelId: "C1",
     sourceRootThreadTs: "99.1",
+    sourceSlackUserId: "U123",
     targetAgentId: "reviewer",
     targetChannelId: "C2",
     targetSessionId: "s2",
@@ -66,6 +67,10 @@ test("projects direct delegation into the target channel as an activity thread",
   assert.match(String(posts[3]?.text), /<#C2>/u);
   assert.equal(posts[3]?.username, "Taishi Implementer");
   assert.equal(posts[3]?.icon_emoji, ":hammer:");
+  assert.ok(
+    posts.every((post) => !String(post.text).includes("<@U123>")),
+    "ordinary Koe-to-Koe activity must not mention the originating user",
+  );
   assert.equal(updates.length, 0);
 });
 

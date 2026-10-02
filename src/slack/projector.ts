@@ -62,6 +62,11 @@ type AttachmentUploader = (
 
 export interface SlackThreadProjectorOptions {
   readonly sourceUserId?: string;
+  /**
+   * Whether ordinary turn messages should notify the source user. Structured
+   * requests still use sourceUserId to bind and notify the authenticated human.
+   */
+  readonly mentionSourceUserInTurnMessages?: boolean;
   readonly presentation?: SlackMessagePresentation;
   readonly now?: () => number;
   readonly heartbeatScheduler?: HeartbeatScheduler;
@@ -78,6 +83,7 @@ export class SlackThreadProjector {
   readonly #rootThreadTs: string;
   readonly #sourceUserId: string | undefined;
   readonly #sourceUserMention: string | undefined;
+  readonly #mentionSourceUserInTurnMessages: boolean;
   readonly #presentation: SlackMessagePresentation;
   readonly #now: () => number;
   readonly #heartbeatScheduler: HeartbeatScheduler;
@@ -137,6 +143,8 @@ export class SlackThreadProjector {
     this.#sourceUserMention = options.sourceUserId === undefined
       ? undefined
       : formatSlackUserMention(options.sourceUserId);
+    this.#mentionSourceUserInTurnMessages =
+      options.mentionSourceUserInTurnMessages ?? true;
     this.#presentation = options.presentation ?? {};
     this.#now = options.now ?? Date.now;
     this.#heartbeatScheduler =
@@ -372,7 +380,10 @@ export class SlackThreadProjector {
   }
 
   async #completeProjection(): Promise<void> {
-    if (this.#sourceUserMention === undefined) {
+    if (
+      this.#sourceUserMention === undefined ||
+      !this.#mentionSourceUserInTurnMessages
+    ) {
       await this.#publishFinalMessagesToActivity();
       if (this.#finalMessagesPublished) {
         await this.#publishPendingGitApprovalRecovery();
@@ -845,7 +856,9 @@ export class SlackThreadProjector {
     notifySourceUser = false,
   ): Promise<void> {
     const includesSourceMention =
-      notifySourceUser && this.#sourceUserMention !== undefined;
+      notifySourceUser &&
+      this.#mentionSourceUserInTurnMessages &&
+      this.#sourceUserMention !== undefined;
     const postedText = this.#formatActionableMessage(text, includesSourceMention);
     // Slack clients can derive notification copy from either the top-level
     // fallback or Block Kit text, so keep the actionable mention in both.
