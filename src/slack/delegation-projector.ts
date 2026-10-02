@@ -201,7 +201,12 @@ export class SlackDelegationProjector {
       {
         ...(activity.sourceSlackUserId === undefined
           ? {}
-          : { sourceUserId: activity.sourceSlackUserId }),
+          : {
+              sourceUserId: activity.sourceSlackUserId,
+              // Keep the authenticated human bound to structured requests,
+              // but do not notify them for ordinary Koe-to-Koe activity.
+              mentionSourceUserInTurnMessages: false,
+            }),
         presentation: presentationForChannel(
           this.#presentations,
           activity.targetChannelId,
