@@ -6,6 +6,34 @@ import {
   type InteractionAuditInput,
 } from "../../src/slack/interaction-audit.js";
 
+test("text attribution uses fixed classification and hashed actor and message references", () => {
+  const lines: string[] = [];
+  const audit = createInteractionAudit((line) => lines.push(line), () => 0);
+  const input: InteractionAuditInput = {
+    event: "approval_text.binding_validated",
+    requestId: "codex:synthetic-request",
+    messageTs: "1780000001.000001",
+    commandMessageTs: "1780000002.000001",
+    actorUserId: "UAPPROVER",
+    attributionUserId: "UCHATGPT",
+    attributionAppId: "ACHATGPT",
+    approvalTextFormat: "chatgpt_slack_footer_v1",
+    outcome: "approve",
+  };
+  audit(input);
+  const record = JSON.parse(lines[0]!) as Record<string, unknown>;
+  assert.equal(record.approvalTextFormat, "chatgpt_slack_footer_v1");
+  for (const field of ["actorRef", "attributionUserRef", "attributionAppRef", "messageRef", "commandMessageRef"]) {
+    assert.match(String(record[field]), /^[0-9a-f]{16}$/u);
+  }
+  assert.notEqual(record.actorRef, record.attributionUserRef);
+  assert.notEqual(record.commandMessageRef, record.messageRef);
+  assert.doesNotMatch(lines[0]!, /UAPPROVER|UCHATGPT|ACHATGPT|178000000|synthetic-request/u);
+  audit({ ...input, approvalTextFormat: "untrusted-secret" as NonNullable<InteractionAuditInput["approvalTextFormat"]> });
+  assert.equal(JSON.parse(lines[1]!).approvalTextFormat, "invalid_format_classifier");
+  assert.ok(!lines[1]!.includes("untrusted-secret"));
+});
+
 test("writes timestamped interaction lifecycle records with only hashed routing refs", () => {
   const lines: string[] = [];
   const audit = createInteractionAudit(

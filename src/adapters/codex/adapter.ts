@@ -1356,7 +1356,7 @@ export class CodexAdapter implements AgentAdapter {
     if (pending === undefined || pending.sessionId !== session.id) {
       throw new Error(`Unknown approval request: ${approval.requestId}`);
     }
-    if (Date.now() > pending.expiresAt) {
+    if (Date.now() >= pending.expiresAt) {
       try {
         this.#respondToPendingApproval(pending, "cancel");
       } finally {
@@ -1809,6 +1809,7 @@ export class CodexAdapter implements AgentAdapter {
     const itemId = typeof params?.itemId === "string" ? params.itemId : undefined;
     const item =
       itemId === undefined ? undefined : this.#startedItems.get(itemKey(sessionId, itemId));
+    const expiresAt = Date.now() + this.#options.approvalTimeoutMs;
     const expirationTimer = setTimeout(() => {
       const current = this.#pendingApprovals.get(requestId);
       if (current === undefined) return;
@@ -1837,7 +1838,7 @@ export class CodexAdapter implements AgentAdapter {
       ...(commandApprovalOptions?.commandDecisions === undefined
         ? {}
         : { commandDecisions: commandApprovalOptions.commandDecisions }),
-      expiresAt: Date.now() + this.#options.approvalTimeoutMs,
+      expiresAt,
       expirationTimer,
     });
     this.#statuses.set(sessionId, "waiting_for_approval");
@@ -1848,6 +1849,7 @@ export class CodexAdapter implements AgentAdapter {
     queue.push({
       type: "approval.requested",
       requestId,
+      expiresAt: new Date(expiresAt).toISOString(),
       summary:
         mcpToolApproval !== undefined
           ? mcpToolApproval.summary

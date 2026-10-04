@@ -8,6 +8,7 @@ import type {
   Gateway,
   GatewayAgentEvent,
   AgentEvent,
+  AgentApproval,
   WorkspaceGitApprovalPlan,
 } from "../core/index.js";
 import type { RuntimeSlackAttachment } from "../mcp/workspace-attachments.js";
@@ -15,6 +16,7 @@ import type {
   PermissionApprovalCoordinator,
   PermissionApprovalPresentation,
   PermissionApprovalSettlement,
+  PermissionApprovalDecision,
 } from "../permissions/approval-coordinator.js";
 import {
   createWorkspaceGitHumanDecisionDeliveryId,
@@ -36,6 +38,7 @@ import type {
 } from "../approvals/workspace-git-system-rejection-coordinator.js";
 import {
   APPROVAL_ACTION_PREFIX,
+  type ApprovalActionValue,
   parseApprovalActionValue,
   parseApprovalDecision,
 } from "./blocks.js";
@@ -62,6 +65,11 @@ import {
   parseConversationControlAction,
   parseConversationControlActionValue,
 } from "./controls.js";
+import { ApprovalTextStore } from "./approval-text-store.js";
+import {
+  parseApprovalTextCommand, buildApprovalTextCommandHint,
+  type ApprovalTextAttributionProfile,
+} from "./approval-text-command.js";
 import { validateSlackActionSource } from "./interaction-source.js";
 import {
   GIT_APPROVAL_RECOVERY_ACTION_PREFIX,
@@ -86,6 +94,7 @@ import {
 } from "./user-input-blocks.js";
 import {
   CHOICE_ACTION_PREFIX,
+  type ChoiceActionValue,
   CHOICE_OTHER_VIEW_CALLBACK_ID,
   buildChoiceOtherModal,
   parseChoiceActionId,
@@ -109,6 +118,7 @@ import {
 import {
   createInteractionAudit,
   type InteractionAudit,
+  type InteractionAuditInput,
   type InteractionAuditOutcome,
 } from "./interaction-audit.js";
 import {
@@ -151,6 +161,9 @@ export interface SlackFrontendOptions {
   readonly workspaceGitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
   readonly requestRestart?: () => void;
   readonly now?: () => number;
+  readonly approvalTextStore?: ApprovalTextStore;
+  /** Composition/test dependency; never derived from a Slack message. */
+  readonly approvalTextAttributionProfile?: ApprovalTextAttributionProfile;
   readonly interactionAudit?: InteractionAudit;
 }
 
@@ -241,13 +254,15 @@ export class SlackFrontend {
   readonly #gitApprovalDetails: WorkspaceGitApprovalDetailsStore;
   readonly #choiceContinuations: StructuredChoiceContinuationStore;
   readonly #permissionApprovalCards: PermissionApprovalCardTracker;
+  readonly #approvalTextStore: ApprovalTextStore;
+  readonly #approvalTextAttributionProfile: ApprovalTextAttributionProfile | undefined;
   readonly #now: () => number;
   readonly #interactionAudit: InteractionAudit;
   #activeMessageHandlers = 0;
   #restartPending = false;
   #stopPromise: Promise<void> | undefined;
 
-  constructor(gateway: Gateway, options: SlackFrontendOptions) {
+  constructor(gateway: Gateway, options: SlackFrontendOptions, app?: App) {
     this.#gateway = gateway;
     this.#approvers = new Set(options.approverUserIds);
     this.#agentChannels = new Set(options.agentChannelIds);
@@ -272,6 +287,9 @@ export class SlackFrontend {
       new WorkspaceGitApprovalDetailsStore();
     this.#requestRestart = options.requestRestart;
     this.#now = options.now ?? Date.now;
+    this.#approvalTextStore = options.approvalTextStore ?? new ApprovalTextStore(this.#now);
+    this.#approvalTextAttributionProfile = options.approvalTextAttributionProfile === undefined
+      ? undefined : Object.freeze({ ...options.approvalTextAttributionProfile });
     this.#interactionAudit = options.interactionAudit ??
       createInteractionAudit(console.info, this.#now);
     this.#choiceContinuations = new StructuredChoiceContinuationStore(this.#now);
@@ -286,7 +304,7 @@ export class SlackFrontend {
           }),
     });
     this.#defaultNotificationUserId = options.approverUserIds[0];
-    this.#app = new App({
+    this.#app = app ?? new App({
       token: options.botToken,
       appToken: options.appToken,
       socketMode: true,
@@ -297,6 +315,7 @@ export class SlackFrontend {
       this.#presentationsByChannel,
       this.#gitApprovalDetails,
       this.#choiceContinuations,
+      this.#approvalTextStore,
     );
     this.#registerListeners();
   }
@@ -503,6 +522,7 @@ export class SlackFrontend {
         );
       },
       this.#choiceContinuations,
+      this.#approvalTextStore,
     );
   }
 
@@ -628,6 +648,17 @@ export class SlackFrontend {
         operation: request.operation,
       };
       await this.#permissionApprovalCards.rememberRoute(request.requestId, route);
+      if (this.#permissionApprovalCards.routeFor(request.requestId) !== undefined &&
+          this.#permissionApprovalCards.settlementFor(request.requestId) === undefined) {
+        this.#approvalTextStore.remember({
+          kind: "permission",
+          requestId: request.requestId,
+          channelId: route.channelId,
+          rootThreadTs: route.rootThreadTs ?? route.messageTs,
+          messageTs: route.messageTs,
+          expiresAt: Date.parse(request.expiresAt),
+        });
+      }
     } catch (error) {
       await this.#permissionApprovalCards
         .discardUnroutedSettlement(request.requestId)
@@ -654,6 +685,7 @@ export class SlackFrontend {
   async settlePermissionApproval(
     settlement: PermissionApprovalSettlement,
   ): Promise<void> {
+    this.#approvalTextStore.forget(settlement.requestId);
     await this.#permissionApprovalCards.rememberSettlement(settlement);
     await this.#applyPermissionApprovalSettlement(settlement.requestId).catch(
       reportPermissionApprovalUpdateError,
@@ -672,14 +704,16 @@ export class SlackFrontend {
   async #applyPermissionApprovalSettlement(
     requestId: string,
   ): Promise<void> {
-    await this.#permissionApprovalCards.apply(
+    const applied = await this.#permissionApprovalCards.apply(
       requestId,
       async (route, settlement) => {
+        this.#approvalTextStore.forget(requestId);
         await this.#app.client.chat.update(
           permissionApprovalSettlementUpdateArguments(route, settlement),
         );
       },
     );
+    if (applied) this.#approvalTextStore.forget(requestId);
   }
 
   async #terminalizeExpiredGitApprovalCard(
@@ -687,6 +721,7 @@ export class SlackFrontend {
     details: WorkspaceGitApprovalDetails,
   ): Promise<boolean> {
     if (this.#now() < details.expiresAt) return false;
+    this.#approvalTextStore.forget(details.routing.requestId);
     const fallback = "Git操作の承認期限が切れました。この計画は実行できません。";
     const blocks = buildExpiredWorkspaceGitApprovalBlocks(
       details.plan,
@@ -709,6 +744,7 @@ export class SlackFrontend {
     client: WebClient,
     routing: UserInputActionValue,
   ): Promise<void> {
+    this.#approvalTextStore.forget(routing.requestId);
     await client.chat.update({
       channel: routing.channelId,
       ts: routing.messageTs,
@@ -740,6 +776,7 @@ export class SlackFrontend {
       ),
       async () => {
         this.#gitApprovalDetails.forget(details.routing);
+        this.#approvalTextStore.forget(details.routing.requestId);
         const reason = publicErrorMessage(failure);
         const message =
           `Git承認をprivate stateへ記録できなかったため、このSlack承認要求を終了しました。${reason}` +
@@ -912,6 +949,7 @@ export class SlackFrontend {
           presentation: this.#presentation(continuation.channelId),
           gitApprovalDetailsStore: this.#gitApprovalDetails,
           choiceContinuationStore: this.#choiceContinuations,
+          approvalTextStore: this.#approvalTextStore,
           interactionAudit: this.#interactionAudit,
         },
       );
@@ -995,10 +1033,280 @@ export class SlackFrontend {
     }
   }
 
+
+  async #applyNativeApproval(
+    client: WebClient,
+    logger: { error(error: unknown): void },
+    decision: AgentApproval["decision"],
+    approval: ApprovalActionValue,
+    source: { readonly userId: string; readonly channelId: string; readonly messageTs: string },
+  ): Promise<void> {
+    if (approval.sessionId === undefined) {
+      await this.#gateway.resolveApproval(
+        approval.channelId,
+        approval.rootThreadTs,
+        { requestId: approval.requestId, decision },
+      );
+    } else {
+      await this.#gateway.resolveSessionApproval(approval.sessionId, {
+        requestId: approval.requestId,
+        decision,
+      });
+    }
+    this.#approvalTextStore.forget(approval.requestId);
+    await client.chat.update({
+      channel: source.channelId,
+      ts: source.messageTs,
+      text: `Approval resolved by <@${source.userId}>: ${decisionLabel(decision)}`,
+      blocks: [],
+    }).catch((error) => logger.error(error));
+  }
+
+  async #applyChoiceAnswer(
+    client: WebClient,
+    logger: { error(error: unknown): void },
+    routing: ChoiceActionValue,
+    source: { readonly userId: string; readonly channelId: string; readonly messageTs: string },
+  ): Promise<void> {
+    const selectedOptionId = routing.optionId;
+    if (selectedOptionId === undefined) throw new Error("Structured choice option is missing");
+    this.#interactionAudit({
+      event: "choice.answer_recorded",
+      ...routing,
+    });
+    await deliverChoiceAnswerBeforeReceipt(
+      () => this.#gateway.resolveUserInput(
+        routing.channelId,
+        routing.rootThreadTs,
+        {
+          requestId: routing.requestId,
+          answer: {
+            questionId: routing.questionId,
+            optionId: selectedOptionId,
+          },
+        },
+      ),
+      () => {
+        this.#approvalTextStore.forget(routing.requestId);
+        this.#choiceContinuations.markDispatched(routing.requestId, routing.messageTs);
+        return client.chat.update({
+          channel: source.channelId,
+          ts: source.messageTs,
+          text: choiceReceiptText(source.userId, routing.purpose),
+          blocks: [],
+        }).then(() => this.#interactionAudit({
+          event: "choice.card_terminalized",
+          ...routing,
+          outcome: "answer_dispatched",
+        })).catch((error) => logger.error(error));
+      },
+    );
+  }
+
+  async #applyGitApproval(
+    client: WebClient,
+    logger: { error(error: unknown): void },
+    decision: "approve" | "reject",
+    routing: UserInputActionValue,
+    source: { readonly userId: string; readonly channelId: string; readonly messageTs: string },
+  ): Promise<void> {
+    await this.#gitApprovalDetails.serialize(routing, async () => {
+      const details = this.#gitApprovalDetails.get(routing);
+      if (details === undefined) {
+        await this.#terminalizeUnavailableGitApprovalCard(client, routing);
+        return;
+      }
+      if (await this.#terminalizeExpiredGitApprovalCard(client, details)) {
+        return;
+      }
+      try {
+        const koeId = this.#agentIdsByChannel.get(routing.channelId);
+        if (koeId === undefined || details.sessionId === undefined) {
+          throw new Error(
+            "The authenticated workspace-git decision context is unavailable",
+          );
+        }
+        await recordGitDecisionBeforeAppServerResume(
+          this.#workspaceGitDecisionBroker,
+          details.plan,
+          decision,
+          createWorkspaceGitHumanDecisionDeliveryId({
+            channelId: routing.channelId,
+            rootThreadTs: routing.rootThreadTs,
+            messageTs: routing.messageTs,
+            requestId: routing.requestId,
+            userId: source.userId,
+            decision,
+            operationId: details.plan.operationId,
+            planHash: details.plan.planHash,
+          }),
+          {
+            callerId: source.userId,
+            koeId,
+            channelId: routing.channelId,
+            rootThreadTs: routing.rootThreadTs,
+            sessionId: details.sessionId,
+          },
+          () => this.#gateway.resolveUserInput(
+            routing.channelId,
+            routing.rootThreadTs,
+            {
+              requestId: routing.requestId,
+              optionId: decision,
+              plan: details.plan,
+            },
+          ),
+        );
+        this.#interactionAudit({
+          event: "git_approval.answer_applied",
+          ...routing,
+          outcome: decision,
+        });
+      } catch (error) {
+        logger.error(error);
+        if (!canSafelyRejectAfterPrivateGitDecisionFailure(error)) {
+          // A timeout or transport failure can race with a durable
+          // approval that completed after the local wait ended. Keep
+          // the App Server request and original Slack controls pending;
+          // retrying the same bound button reconciles by delivery ID.
+          throw error;
+        }
+        await this.#closeFailedPrivateGitDecision(client, details, error);
+        return;
+      }
+      this.#gitApprovalDetails.forget(routing);
+      this.#approvalTextStore.forget(routing.requestId);
+      try {
+        await client.chat.update({
+          channel: source.channelId,
+          ts: source.messageTs,
+          text:
+            decision === "approve"
+              ? `Git plan approved by <@${source.userId}>. Codex is revalidating it before execution.`
+              : `Git plan rejected or held by <@${source.userId}>.`,
+          blocks: [],
+        });
+        this.#interactionAudit({
+          event: "git_approval.card_terminalized",
+          ...routing,
+          outcome: decision,
+        });
+      } catch (error) {
+        // The App Server response is already single-use. A cosmetic Slack
+        // update failure must never cause a second approval attempt.
+        logger.error(error);
+      }
+    });
+  }
+
+  async #applyPermissionApproval(
+    requestId: string,
+    decision: PermissionApprovalDecision,
+    userId: string,
+  ): Promise<void> {
+    if (this.#permissionApprovals === undefined) throw new Error("Permission approvals are not available in this runtime");
+    const settled = this.#permissionApprovalCards.settlementFor(
+      requestId,
+    );
+    if (settled !== undefined) {
+      await this.#applyPermissionApprovalSettlement(requestId);
+      return;
+    }
+    await this.#permissionApprovals.resolve(requestId, decision, {
+      resolvedBySlackUserId: userId,
+    });
+    this.#approvalTextStore.forget(requestId);
+  }
+
+  async #handleApprovalTextMessage(
+    event: unknown,
+    body: unknown,
+    client: WebClient,
+    logger: { error(error: unknown): void },
+  ): Promise<boolean> {
+    const raw = asRecord(event);
+    if (!isApprovalTextAttempt(raw?.text)) return false;
+    // Reserved approval text is never queued as an ordinary agent prompt,
+    // including malformed, quoted, stale and unsupported request IDs.
+    const message = parseHumanSlackMessage(event);
+    if (message === undefined || message.user === undefined ||
+        !this.#agentChannels.has(message.channel)) return true;
+    const finishHandler = this.#beginSlackHandler();
+    let auditContext: Omit<InteractionAuditInput, "event" | "outcome"> = {
+      channelId: message.channel,
+      commandMessageTs: message.ts,
+      actorUserId: message.user,
+    };
+    try {
+      if (this.#restartPending) throw new Error("Gateway restart is in progress");
+      if (parseSlackEventEnvelopeIdentity(body) === undefined) {
+        throw new Error("Slack event identity is incomplete");
+      }
+      const command = parseApprovalTextCommand(event, this.#approvalTextAttributionProfile);
+      if (command === undefined) throw new Error("Use only the exact approval command shown on the card, in its thread");
+      auditContext = {
+        ...auditContext,
+        requestId: command.requestId,
+        rootThreadTs: command.rootThreadTs,
+        approvalTextFormat: command.attribution?.kind ?? "plain",
+        ...(command.attribution === undefined ? {} : {
+          attributionAppId: command.attribution.appId,
+          attributionUserId: command.attribution.userId,
+        }),
+      };
+      const entry = this.#approvalTextStore.getForCommand(command, this.#approvers);
+      auditContext = { ...auditContext, messageTs: entry.messageTs };
+      // This is a validated candidate, not proof of backend settlement. The
+      // common handlers retain their own pending/replay checks and outcome logs.
+      this.#interactionAudit({ event: "approval_text.binding_validated", ...auditContext,
+        outcome: command.decision });
+      const source = { userId: command.userId, channelId: entry.channelId, messageTs: entry.messageTs };
+      switch (entry.kind) {
+        case "native": {
+          const decision = nativeTextApprovalDecision(command.decision, entry.availableDecisions);
+          await this.#applyNativeApproval(client, logger, decision, entry, source);
+          break;
+        }
+        case "permission":
+          await this.#applyPermissionApproval(entry.requestId,
+            command.decision === "approve" ? "allow_once" : "deny", command.userId);
+          break;
+        case "git":
+          await this.#applyGitApproval(client, logger, command.decision, entry.routing, source);
+          break;
+        case "external": {
+          const current = this.#choiceContinuations.getDisplayed(entry.requestId);
+          if (current === undefined || current.question.purpose !== "external_action_confirmation" ||
+              current.messageTs !== entry.messageTs || current.question.id !== entry.routing.questionId) {
+            throw new Error("External action confirmation is no longer pending");
+          }
+          await this.#applyChoiceAnswer(client, logger, {
+            ...entry.routing,
+            optionId: command.decision === "approve" ? entry.approveOptionId : entry.rejectOptionId,
+          }, source);
+          break;
+        }
+      }
+    } catch (error) {
+      this.#interactionAudit({ event: "approval_text.failed", ...auditContext, outcome: "error" });
+      logger.error(error);
+      await client.chat.postEphemeral({
+        channel: message.channel,
+        user: message.user,
+        text: `承認コマンドの完了を確認できませんでした: ${publicErrorMessage(error)}`,
+        ...this.#presentation(message.channel),
+      }).catch((postError) => logger.error(postError));
+    } finally {
+      finishHandler();
+    }
+    return true;
+  }
+
   #registerListeners(): void {
     this.#app.event("message", async ({ event, body, client, logger }) => {
       if (this.#durableEventLedger?.has(body.event_id) === true) return;
       if (!this.#deduplicator.accept(body.event_id)) return;
+      if (await this.#handleApprovalTextMessage(event, body, client, logger)) return;
       const message = parseHumanSlackMessage(event);
       if (message === undefined) return;
       const slackEnvelopeIdentity = parseSlackEventEnvelopeIdentity(body);
@@ -1031,6 +1339,7 @@ export class SlackFrontend {
               presentation: this.#presentation(message.channel),
               gitApprovalDetailsStore: this.#gitApprovalDetails,
               choiceContinuationStore: this.#choiceContinuations,
+          approvalTextStore: this.#approvalTextStore,
               interactionAudit: this.#interactionAudit,
           },
         );
@@ -1266,24 +1575,7 @@ export class SlackFrontend {
             action,
             this.#approvers,
           );
-          if (approval.sessionId === undefined) {
-            await this.#gateway.resolveApproval(
-              approval.channelId,
-              approval.rootThreadTs,
-              { requestId: approval.requestId, decision },
-            );
-          } else {
-            await this.#gateway.resolveSessionApproval(approval.sessionId, {
-              requestId: approval.requestId,
-              decision,
-            });
-          }
-          await client.chat.update({
-            channel: source.channelId,
-            ts: source.messageTs,
-            text: `Approval resolved by <@${source.userId}>: ${decisionLabel(decision)}`,
-            blocks: [],
-          });
+          await this.#applyNativeApproval(client, logger, decision, approval, source);
         } catch (error) {
           logger.error(error);
           await client.chat.postEphemeral({
@@ -1375,34 +1667,7 @@ export class SlackFrontend {
           if (routing.optionId === undefined) {
             throw new Error("Structured choice option is missing");
           }
-          const selectedOptionId = routing.optionId;
-          this.#interactionAudit({
-            event: "choice.answer_recorded",
-            ...routing,
-          });
-          await deliverChoiceAnswerBeforeReceipt(
-            () => this.#gateway.resolveUserInput(
-              routing.channelId,
-              routing.rootThreadTs,
-              {
-                requestId: routing.requestId,
-                answer: {
-                  questionId: routing.questionId,
-                  optionId: selectedOptionId,
-                },
-              },
-            ),
-            () => client.chat.update({
-              channel: source.channelId,
-              ts: source.messageTs,
-              text: choiceReceiptText(source.userId, routing.purpose),
-              blocks: [],
-            }).then(() => this.#interactionAudit({
-              event: "choice.card_terminalized",
-              ...routing,
-              outcome: "answer_dispatched",
-            })).catch((error) => logger.error(error)),
-          );
+          await this.#applyChoiceAnswer(client, logger, routing, source);
         } catch (error) {
           this.#interactionAudit({
             event: "choice.action_failed",
@@ -1411,13 +1676,14 @@ export class SlackFrontend {
           });
           logger.error(error);
           if (userId !== undefined && channelId !== undefined) {
-            if (auditRoute?.messageTs !== undefined) {
+            if (auditRoute?.messageTs !== undefined &&
+                this.#choiceContinuations.getDispatched(auditRoute.requestId) === undefined) {
               await client.chat.update({
                 channel: channelId,
                 ts: auditRoute.messageTs,
                 text:
                   auditRoute.purpose === "external_action_confirmation"
-                    ? "Codexへの回答送信に失敗したため、外部操作は未承認のまま停止しました。新しい最終承認が必要です。"
+                    ? "この外部操作への回答結果を確定できませんでした。元の要求の処理状況を確認してください。この表示は新たな承認ではありません。"
                     : "Codexへの回答送信に失敗しました。必要なら新しい質問からやり直してください。",
                 blocks: [],
               }).catch((updateError) => logger.error(updateError));
@@ -1839,6 +2105,8 @@ export class SlackFrontend {
                   expiresAt: new Date(details.expiresAt).toISOString(),
                 },
               );
+              const textEntry = this.#approvalTextStore.get(routing.requestId);
+              if (textEntry !== undefined) planBlocks.push(approvalTextHintBlock(textEntry.requestId));
               await client.chat.update({
                 channel: source.channelId,
                 ts: source.messageTs,
@@ -1863,92 +2131,7 @@ export class SlackFrontend {
             ...routing,
             outcome: decision,
           });
-          await this.#gitApprovalDetails.serialize(routing, async () => {
-            const details = this.#gitApprovalDetails.get(routing);
-            if (details === undefined) {
-              await this.#terminalizeUnavailableGitApprovalCard(client, routing);
-              return;
-            }
-            if (await this.#terminalizeExpiredGitApprovalCard(client, details)) {
-              return;
-            }
-            try {
-              const koeId = this.#agentIdsByChannel.get(routing.channelId);
-              if (koeId === undefined || details.sessionId === undefined) {
-                throw new Error(
-                  "The authenticated workspace-git decision context is unavailable",
-                );
-              }
-              await recordGitDecisionBeforeAppServerResume(
-                this.#workspaceGitDecisionBroker,
-                details.plan,
-                decision,
-                createWorkspaceGitHumanDecisionDeliveryId({
-                  channelId: routing.channelId,
-                  rootThreadTs: routing.rootThreadTs,
-                  messageTs: routing.messageTs,
-                  requestId: routing.requestId,
-                  userId: source.userId,
-                  decision,
-                  operationId: details.plan.operationId,
-                  planHash: details.plan.planHash,
-                }),
-                {
-                  callerId: source.userId,
-                  koeId,
-                  channelId: routing.channelId,
-                  rootThreadTs: routing.rootThreadTs,
-                  sessionId: details.sessionId,
-                },
-                () => this.#gateway.resolveUserInput(
-                  routing.channelId,
-                  routing.rootThreadTs,
-                  {
-                    requestId: routing.requestId,
-                    optionId: decision,
-                    plan: details.plan,
-                  },
-                ),
-              );
-              this.#interactionAudit({
-                event: "git_approval.answer_applied",
-                ...routing,
-                outcome: decision,
-              });
-            } catch (error) {
-              logger.error(error);
-              if (!canSafelyRejectAfterPrivateGitDecisionFailure(error)) {
-                // A timeout or transport failure can race with a durable
-                // approval that completed after the local wait ended. Keep
-                // the App Server request and original Slack controls pending;
-                // retrying the same bound button reconciles by delivery ID.
-                throw error;
-              }
-              await this.#closeFailedPrivateGitDecision(client, details, error);
-              return;
-            }
-            this.#gitApprovalDetails.forget(routing);
-            try {
-              await client.chat.update({
-                channel: source.channelId,
-                ts: source.messageTs,
-                text:
-                  decision === "approve"
-                    ? `Git plan approved by <@${source.userId}>. Codex is revalidating it before execution.`
-                    : `Git plan rejected or held by <@${source.userId}>.`,
-                blocks: [],
-              });
-              this.#interactionAudit({
-                event: "git_approval.card_terminalized",
-                ...routing,
-                outcome: decision,
-              });
-            } catch (error) {
-              // The App Server response is already single-use. A cosmetic Slack
-              // update failure must never cause a second approval attempt.
-              logger.error(error);
-            }
-          });
+          await this.#applyGitApproval(client, logger, decision, routing, source);
         } catch (error) {
           this.#interactionAudit({
             event: "git_approval.action_failed",
@@ -2096,16 +2279,7 @@ export class SlackFrontend {
             this.#approvers,
             route,
           );
-          const settled = this.#permissionApprovalCards.settlementFor(
-            approval.requestId,
-          );
-          if (settled !== undefined) {
-            await this.#applyPermissionApprovalSettlement(approval.requestId);
-            return;
-          }
-          await this.#permissionApprovals.resolve(approval.requestId, decision, {
-            resolvedBySlackUserId: userId,
-          });
+          await this.#applyPermissionApproval(approval.requestId, decision, userId);
         } catch (error) {
           logger.error(error);
           await client.chat.postEphemeral({
@@ -2233,7 +2407,7 @@ export function permissionApprovalPostArguments(
       ? {}
       : { thread_ts: request.sourceRootThreadTs }),
     text: `${notificationUserId === undefined ? "" : `<@${notificationUserId}> `}${request.sourceAgentId} Koe requests permission: ${request.summary}`,
-    blocks: buildPermissionApprovalBlocks(routedRequest),
+    blocks: [...buildPermissionApprovalBlocks(routedRequest), approvalTextHintBlock(request.requestId)],
     ...presentation,
   };
 }
@@ -2282,6 +2456,33 @@ function reportPermissionApprovalUpdateError(error: unknown): void {
       error instanceof Error ? error.message : "unknown error"
     }`,
   );
+}
+
+/** Reserved command attempts never become new coding-agent turns. */
+export function isApprovalTextAttempt(text: unknown): boolean {
+  return typeof text === "string" && (
+    /^[\s>`*_~]*(?:承認|拒否)(?:\s|$)/u.test(text) ||
+    /(?:承認|拒否)\s+(?:codex|codex-input|codex-choice|permission):/u.test(text)
+  );
+}
+
+export function nativeTextApprovalDecision(
+  decision: "approve" | "reject",
+  available: readonly AgentApproval["decision"][],
+): AgentApproval["decision"] {
+  const mapped = decision === "approve" ? "allow_once"
+    : available.includes("deny") ? "deny" : "cancel";
+  if (!available.includes(mapped)) throw new Error("This decision requires the approval buttons");
+  return mapped;
+}
+
+function approvalTextHintBlock(requestId: string): KnownBlock {
+  if (buildApprovalTextCommandHint(requestId) === undefined) {
+    throw new Error("Approval request ID cannot be used in a text command");
+  }
+  return { type: "context", elements: [{ type: "mrkdwn", text:
+    `ボタン、またはこのスレッドへ専用コマンドだけを送信: \`承認 ${requestId}\` / \`拒否 ${requestId}\`\n承認は今回限り。手動の引用・署名・メンションは不可。確認済みChatGPT連携の自動付記のみ対応。表示期限内のみ有効です。`,
+  }] };
 }
 
 export function parseHumanSlackMessage(

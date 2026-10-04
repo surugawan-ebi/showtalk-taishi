@@ -1,9 +1,12 @@
 import type { KnownBlock } from "@slack/types";
 import type { WebClient } from "@slack/web-api";
 
-import type { AgentEvent } from "../core/index.js";
+import type { AgentApproval, AgentEvent } from "../core/index.js";
+import { buildApprovalTextCommandHint } from "./approval-text-command.js";
+import type { ApprovalTextStore } from "./approval-text-store.js";
 import { buildApprovalBlocks } from "./blocks.js";
 import { buildGitApprovalRecoveryBlocks } from "./git-approval-recovery-blocks.js";
+import type { ChoiceActionRouting } from "./choice-blocks.js";
 import { buildChoiceBlocks } from "./choice-blocks.js";
 import {
   StructuredChoiceContinuationStore,
@@ -44,6 +47,12 @@ const TERMINAL_UPDATE_RETRY_DELAYS_MS = [100, 500] as const;
 const WORKING_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 const GIT_APPROVAL_RECOVERY_FINAL_TEXT =
   "Git操作は承認されませんでした。元の依頼の処理は終了しました。";
+const DEFAULT_NATIVE_APPROVAL_DECISIONS: readonly AgentApproval["decision"][] = [
+  "allow_once",
+  "allow_session",
+  "deny",
+  "cancel",
+];
 
 type HeartbeatScheduler = (
   task: () => Promise<void>,
@@ -73,6 +82,7 @@ export interface SlackThreadProjectorOptions {
   readonly maxFinalChunks?: number;
   readonly gitApprovalDetailsStore?: WorkspaceGitApprovalDetailsStore;
   readonly choiceContinuationStore?: StructuredChoiceContinuationStore;
+  readonly approvalTextStore?: ApprovalTextStore;
   readonly attachmentUploader?: AttachmentUploader;
   readonly interactionAudit?: InteractionAudit;
 }
@@ -90,6 +100,8 @@ export class SlackThreadProjector {
   readonly #maxFinalChunks: number;
   readonly #gitApprovalDetailsStore: WorkspaceGitApprovalDetailsStore | undefined;
   readonly #choiceContinuationStore: StructuredChoiceContinuationStore | undefined;
+  readonly #approvalTextStore: ApprovalTextStore | undefined;
+  readonly #approvalTextRequestIds = new Set<string>();
   readonly #attachmentUploader: AttachmentUploader;
   readonly #interactionAudit: InteractionAudit | undefined;
   readonly #startedAtMs: number;
@@ -152,6 +164,7 @@ export class SlackThreadProjector {
     this.#maxFinalChunks = options.maxFinalChunks ?? MAX_FINAL_CHUNKS;
     this.#gitApprovalDetailsStore = options.gitApprovalDetailsStore;
     this.#choiceContinuationStore = options.choiceContinuationStore;
+    this.#approvalTextStore = options.approvalTextStore;
     this.#attachmentUploader =
       options.attachmentUploader ??
       ((client, channelId, rootThreadTs, attachments) =>
@@ -355,6 +368,7 @@ export class SlackThreadProjector {
   async complete(): Promise<void> {
     this.#stopHeartbeat();
     this.#finalizeToolProgress();
+    this.#revokeApprovalTextRequests();
     if (this.#completion !== undefined) {
       await this.#completion;
       return;
@@ -372,6 +386,7 @@ export class SlackThreadProjector {
   async abandon(): Promise<void> {
     this.#stopHeartbeat();
     this.#finalizeToolProgress();
+    this.#revokeApprovalTextRequests();
     await this.#activityWriteTail.catch(() => undefined);
   }
 
@@ -913,6 +928,16 @@ export class SlackThreadProjector {
         expiresAt: event.expiresAt,
       },
     );
+    const approvalTextHint = this.#approvalTextStore === undefined
+      ? undefined
+      : buildApprovalTextHintBlock(
+        event.requestId,
+        { approve: true, reject: true },
+        expiresAt!,
+      );
+    const renderedBlocks = approvalTextHint === undefined
+      ? blocks
+      : [...blocks, approvalTextHint];
     const posted = await this.#client.chat.postMessage({
       channel: this.#channelId,
       thread_ts: this.#rootThreadTs,
@@ -920,8 +945,8 @@ export class SlackThreadProjector {
       mrkdwn: this.#sourceUserMention !== undefined,
       blocks:
         this.#sourceUserMention === undefined
-          ? blocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+          ? renderedBlocks
+          : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
       ...this.#presentation,
     });
     if (typeof posted.ts !== "string") {
@@ -954,9 +979,21 @@ export class SlackThreadProjector {
         ? {}
         : { sourceUserMention: this.#sourceUserMention }),
     });
+    if (approvalTextHint !== undefined) {
+      this.#rememberApprovalText({
+        kind: "git",
+        requestId: event.requestId,
+        channelId: this.#channelId,
+        rootThreadTs: this.#rootThreadTs,
+        messageTs: posted.ts,
+        expiresAt: expiresAt!,
+        routing,
+      });
+    }
   }
 
   async #resolveGitApprovalExternally(requestId: string): Promise<void> {
+    this.#forgetApprovalText(requestId);
     const initial = this.#gitApprovalDetailsStore?.getForTerminalProjection(
       requestId,
       this.#channelId,
@@ -1000,6 +1037,7 @@ export class SlackThreadProjector {
   }
 
   async #expireGitApproval(requestId: string): Promise<void> {
+    this.#forgetApprovalText(requestId);
     const initial = this.#gitApprovalDetailsStore?.getForTerminalProjection(
       requestId,
       this.#channelId,
@@ -1063,6 +1101,17 @@ export class SlackThreadProjector {
     if (typeof posted.ts !== "string") {
       throw new Error("Slack did not return a timestamp for approval UI");
     }
+    const availableDecisions = event.availableDecisions ?? DEFAULT_NATIVE_APPROVAL_DECISIONS;
+    const expiresAt = parseApprovalExpiry(
+      (event as { readonly expiresAt?: string }).expiresAt,
+    );
+    const approvalTextHint = this.#approvalTextStore === undefined || expiresAt === undefined
+      ? undefined
+      : buildApprovalTextHintBlock(
+        event.requestId,
+        nativeApprovalTextMappings(availableDecisions),
+        expiresAt,
+      );
     const blocks = buildApprovalBlocks(event.summary, {
       requestId: event.requestId,
       channelId: this.#channelId,
@@ -1070,18 +1119,34 @@ export class SlackThreadProjector {
       messageTs: posted.ts,
       ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
     }, event.availableDecisions);
+    const renderedBlocks = approvalTextHint === undefined
+      ? blocks
+      : [...blocks, approvalTextHint];
     await this.#client.chat.update({
       channel: this.#channelId,
       ts: posted.ts,
       text: fallback,
       blocks:
         this.#sourceUserMention === undefined
-          ? blocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+          ? renderedBlocks
+          : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
     });
+    if (approvalTextHint !== undefined) {
+      this.#rememberApprovalText({
+        kind: "native",
+        requestId: event.requestId,
+        channelId: this.#channelId,
+        rootThreadTs: this.#rootThreadTs,
+        messageTs: posted.ts,
+        expiresAt: expiresAt!,
+        ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+        availableDecisions,
+      });
+    }
   }
 
   async #resolveChoiceExternally(requestId: string): Promise<void> {
+    this.#forgetApprovalText(requestId);
     const displayed = this.#choiceContinuationStore?.getDisplayed(requestId);
     const auditSessionId = displayed?.sessionId ?? this.#sessionId;
     this.#interactionAudit?.({
@@ -1139,6 +1204,7 @@ export class SlackThreadProjector {
   }
 
   #auditChoiceServerRequestResolved(requestId: string): void {
+    this.#forgetApprovalText(requestId);
     const display =
       this.#choiceContinuationStore?.getDispatched(requestId) ??
       this.#choiceContinuationStore?.getDisplayed(requestId);
@@ -1157,6 +1223,7 @@ export class SlackThreadProjector {
   }
 
   async #markChoiceAnswerDispatched(requestId: string): Promise<void> {
+    this.#forgetApprovalText(requestId);
     const display = this.#choiceContinuationStore?.markDispatched(requestId);
     const auditSessionId = display?.sessionId ?? this.#sessionId;
     this.#interactionAudit?.({
@@ -1189,6 +1256,7 @@ export class SlackThreadProjector {
       | "response_receiver_dropped"
       | "response_deserialize_failed",
   ): Promise<void> {
+    this.#forgetApprovalText(requestId);
     const display =
       this.#choiceContinuationStore?.getDispatched(requestId) ??
       this.#choiceContinuationStore?.getDisplayed(requestId);
@@ -1261,7 +1329,7 @@ export class SlackThreadProjector {
       messageTs: posted.ts,
       ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
     });
-    const blocks = buildChoiceBlocks(event.question, {
+    const routing: ChoiceActionRouting = {
       version: 1,
       requestId: event.requestId,
       questionId: event.question.id,
@@ -1274,15 +1342,32 @@ export class SlackThreadProjector {
       ...(this.#sourceUserId === undefined
         ? {}
         : { responderUserId: this.#sourceUserId }),
-    });
+    };
+    const expiresAt = parseApprovalExpiry(event.expiresAt);
+    const externalApprovalSupported = isSupportedExternalApprovalQuestion(
+      event.question,
+    );
+    const approvalTextHint = this.#approvalTextStore === undefined ||
+        expiresAt === undefined ||
+        !externalApprovalSupported
+      ? undefined
+      : buildApprovalTextHintBlock(
+        event.requestId,
+        { approve: true, reject: true },
+        expiresAt,
+      );
+    const blocks = buildChoiceBlocks(event.question, routing);
+    const renderedBlocks = approvalTextHint === undefined
+      ? blocks
+      : [...blocks, approvalTextHint];
     await this.#client.chat.update({
       channel: this.#channelId,
       ts: posted.ts,
       text: fallback,
       blocks:
         this.#sourceUserMention === undefined
-          ? blocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...blocks],
+          ? renderedBlocks
+          : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
     });
     this.#interactionAudit?.({
       event: "choice.controls_attached",
@@ -1305,6 +1390,19 @@ export class SlackThreadProjector {
           ? {}
           : { responderUserId: this.#sourceUserId }),
         expiresAt: Date.parse(event.expiresAt),
+      });
+    }
+    if (approvalTextHint !== undefined) {
+      this.#rememberApprovalText({
+        kind: "external",
+        requestId: event.requestId,
+        channelId: this.#channelId,
+        rootThreadTs: this.#rootThreadTs,
+        messageTs: posted.ts,
+        expiresAt: expiresAt!,
+        routing,
+        approveOptionId: "option_1",
+        rejectOptionId: "option_2",
       });
     }
   }
@@ -1331,6 +1429,26 @@ export class SlackThreadProjector {
       ...this.#presentation,
     });
     this.#gitApprovalRecoveryPublished = true;
+  }
+
+  #rememberApprovalText(
+    entry: Parameters<ApprovalTextStore["remember"]>[0],
+  ): void {
+    if (this.#approvalTextStore === undefined) return;
+    this.#approvalTextStore.remember(entry);
+    this.#approvalTextRequestIds.add(entry.requestId);
+  }
+
+  #forgetApprovalText(requestId: string): void {
+    this.#approvalTextStore?.forget(requestId);
+    this.#approvalTextRequestIds.delete(requestId);
+  }
+
+  #revokeApprovalTextRequests(): void {
+    for (const requestId of this.#approvalTextRequestIds) {
+      this.#approvalTextStore?.forget(requestId);
+    }
+    this.#approvalTextRequestIds.clear();
   }
 
   #formatActionableMessage(text: string, includeSourceMention: boolean): string {
@@ -1381,6 +1499,59 @@ function sourceMentionBlock(sourceUserMention: string): KnownBlock {
     type: "section",
     text: { type: "mrkdwn", text: sourceUserMention },
   };
+}
+
+function buildApprovalTextHintBlock(
+  requestId: string,
+  supported: { readonly approve?: boolean; readonly reject?: boolean },
+  expiresAt: number,
+): KnownBlock | undefined {
+  if (!Number.isFinite(expiresAt)) return undefined;
+  if (buildApprovalTextCommandHint(requestId) === undefined) return undefined;
+  if (supported.approve !== true && supported.reject !== true) return undefined;
+  const lines: string[] = ["このスレッドでコマンドだけを送信してください。確認済みChatGPT連携の自動付記のみ対応しています。"];
+  if (supported.approve === true) {
+    lines.push(`承認: \`承認 ${requestId}\`（1回だけ許可）`);
+  }
+  if (supported.reject === true) {
+    lines.push(`拒否: \`拒否 ${requestId}\``);
+  }
+  lines.push(`期限: \`${new Date(expiresAt).toISOString()}\``);
+  return {
+    type: "context",
+    elements: [{ type: "mrkdwn", text: lines.join("\n") }],
+  };
+}
+
+function nativeApprovalTextMappings(
+  availableDecisions: readonly AgentApproval["decision"][],
+): { readonly approve?: true; readonly reject?: true } {
+  const mappings: { approve?: true; reject?: true } = {};
+  if (availableDecisions.includes("allow_once")) mappings.approve = true;
+  if (availableDecisions.includes("deny") || availableDecisions.includes("cancel")) {
+    mappings.reject = true;
+  }
+  return mappings;
+}
+
+function parseApprovalExpiry(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isSupportedExternalApprovalQuestion(
+  question: Extract<AgentEvent, { type: "choice.requested" }>["question"],
+): boolean {
+  return (
+    question.purpose === "external_action_confirmation" &&
+    question.allowsOther === false &&
+    question.options.length === 2 &&
+    question.options[0]?.id === "option_1" &&
+    question.options[0].label === "外部操作を承認（Git承認ではありません）" &&
+    question.options[1]?.id === "option_2" &&
+    question.options[1].label === "外部操作を拒否・保留"
+  );
 }
 
 function formatSlackUserMention(sourceUserId: string): string {
