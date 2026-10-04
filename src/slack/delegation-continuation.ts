@@ -12,6 +12,7 @@ import {
 } from "./presentation.js";
 import { SlackThreadProjector } from "./projector.js";
 import { formatAgentTextForSlack } from "./text-format.js";
+import type { ApprovalTextStore } from "./approval-text-store.js";
 import type { WorkspaceGitApprovalDetailsStore } from "./user-input-blocks.js";
 import type { StructuredChoiceContinuationStore } from "./choice-continuation.js";
 
@@ -67,6 +68,7 @@ export async function projectDelegationContinuation(
     }>,
   ) => Promise<void>,
   choiceContinuationStore?: StructuredChoiceContinuationStore,
+  approvalTextStore?: ApprovalTextStore,
 ): Promise<void> {
   const sourceUserId =
     request.sourceSlackUserId ?? defaultNotificationUserId;
@@ -89,6 +91,9 @@ export async function projectDelegationContinuation(
       ...(choiceContinuationStore === undefined
         ? {}
         : { choiceContinuationStore }),
+      ...(approvalTextStore === undefined
+        ? {}
+        : { approvalTextStore }),
     },
   );
   let turnError: unknown;

@@ -4,6 +4,7 @@ import test from "node:test";
 import type { WebClient } from "@slack/web-api";
 
 import { SlackThreadProjector } from "../../src/slack/projector.js";
+import { ApprovalTextStore } from "../../src/slack/approval-text-store.js";
 import { StructuredChoiceContinuationStore } from "../../src/slack/choice-continuation.js";
 import { WorkspaceGitApprovalDetailsStore } from "../../src/slack/user-input-blocks.js";
 import type { InteractionAuditInput } from "../../src/slack/interaction-audit.js";
@@ -1539,6 +1540,155 @@ test("uses a blocked Git result instead of generic success when recovery has no 
   assert.match(String(posts[1]?.text), /Git操作は承認されませんでした/u);
   assert.doesNotMatch(String(posts[1]?.text), /処理が完了しました/u);
   assert.match(JSON.stringify(posts[2]?.blocks), /このGit承認は古いカード/u);
+});
+
+test("registers a supported external text approval only after the card update succeeds", async () => {
+  const { client, updates } = recordingClient();
+  const approvalTextStore = new ApprovalTextStore(() => Date.parse("2026-08-27T00:00:00.000Z"));
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    approvalTextStore,
+  });
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111115";
+
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: "2026-08-27T00:10:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "外部操作の最終確認",
+      prompt: "対象を変更しますか？",
+      options: [
+        {
+          id: "option_1",
+          label: "外部操作を承認（Git承認ではありません）",
+          description: "実行する",
+        },
+        { id: "option_2", label: "外部操作を拒否・保留", description: "保留する" },
+      ],
+      allowsOther: false,
+    },
+  });
+
+  const entry = approvalTextStore.get(requestId);
+  assert.equal(entry?.kind, "external");
+  assert.equal(entry?.messageTs, "102.1");
+  const rendered = JSON.stringify(updates.at(-1)?.blocks);
+  assert.match(rendered, /`承認 codex-choice:11111111-1111-4111-8111-111111111115`/u);
+  assert.match(rendered, /`拒否 codex-choice:11111111-1111-4111-8111-111111111115`/u);
+  assert.match(rendered, /1回だけ許可/u);
+  assert.match(rendered, /2026-08-27T00:10:00\.000Z/u);
+  assert.match(rendered, /このスレッドでコマンドだけを送信してください/u);
+  const hint = (updates.at(-1)?.blocks as Array<Record<string, unknown>>).find(
+    (block) => block.type === "context",
+  );
+  assert.doesNotMatch(JSON.stringify(hint), /<@U123>/u);
+});
+
+test("does not register text approval when rendering the card fails", async () => {
+  const posts: Array<Record<string, unknown>> = [];
+  const client = {
+    chat: {
+      postMessage: async (input: Record<string, unknown>) => {
+        posts.push(input);
+        return { ok: true, ts: "102.1" };
+      },
+      update: async () => {
+        throw new Error("synthetic Slack update failure");
+      },
+    },
+  } as unknown as WebClient;
+  const approvalTextStore = new ApprovalTextStore(() => Date.parse("2026-08-27T00:00:00.000Z"));
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    approvalTextStore,
+  });
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111116";
+
+  await assert.rejects(
+    projector.project({
+      type: "choice.requested",
+      requestId,
+      expiresAt: "2026-08-27T00:10:00.000Z",
+      completedAnswers: [],
+      question: {
+        id: "question_1",
+        purpose: "external_action_confirmation",
+        header: "外部操作",
+        prompt: "実行しますか？",
+        options: [
+          {
+            id: "option_1",
+            label: "外部操作を承認（Git承認ではありません）",
+            description: "実行する",
+          },
+          { id: "option_2", label: "外部操作を拒否・保留", description: "保留する" },
+        ],
+        allowsOther: false,
+      },
+    }),
+    /synthetic Slack update failure/u,
+  );
+  assert.equal(approvalTextStore.get(requestId), undefined);
+  assert.equal(posts.length, 2);
+});
+
+test("offers native text approval only for allow-once or deny/cancel mappings with finite expiry", async () => {
+  const { client, updates } = recordingClient();
+  const approvalTextStore = new ApprovalTextStore(() => Date.parse("2026-08-27T00:00:00.000Z"));
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    approvalTextStore,
+  });
+  const requestId = "approval:11111111-1111-4111-8111-111111111117";
+  await projector.project({
+    type: "approval.requested",
+    requestId,
+    summary: "Allow command?",
+    availableDecisions: ["allow_once", "deny"],
+    expiresAt: "2026-08-27T00:10:00.000Z",
+  } as never);
+  assert.equal(approvalTextStore.get(requestId)?.kind, "native");
+  assert.match(JSON.stringify(updates.at(-1)?.blocks), /1回だけ許可/u);
+
+  const unsupportedId = "approval:11111111-1111-4111-8111-111111111118";
+  await projector.project({
+    type: "approval.requested",
+    requestId: unsupportedId,
+    summary: "Allow session?",
+    availableDecisions: ["allow_session"],
+    expiresAt: "2026-08-27T00:10:00.000Z",
+  } as never);
+  assert.equal(approvalTextStore.get(unsupportedId), undefined);
+  assert.doesNotMatch(JSON.stringify(updates.at(-1)?.blocks), /1回だけ許可|`拒否 /u);
+});
+
+test("does not offer text approval for ordinary choices", async () => {
+  const { client, updates } = recordingClient();
+  const approvalTextStore = new ApprovalTextStore(() => Date.parse("2026-08-27T00:00:00.000Z"));
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    approvalTextStore,
+  });
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111119";
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: "2026-08-27T00:10:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      header: "普通の選択",
+      prompt: "選択しますか？",
+      options: [
+        { id: "option_1", label: "はい", description: "進める" },
+        { id: "option_2", label: "いいえ", description: "止める" },
+      ],
+      allowsOther: false,
+    },
+  });
+  assert.equal(approvalTextStore.get(requestId), undefined);
+  assert.doesNotMatch(JSON.stringify(updates.at(-1)?.blocks), /1回だけ許可|拒否 codex-choice/u);
 });
 
 test("bounds and escapes actionable text before adding the source mention", async () => {

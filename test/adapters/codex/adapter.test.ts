@@ -1922,6 +1922,47 @@ test("ignores stale completion and approval requests from another turn", async (
   await consuming;
 });
 
+test("native approval publishes its exact deadline and rejects that boundary", async (context) => {
+  const startedAt = Date.parse("2026-01-01T00:00:00.000Z");
+  context.mock.timers.enable({ apis: ["Date"], now: startedAt });
+  const server = new FakeAppServer();
+  server.startTurnBehavior = async () => {
+    server.request({
+      id: 1002,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thr_1", turnId: "turn_1", itemId: "bounded-command", command: "true",
+      },
+    });
+    return { id: "turn_1", status: "inProgress" };
+  };
+  const adapter = new CodexAdapter(server, { approvalTimeoutMs: 60_000 });
+  const events = adapter.sendMessage({ id: "thr_1" }, {
+    text: "Only inspect a synthetic approval", source: { type: "human" },
+  })[Symbol.asyncIterator]();
+  try {
+    await events.next();
+    await events.next();
+    const event = (await events.next()).value;
+    assert.equal(event?.type, "approval.requested");
+    if (event?.type !== "approval.requested") throw new Error("Missing approval");
+    assert.equal(event.expiresAt, new Date(startedAt + 60_000).toISOString());
+    context.mock.timers.setTime(Date.parse(event.expiresAt!));
+    await assert.rejects(adapter.approve({ id: "thr_1" }, {
+      requestId: event.requestId, decision: "allow_once",
+    }), /Approval request expired/u);
+    assert.deepEqual(server.approvalResponses, [{ id: 1002, decision: "cancel" }]);
+    await assert.rejects(adapter.approve({ id: "thr_1" }, {
+      requestId: event.requestId, decision: "allow_once",
+    }), /Unknown approval request/u);
+  } finally {
+    server.notify("turn/completed", {
+      threadId: "thr_1", turn: { id: "turn_1", status: "completed" },
+    });
+    await events.return?.();
+  }
+});
+
 test("correlates a pre-response server request to the returned exact turn", async () => {
   const server = new FakeAppServer();
   server.startTurnBehavior = async () => {

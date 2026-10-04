@@ -483,6 +483,8 @@ export type AgentEvent =
   | {
       readonly type: "approval.requested";
       readonly requestId: string;
+      /** Exact backend deadline; omitted by adapters without text approval support. */
+      readonly expiresAt?: string;
       readonly summary: string;
       readonly details?: JsonValue;
       readonly availableDecisions?: readonly AgentApproval["decision"][];

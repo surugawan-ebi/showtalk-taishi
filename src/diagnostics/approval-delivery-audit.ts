@@ -4,6 +4,8 @@ export const APPROVAL_DELIVERY_BUILD_IDENTITY =
   "showtalk-taishi@0.0.1/approval-delivery-v2";
 
 export type InteractionAuditEvent =
+  | "approval_text.binding_validated"
+  | "approval_text.failed"
   | "turn_start.collaboration_mode_attached"
   | "turn_start.dispatched"
   | "turn_start.bound"
@@ -105,6 +107,12 @@ export interface InteractionAuditInput {
   readonly rootThreadTs?: string;
   readonly messageTs?: string;
   readonly sessionId?: string;
+  readonly commandMessageTs?: string;
+  readonly actorUserId?: string;
+  readonly attributionUserId?: string;
+  readonly attributionAppId?: string;
+  /** Observed syntax only, never proof of the publisher or approver. */
+  readonly approvalTextFormat?: "plain" | "chatgpt_slack_footer_v1";
   /** Fixed classifier only; never include exception text, prompts, or answers. */
   readonly outcome?: InteractionAuditOutcome;
 }
@@ -159,6 +167,23 @@ export function createInteractionAudit(
       ...(input.sessionId === undefined
         ? {}
         : { sessionRef: correlationRef("session", input.sessionId) }),
+      ...(input.commandMessageTs === undefined
+        ? {}
+        : { commandMessageRef: correlationRef("message", input.commandMessageTs) }),
+      ...(input.actorUserId === undefined
+        ? {}
+        : { actorRef: correlationRef("user", input.actorUserId) }),
+      ...(input.attributionUserId === undefined
+        ? {}
+        : { attributionUserRef: correlationRef("user", input.attributionUserId) }),
+      ...(input.attributionAppId === undefined
+        ? {}
+        : { attributionAppRef: correlationRef("app", input.attributionAppId) }),
+      ...(input.approvalTextFormat === undefined
+        ? {}
+        : { approvalTextFormat: input.approvalTextFormat === "plain" ||
+            input.approvalTextFormat === "chatgpt_slack_footer_v1"
+            ? input.approvalTextFormat : "invalid_format_classifier" }),
       ...(input.outcome === undefined
         ? {}
         : { outcome: fixedClassifier(input.outcome) }),
