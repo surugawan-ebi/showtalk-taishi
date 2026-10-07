@@ -37,6 +37,34 @@ Slackチャンネルごとに永続するAIの人格を **Koe（声）** と呼�
 > 現在は実行可能なプレリリース版です。公開ソースは`0.0.1` previewで、
 > 安定版v0.1やnpm公開版ではありません。v0.1までに設定形式が変わる可能性があります。
 
+## 最近の更新
+
+Slackでの承認操作、Koe間の相談時の通知、承認結果の配送確認を改善しています。
+以下は`main`に反映済みの主な更新です。
+
+- **2026-10-04：テキストによる承認・拒否**
+  対応する承認カードに表示された`承認 <リクエストID>`／`拒否 <リクエストID>`を、
+  同じSlackスレッドに返信できます。実際の投稿者、対象カード、期限、未処理状態を
+  検証し、ボタンと共通の決定処理へ渡します。
+  [PR #40](https://github.com/surugawan-ebi/showtalk-taishi/pull/40)
+- **2026-10-02：Koe間の相談時の通知を調整**
+  訪問先Koeの通常の進捗・完了メッセージではユーザーへのメンションを抑え、
+  人間の対応が必要な選択・承認では引き続き通知します。
+  [PR #39](https://github.com/surugawan-ebi/showtalk-taishi/pull/39)
+- **2026-09-30〜10-01：承認配送の確認と診断を改善**
+  ブロッキング入力への回答は、App Serverへの配送状態を確認してからSlack上の
+  結果表示を更新します。配送を確認できない場合の処理と、機密情報や回答本文を
+  記録しない診断を追加しました。
+  [PR #32](https://github.com/surugawan-ebi/showtalk-taishi/pull/32)・
+  [PR #34](https://github.com/surugawan-ebi/showtalk-taishi/pull/34)・
+  [PR #35](https://github.com/surugawan-ebi/showtalk-taishi/pull/35)・
+  [PR #38](https://github.com/surugawan-ebi/showtalk-taishi/pull/38)
+
+ソースの更新だけでは、稼働中のGatewayに変更は反映されません。
+利用中の環境では、別途ビルド・再起動と
+[動作確認](docs/gateway-restart-verification.md)が必要です。
+最新の変更は[mainの履歴](https://github.com/surugawan-ebi/showtalk-taishi/commits/main/)で確認できます。
+
 ## なにができるのか
 
 ```text
