@@ -110,6 +110,7 @@ const baseSyncPlan = {
   relativePath: "existing-pr/local-mcp-24",
   pushRef: "refs/heads/codex/base-sync",
   updateMode: "push_base_merge",
+  expectedBaseSyncReceiptId: `sync_${"6".repeat(64)}`,
   expectedBaseSha: "b".repeat(40),
   expectedMergeCommitSha: "d".repeat(40),
   expectedCommitShas: ["b".repeat(40), "d".repeat(40)],
@@ -202,6 +203,8 @@ test("renders a base-sync push with fixed base, merge, commit set, and total dif
   const rendered = JSON.stringify(blocks);
   assert.match(rendered, /base同期済みmerge commitをpush/u);
   assert.match(rendered, /旧remote HEAD/u);
+  assert.match(rendered, /同期receipt/u);
+  assert.match(rendered, new RegExp(`sync_${"6".repeat(64)}`, "u"));
   assert.match(rendered, /取得base SHA/u);
   assert.match(rendered, /二親merge SHA/u);
   assert.match(rendered, /全commit集合/u);
@@ -224,7 +227,7 @@ test("renders a base-sync push with fixed base, merge, commit set, and total dif
   const encoded = "value" in actions.elements[0]! ? actions.elements[0]!.value : undefined;
   assert.doesNotMatch(
     String(encoded),
-    /local-mcp|push_base_merge|expectedBaseSha|expectedCommitShas|temporary_workspace_id|expected_snapshot_id|push_target|push_ref|base_branch|environment/u,
+    /local-mcp|push_base_merge|expectedBaseSyncReceiptId|expectedBaseSha|expectedCommitShas|temporary_workspace_id|expected_snapshot_id|push_target|push_ref|base_branch|environment/u,
   );
   assert.doesNotMatch(String(encoded), /b{40}|d{40}/u);
 });

@@ -633,6 +633,7 @@ function notifyExistingBaseSyncPlan(server: FakeAppServer): void {
     paths: ["src/a.ts", "src/b.ts"],
     commit_message: "Merge main into codex/base-sync for Pull Request #24",
     update_mode: "push_base_merge",
+    expected_base_sync_receipt_id: `sync_${"6".repeat(64)}`,
     expected_base_sha: "b".repeat(40),
     expected_merge_commit_sha: "d".repeat(40),
   };
@@ -655,6 +656,7 @@ function notifyExistingBaseSyncPlan(server: FakeAppServer): void {
     commit_message: argumentsValue.commit_message,
     push_ref: "refs/heads/codex/base-sync",
     update_mode: "push_base_merge",
+    expected_base_sync_receipt_id: `sync_${"6".repeat(64)}`,
     expected_base_sha: "b".repeat(40),
     expected_merge_commit_sha: "d".repeat(40),
     expected_commit_shas: ["b".repeat(40), "d".repeat(40)],

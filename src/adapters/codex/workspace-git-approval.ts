@@ -31,6 +31,7 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const GIT_SHA = /^[0-9a-f]{40}$/u;
 const SNAPSHOT = /^[0-9a-f]{64}$/u;
 const TEMPORARY_WORKSPACE_ID = /^tmp_[0-9a-f]{64}$/u;
+const BASE_SYNC_RECEIPT_ID = /^sync_[0-9a-f]{64}$/u;
 const MAX_PATHS = 100;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_TOTAL_PATH_LENGTH = 30_000;
@@ -403,6 +404,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       "paths",
       "commit_message",
       "update_mode",
+      "expected_base_sync_receipt_id",
       "expected_base_sha",
       "expected_merge_commit_sha",
       "environment",
@@ -445,6 +447,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
     ];
     const baseSyncScopeKeys = [
       "update_mode",
+      "expected_base_sync_receipt_id",
       "expected_base_sha",
       "expected_merge_commit_sha",
       "expected_commit_shas",
@@ -457,6 +460,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
     if (
       updateMode === "commit_paths" &&
       (Object.hasOwn(argumentsRecord, "expected_base_sha") ||
+        Object.hasOwn(argumentsRecord, "expected_base_sync_receipt_id") ||
         Object.hasOwn(argumentsRecord, "expected_merge_commit_sha"))
     ) {
       throw new Error("workspace-git base synchronization input is invalid");
@@ -544,10 +548,16 @@ export function normalizeWorkspaceGitPrepareCompletion(
     ) {
       throw new Error("workspace-git existing Pull Request heads do not match input");
     }
+    let expectedBaseSyncReceiptId: string | undefined;
     let expectedBaseSha: string | undefined;
     let expectedMergeCommitSha: string | undefined;
     let expectedCommitShas: readonly string[] | undefined;
     if (updateMode === "push_base_merge") {
+      expectedBaseSyncReceiptId = boundedString(
+        scope.expected_base_sync_receipt_id,
+        69,
+        "base synchronization receipt ID",
+      );
       expectedBaseSha = boundedString(scope.expected_base_sha, 40, "expected base SHA");
       expectedMergeCommitSha = boundedString(
         scope.expected_merge_commit_sha,
@@ -560,6 +570,12 @@ export function normalizeWorkspaceGitPrepareCompletion(
       );
       if (
         scope.update_mode !== "push_base_merge" ||
+        !BASE_SYNC_RECEIPT_ID.test(expectedBaseSyncReceiptId) ||
+        expectedBaseSyncReceiptId !== boundedString(
+          argumentsRecord.expected_base_sync_receipt_id,
+          69,
+          "base synchronization receipt input",
+        ) ||
         !GIT_SHA.test(expectedBaseSha) ||
         expectedBaseSha !== boundedString(
           argumentsRecord.expected_base_sha,
@@ -649,6 +665,9 @@ export function normalizeWorkspaceGitPrepareCompletion(
         relativePath,
         pushRef,
         updateMode,
+        ...(expectedBaseSyncReceiptId === undefined
+          ? {}
+          : { expectedBaseSyncReceiptId }),
         ...(expectedBaseSha === undefined ? {} : { expectedBaseSha }),
         ...(expectedMergeCommitSha === undefined
           ? {}
@@ -1263,6 +1282,7 @@ function approvalScopeForPlan(
         ...(plan.updateMode === "push_base_merge"
           ? {
               update_mode: plan.updateMode,
+              expected_base_sync_receipt_id: plan.expectedBaseSyncReceiptId,
               expected_base_sha: plan.expectedBaseSha,
               expected_merge_commit_sha: plan.expectedMergeCommitSha,
               expected_commit_shas: [...plan.expectedCommitShas!],

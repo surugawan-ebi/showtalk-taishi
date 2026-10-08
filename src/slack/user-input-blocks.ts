@@ -464,6 +464,7 @@ function planFields(
       field("Update mode", "base同期済みmerge commitをpush"),
       field("Branch", plan.branch),
       field("旧remote HEAD", plan.expectedRemoteHead),
+      field("同期receipt", plan.expectedBaseSyncReceiptId!),
       field("取得base SHA", plan.expectedBaseSha!),
       field("二親merge SHA", plan.expectedMergeCommitSha!),
       field("全commit集合", `${plan.expectedCommitShas!.length}件`),
@@ -698,6 +699,7 @@ function exactPlanTexts(
     plan.updateMode === "push_base_merge"
       ? [
           ["全commit SHAs", JSON.stringify(plan.expectedCommitShas)] as const,
+          ["同期receipt", plan.expectedBaseSyncReceiptId!] as const,
           ["隔離clone・snapshot", JSON.stringify({
             temporary_workspace_id: plan.temporaryWorkspaceId,
             expected_snapshot_id: plan.expectedSnapshotId,
