@@ -128,6 +128,7 @@ function existingBaseSyncPlan(
     relativePath: "existing-pr/local-mcp-24",
     pushRef: "refs/heads/codex/base-sync",
     updateMode: "push_base_merge",
+    expectedBaseSyncReceiptId: `sync_${"6".repeat(64)}`,
     expectedBaseSha: "b".repeat(40),
     expectedMergeCommitSha: "d".repeat(40),
     expectedCommitShas: ["b".repeat(40), "d".repeat(40)],
@@ -291,6 +292,9 @@ test("treats a changed base-sync commit set or fetched base as ambiguous", () =>
     existingBaseSyncPlan({ expiresAt: "2026-10-08T12:01:00.000Z" }),
     existingBaseSyncPlan({ cloneIdentity: "7".repeat(64) }),
     existingBaseSyncPlan({ pullRequestNumber: 25 }),
+    existingBaseSyncPlan({
+      expectedBaseSyncReceiptId: `sync_${"7".repeat(64)}`,
+    }),
     existingBaseSyncPlan({ expectedBaseSha: "9".repeat(40) }),
     existingBaseSyncPlan({
       expectedCommitShas: ["b".repeat(40), "8".repeat(40)],

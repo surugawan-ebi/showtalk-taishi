@@ -566,6 +566,7 @@ function sameExistingPullRequestUpdatePlan(
     left.relativePath === right.relativePath &&
     left.pushRef === right.pushRef &&
     left.updateMode === right.updateMode &&
+    left.expectedBaseSyncReceiptId === right.expectedBaseSyncReceiptId &&
     left.expectedBaseSha === right.expectedBaseSha &&
     left.expectedMergeCommitSha === right.expectedMergeCommitSha &&
     isDeepStrictEqual(left.expectedCommitShas, right.expectedCommitShas) &&

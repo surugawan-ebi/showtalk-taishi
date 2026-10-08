@@ -341,10 +341,12 @@ function existingPullRequestUpdateNotification() {
 
 function existingPullRequestBaseSyncNotification() {
   const notification = existingPullRequestUpdateNotification();
+  const receiptId = `sync_${"6".repeat(64)}`;
   const mergeSha = "c".repeat(40);
   const baseSha = "7".repeat(40);
   const argumentsRecord = notification.item.arguments as Record<string, unknown>;
   argumentsRecord.update_mode = "push_base_merge";
+  argumentsRecord.expected_base_sync_receipt_id = receiptId;
   argumentsRecord.expected_base_sha = baseSha;
   argumentsRecord.expected_merge_commit_sha = mergeSha;
   const scope = notification.item.result.structuredContent.scope as Record<
@@ -352,12 +354,14 @@ function existingPullRequestBaseSyncNotification() {
     unknown
   >;
   scope.update_mode = "push_base_merge";
+  scope.expected_base_sync_receipt_id = receiptId;
   scope.expected_base_sha = baseSha;
   scope.expected_merge_commit_sha = mergeSha;
   scope.expected_commit_shas = [baseSha, mergeSha];
   const approvalScope = notification.item.result.structuredContent
     .approval_scope as Record<string, unknown>;
   approvalScope.update_mode = "push_base_merge";
+  approvalScope.expected_base_sync_receipt_id = receiptId;
   approvalScope.expected_base_sha = baseSha;
   approvalScope.expected_merge_commit_sha = mergeSha;
   approvalScope.expected_commit_shas = [baseSha, mergeSha];
@@ -618,6 +622,7 @@ test("captures and fixes every base-sync commit and total-diff boundary", () => 
   assert.equal(capture?.plan.operation, "existing_pull_request_update");
   if (capture?.plan.operation !== "existing_pull_request_update") return;
   assert.equal(capture.plan.updateMode, "push_base_merge");
+  assert.equal(capture.plan.expectedBaseSyncReceiptId, `sync_${"6".repeat(64)}`);
   assert.equal(capture.plan.expectedBaseSha, "7".repeat(40));
   assert.equal(capture.plan.expectedMergeCommitSha, "c".repeat(40));
   assert.deepEqual(capture.plan.expectedCommitShas, [
@@ -648,6 +653,7 @@ test("captures and fixes every base-sync commit and total-diff boundary", () => 
   const substitutions: Array<[string, (value: ReturnType<typeof existingPullRequestBaseSyncNotification>) => void]> = [
     ["remote parent", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_remote_head_sha", "8".repeat(40)); }],
     ["base parent", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_base_sha", "8".repeat(40)); }],
+    ["sync receipt", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_base_sync_receipt_id", `sync_${"8".repeat(64)}`); }],
     ["merge head", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_local_head_sha", "8".repeat(40)); }],
     ["complete diff", (value) => { Reflect.set(value.item.result.structuredContent.scope, "paths", ["src/other.ts"]); }],
     ["temporary clone", (value) => { Reflect.set(value.item.result.structuredContent.scope, "temporary_workspace_id", `tmp_${"8".repeat(64)}`); }],
@@ -659,6 +665,28 @@ test("captures and fixes every base-sync commit and total-diff boundary", () => 
     const changed = existingPullRequestBaseSyncNotification();
     substitute(changed);
     assert.throws(() => captureWorkspaceGitPlan(changed), Error, name);
+  }
+
+  for (const location of ["input", "scope", "approval scope"] as const) {
+    const missingReceipt = existingPullRequestBaseSyncNotification();
+    if (location === "input") {
+      Reflect.deleteProperty(
+        missingReceipt.item.arguments,
+        "expected_base_sync_receipt_id",
+      );
+    } else {
+      Reflect.deleteProperty(
+        missingReceipt.item.result.structuredContent[
+          location === "scope" ? "scope" : "approval_scope"
+        ],
+        "expected_base_sync_receipt_id",
+      );
+    }
+    assert.throws(
+      () => captureWorkspaceGitPlan(missingReceipt),
+      Error,
+      `missing receipt in ${location}`,
+    );
   }
 
   const substitutedRemoteParent = existingPullRequestBaseSyncNotification();
@@ -689,11 +717,18 @@ test("captures and fixes every base-sync commit and total-diff boundary", () => 
     /base synchronization scope does not match input/u,
   );
 
-  const unknownInput = existingPullRequestBaseSyncNotification();
-  Reflect.set(unknownInput.item.arguments, "expected_base_sync_receipt_id", `sync_${"8".repeat(64)}`);
+  const malformedReceipt = existingPullRequestBaseSyncNotification();
+  Reflect.set(malformedReceipt.item.arguments, "expected_base_sync_receipt_id", `sync_${"z".repeat(64)}`);
+  for (const scopeKey of ["scope", "approval_scope"] as const) {
+    Reflect.set(
+      malformedReceipt.item.result.structuredContent[scopeKey],
+      "expected_base_sync_receipt_id",
+      `sync_${"z".repeat(64)}`,
+    );
+  }
   assert.throws(
-    () => captureWorkspaceGitPlan(unknownInput),
-    /input is invalid/u,
+    () => captureWorkspaceGitPlan(malformedReceipt),
+    /base synchronization scope does not match input/u,
   );
 });
 
