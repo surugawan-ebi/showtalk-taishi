@@ -565,6 +565,10 @@ function sameExistingPullRequestUpdatePlan(
     left.configuredRootIdentity === right.configuredRootIdentity &&
     left.relativePath === right.relativePath &&
     left.pushRef === right.pushRef &&
+    left.updateMode === right.updateMode &&
+    left.expectedBaseSha === right.expectedBaseSha &&
+    left.expectedMergeCommitSha === right.expectedMergeCommitSha &&
+    isDeepStrictEqual(left.expectedCommitShas, right.expectedCommitShas) &&
     left.expiresAt === right.expiresAt;
 }
 

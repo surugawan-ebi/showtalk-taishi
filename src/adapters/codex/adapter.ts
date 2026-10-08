@@ -4267,7 +4267,9 @@ function workspaceGitAutomationPlan(
   if (plan.branch === "main") return undefined;
   let capabilities: WorkspaceGitPreparedPlan["capabilities"];
   if (plan.operation === "existing_pull_request_update") {
-    capabilities = ["commit", "push"];
+    capabilities = plan.updateMode === "push_base_merge"
+      ? ["push"]
+      : ["commit", "push"];
   } else if (plan.operation === "git_publication") {
     switch (plan.mode) {
       case "commit_only":

@@ -244,6 +244,10 @@ interface WorkspaceGitExistingPullRequestUpdateApprovalPlan
   readonly configuredRootIdentity: string;
   readonly relativePath: string;
   readonly pushRef: string;
+  readonly updateMode: "commit_paths" | "push_base_merge";
+  readonly expectedBaseSha?: string;
+  readonly expectedMergeCommitSha?: string;
+  readonly expectedCommitShas?: readonly string[];
 }
 
 export type WorkspaceGitDependabotSecurityUpdateState =

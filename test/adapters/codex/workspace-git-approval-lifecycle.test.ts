@@ -97,6 +97,45 @@ function mainUpdatePlan(): WorkspaceGitApprovalPlan {
   };
 }
 
+function existingBaseSyncPlan(
+  overrides: Partial<Extract<WorkspaceGitApprovalPlan, {
+    operation: "existing_pull_request_update";
+  }>> = {},
+): WorkspaceGitApprovalPlan {
+  return {
+    operationId: "66666666-6666-4666-8666-666666666666",
+    planHash: "6".repeat(64),
+    approvalTarget: "existing_pr_update_24",
+    operation: "existing_pull_request_update",
+    repoId: "local-mcp",
+    environment: "development",
+    mode: "existing_pull_request_update",
+    branch: "codex/base-sync",
+    paths: ["src/a.ts", "src/b.ts"],
+    expectedHead: "d".repeat(40),
+    expectedSnapshotId: "e".repeat(64),
+    temporaryWorkspaceId: `tmp_${"1".repeat(64)}`,
+    commitMessage: "Merge main into codex/base-sync for Pull Request #24",
+    pushTarget: "origin/codex/base-sync",
+    pullRequestNumber: 24,
+    pullRequestUrl: "https://github.com/example/local-mcp/pull/24",
+    baseBranch: "main",
+    expectedPullRequestHead: "a".repeat(40),
+    expectedRemoteHead: "a".repeat(40),
+    expectedTree: "f".repeat(40),
+    cloneIdentity: "2".repeat(64),
+    configuredRootIdentity: "3".repeat(64),
+    relativePath: "existing-pr/local-mcp-24",
+    pushRef: "refs/heads/codex/base-sync",
+    updateMode: "push_base_merge",
+    expectedBaseSha: "b".repeat(40),
+    expectedMergeCommitSha: "d".repeat(40),
+    expectedCommitShas: ["b".repeat(40), "d".repeat(40)],
+    expiresAt: "2026-10-08T12:00:00.000Z",
+    ...overrides,
+  } as WorkspaceGitApprovalPlan;
+}
+
 function mainUpdateExecutionItem(outcome: "updated" | "skipped") {
   const exact = mainUpdatePlan();
   return {
@@ -243,6 +282,27 @@ test("treats changed exact-plan fields as ambiguous even when public IDs match",
   assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
     kind: "ambiguous",
   });
+});
+
+test("treats a changed base-sync commit set or fetched base as ambiguous", () => {
+  for (const changed of [
+    existingBaseSyncPlan({ operationId: "77777777-7777-4777-8777-777777777777" }),
+    existingBaseSyncPlan({ planHash: "7".repeat(64) }),
+    existingBaseSyncPlan({ expiresAt: "2026-10-08T12:01:00.000Z" }),
+    existingBaseSyncPlan({ cloneIdentity: "7".repeat(64) }),
+    existingBaseSyncPlan({ pullRequestNumber: 25 }),
+    existingBaseSyncPlan({ expectedBaseSha: "9".repeat(40) }),
+    existingBaseSyncPlan({
+      expectedCommitShas: ["b".repeat(40), "8".repeat(40)],
+    }),
+  ]) {
+    const lifecycle = new WorkspaceGitApprovalLifecycle();
+    lifecycle.rememberPlan("session", "turn", existingBaseSyncPlan());
+    lifecycle.rememberPlan("session", "turn", changed);
+    assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), {
+      kind: "ambiguous",
+    });
+  }
 });
 
 test("does not overwrite an active approved execution", () => {

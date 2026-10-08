@@ -402,6 +402,9 @@ export function normalizeWorkspaceGitPrepareCompletion(
       "expected_snapshot_id",
       "paths",
       "commit_message",
+      "update_mode",
+      "expected_base_sha",
+      "expected_merge_commit_sha",
       "environment",
       "ttl_minutes",
     ])) {
@@ -415,7 +418,13 @@ export function normalizeWorkspaceGitPrepareCompletion(
     ) {
       throw new Error("workspace-git existing Pull Request update TTL is invalid");
     }
-    if (!hasExactKeys(scope, [
+    const updateMode = argumentsRecord.update_mode === undefined
+      ? "commit_paths"
+      : boundedString(argumentsRecord.update_mode, 32, "update mode");
+    if (updateMode !== "commit_paths" && updateMode !== "push_base_merge") {
+      throw new Error("workspace-git existing Pull Request update mode is invalid");
+    }
+    const commonScopeKeys = [
       "repo_id",
       "temporary_workspace_id",
       "pull_request_number",
@@ -433,8 +442,24 @@ export function normalizeWorkspaceGitPrepareCompletion(
       "paths",
       "commit_message",
       "push_ref",
-    ])) {
+    ];
+    const baseSyncScopeKeys = [
+      "update_mode",
+      "expected_base_sha",
+      "expected_merge_commit_sha",
+      "expected_commit_shas",
+    ];
+    if (!hasExactKeys(scope, updateMode === "push_base_merge"
+      ? [...commonScopeKeys, ...baseSyncScopeKeys]
+      : commonScopeKeys)) {
       throw new Error("workspace-git existing Pull Request update scope is invalid");
+    }
+    if (
+      updateMode === "commit_paths" &&
+      (Object.hasOwn(argumentsRecord, "expected_base_sha") ||
+        Object.hasOwn(argumentsRecord, "expected_merge_commit_sha"))
+    ) {
+      throw new Error("workspace-git base synchronization input is invalid");
     }
     const temporaryWorkspaceId = boundedString(
       scope.temporary_workspace_id,
@@ -510,6 +535,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
         40,
         "expected HEAD input",
       ) ||
+      expectedRemoteHead !== expectedPullRequestHead ||
       expectedSnapshotId !== boundedString(
         argumentsRecord.expected_snapshot_id,
         64,
@@ -517,6 +543,39 @@ export function normalizeWorkspaceGitPrepareCompletion(
       )
     ) {
       throw new Error("workspace-git existing Pull Request heads do not match input");
+    }
+    let expectedBaseSha: string | undefined;
+    let expectedMergeCommitSha: string | undefined;
+    let expectedCommitShas: readonly string[] | undefined;
+    if (updateMode === "push_base_merge") {
+      expectedBaseSha = boundedString(scope.expected_base_sha, 40, "expected base SHA");
+      expectedMergeCommitSha = boundedString(
+        scope.expected_merge_commit_sha,
+        40,
+        "expected merge commit SHA",
+      );
+      expectedCommitShas = validatedGitShas(
+        scope.expected_commit_shas,
+        "expected commit SHAs",
+      );
+      if (
+        scope.update_mode !== "push_base_merge" ||
+        !GIT_SHA.test(expectedBaseSha) ||
+        expectedBaseSha !== boundedString(
+          argumentsRecord.expected_base_sha,
+          40,
+          "expected base SHA input",
+        ) ||
+        expectedMergeCommitSha !== boundedString(
+          argumentsRecord.expected_merge_commit_sha,
+          40,
+          "expected merge commit SHA input",
+        ) ||
+        expectedMergeCommitSha !== expectedHead ||
+        expectedCommitShas.at(-1) !== expectedMergeCommitSha
+      ) {
+        throw new Error("workspace-git base synchronization scope does not match input");
+      }
     }
     const paths = validatedPaths(scope.paths);
     const inputPaths = validatedPaths(argumentsRecord.paths);
@@ -589,6 +648,12 @@ export function normalizeWorkspaceGitPrepareCompletion(
         configuredRootIdentity,
         relativePath,
         pushRef,
+        updateMode,
+        ...(expectedBaseSha === undefined ? {} : { expectedBaseSha }),
+        ...(expectedMergeCommitSha === undefined
+          ? {}
+          : { expectedMergeCommitSha }),
+        ...(expectedCommitShas === undefined ? {} : { expectedCommitShas }),
         expiresAt,
       }, approvalScope),
     };
@@ -1079,6 +1144,17 @@ function validatedPaths(value: unknown): readonly string[] {
   return Object.freeze(paths);
 }
 
+function validatedGitShas(value: unknown, label: string): readonly string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 1_000) {
+    throw new Error(`workspace-git ${label} are invalid`);
+  }
+  const shas = value.map((entry) => boundedString(entry, 40, label));
+  if (shas.some((sha) => !GIT_SHA.test(sha)) || new Set(shas).size !== shas.length) {
+    throw new Error(`workspace-git ${label} are invalid`);
+  }
+  return Object.freeze(shas);
+}
+
 type UnboundWorkspaceGitApprovalPlan = WorkspaceGitApprovalPlan extends infer Plan
   ? Plan extends WorkspaceGitApprovalPlan
     ? Omit<Plan, "approvalScope">
@@ -1184,6 +1260,14 @@ function approvalScopeForPlan(
         paths: [...plan.paths],
         commit_message: plan.commitMessage,
         push_ref: plan.pushRef,
+        ...(plan.updateMode === "push_base_merge"
+          ? {
+              update_mode: plan.updateMode,
+              expected_base_sha: plan.expectedBaseSha,
+              expected_merge_commit_sha: plan.expectedMergeCommitSha,
+              expected_commit_shas: [...plan.expectedCommitShas!],
+            }
+          : {}),
       };
     case "github_repository_settings":
       return {

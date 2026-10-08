@@ -84,6 +84,38 @@ const mainUpdatePlan = {
   expiresAt: "2026-09-09T01:00:00+09:00",
 } satisfies WorkspaceGitApprovalPlan;
 
+const baseSyncPlan = {
+  operationId: "66666666-6666-4666-8666-666666666666",
+  planHash: "6".repeat(64),
+  approvalTarget: "existing_pr_update_24",
+  operation: "existing_pull_request_update",
+  repoId: "local-mcp",
+  environment: "development",
+  mode: "existing_pull_request_update",
+  branch: "codex/base-sync",
+  paths: ["src/a.ts", "src/b.ts"],
+  expectedHead: "d".repeat(40),
+  expectedSnapshotId: "e".repeat(64),
+  temporaryWorkspaceId: `tmp_${"1".repeat(64)}`,
+  commitMessage: "Merge main into codex/base-sync for Pull Request #24",
+  pushTarget: "origin/codex/base-sync",
+  pullRequestNumber: 24,
+  pullRequestUrl: "https://github.com/example/local-mcp/pull/24",
+  baseBranch: "main",
+  expectedPullRequestHead: "a".repeat(40),
+  expectedRemoteHead: "a".repeat(40),
+  expectedTree: "f".repeat(40),
+  cloneIdentity: "2".repeat(64),
+  configuredRootIdentity: "3".repeat(64),
+  relativePath: "existing-pr/local-mcp-24",
+  pushRef: "refs/heads/codex/base-sync",
+  updateMode: "push_base_merge",
+  expectedBaseSha: "b".repeat(40),
+  expectedMergeCommitSha: "d".repeat(40),
+  expectedCommitShas: ["b".repeat(40), "d".repeat(40)],
+  expiresAt: "2026-10-08T12:00:00.000Z",
+} satisfies WorkspaceGitApprovalPlan;
+
 const historyResetPlan = {
   operationId: "55555555-5555-4555-8555-555555555555",
   planHash: "f".repeat(64),
@@ -159,6 +191,42 @@ test("renders an exact Git plan while keeping it out of the action value", () =>
     rootThreadTs: routing.rootThreadTs,
   });
   assert.doesNotMatch(String(encoded), /showtalk-taishi|planHash|operationId/u);
+});
+
+test("renders a base-sync push with fixed base, merge, commit set, and total diff", () => {
+  const blocks = buildWorkspaceGitApprovalBlocks(
+    "base同期済みmergeを確認してください",
+    baseSyncPlan,
+    routing,
+  );
+  const rendered = JSON.stringify(blocks);
+  assert.match(rendered, /base同期済みmerge commitをpush/u);
+  assert.match(rendered, /旧remote HEAD/u);
+  assert.match(rendered, /取得base SHA/u);
+  assert.match(rendered, /二親merge SHA/u);
+  assert.match(rendered, /全commit集合/u);
+  assert.match(rendered, /全commit SHAs/u);
+  assert.match(rendered, new RegExp("b{40}", "u"));
+  assert.match(rendered, new RegExp("d{40}", "u"));
+  assert.match(rendered, /総diff/u);
+  assert.match(rendered, /2 paths/u);
+  assert.match(rendered, /隔離clone・snapshot/u);
+  assert.match(rendered, new RegExp(`tmp_${"1".repeat(64)}`, "u"));
+  assert.match(rendered, new RegExp("e{64}", "u"));
+  assert.match(rendered, /Push・base target/u);
+  assert.match(rendered, /origin\/codex\/base-sync/u);
+  assert.match(rendered, /refs\/heads\/codex\/base-sync/u);
+  assert.match(rendered, /main/u);
+  assert.match(rendered, /development/u);
+  const actions = blocks.at(-1);
+  assert.equal(actions?.type, "actions");
+  if (actions?.type !== "actions") return;
+  const encoded = "value" in actions.elements[0]! ? actions.elements[0]!.value : undefined;
+  assert.doesNotMatch(
+    String(encoded),
+    /local-mcp|push_base_merge|expectedBaseSha|expectedCommitShas|temporary_workspace_id|expected_snapshot_id|push_target|push_ref|base_branch|environment/u,
+  );
+  assert.doesNotMatch(String(encoded), /b{40}|d{40}/u);
 });
 
 test("renders exact GitHub repository settings without inventing file or branch fields", () => {

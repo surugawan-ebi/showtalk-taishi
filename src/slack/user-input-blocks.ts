@@ -453,6 +453,23 @@ function planFields(
   plan: WorkspaceGitApprovalPlan,
 ): Array<{ type: "mrkdwn"; text: string }> {
   const operation = operationLabel(plan.operation);
+  if (
+    plan.operation === "existing_pull_request_update" &&
+    plan.updateMode === "push_base_merge"
+  ) {
+    return [
+      field("操作", operation),
+      field("Repository", plan.repoId),
+      field("Pull Request", `#${plan.pullRequestNumber}`),
+      field("Update mode", "base同期済みmerge commitをpush"),
+      field("Branch", plan.branch),
+      field("旧remote HEAD", plan.expectedRemoteHead),
+      field("取得base SHA", plan.expectedBaseSha!),
+      field("二親merge SHA", plan.expectedMergeCommitSha!),
+      field("全commit集合", `${plan.expectedCommitShas!.length}件`),
+      field("総diff", `${plan.paths.length} paths`),
+    ];
+  }
   if (plan.operation === "github_repository_settings") {
     return [
       field("操作", operation),
@@ -677,6 +694,22 @@ function exactPlanTexts(
     ];
   }
   return [
+    ...(plan.operation === "existing_pull_request_update" &&
+    plan.updateMode === "push_base_merge"
+      ? [
+          ["全commit SHAs", JSON.stringify(plan.expectedCommitShas)] as const,
+          ["隔離clone・snapshot", JSON.stringify({
+            temporary_workspace_id: plan.temporaryWorkspaceId,
+            expected_snapshot_id: plan.expectedSnapshotId,
+          })] as const,
+          ["Push・base target", JSON.stringify({
+            push_target: plan.pushTarget,
+            push_ref: plan.pushRef,
+            base_branch: plan.baseBranch,
+            environment: plan.environment,
+          })] as const,
+        ]
+      : []),
     ...(plan.commitMessage === undefined
       ? []
       : [["Commit message", plan.commitMessage] as const]),

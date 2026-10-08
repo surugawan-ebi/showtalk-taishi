@@ -623,6 +623,81 @@ function notifyPublicationPlan(
   });
 }
 
+function notifyExistingBaseSyncPlan(server: FakeAppServer): void {
+  const argumentsValue = {
+    repo_id: "local-mcp",
+    pull_request_number: 24,
+    temporary_workspace_id: `tmp_${"1".repeat(64)}`,
+    expected_head_sha: "a".repeat(40),
+    expected_snapshot_id: "e".repeat(64),
+    paths: ["src/a.ts", "src/b.ts"],
+    commit_message: "Merge main into codex/base-sync for Pull Request #24",
+    update_mode: "push_base_merge",
+    expected_base_sha: "b".repeat(40),
+    expected_merge_commit_sha: "d".repeat(40),
+  };
+  const scope = {
+    repo_id: "local-mcp",
+    temporary_workspace_id: argumentsValue.temporary_workspace_id,
+    pull_request_number: 24,
+    pull_request_url: "https://github.com/example/local-mcp/pull/24",
+    head_ref_name: "codex/base-sync",
+    base_ref_name: "main",
+    expected_pull_request_head_sha: "a".repeat(40),
+    expected_remote_head_sha: "a".repeat(40),
+    expected_local_head_sha: "d".repeat(40),
+    expected_snapshot_id: "e".repeat(64),
+    expected_tree: "f".repeat(40),
+    clone_identity: "2".repeat(64),
+    configured_root_identity: "3".repeat(64),
+    relative_path: "existing-pr/local-mcp-24",
+    paths: argumentsValue.paths,
+    commit_message: argumentsValue.commit_message,
+    push_ref: "refs/heads/codex/base-sync",
+    update_mode: "push_base_merge",
+    expected_base_sha: "b".repeat(40),
+    expected_merge_commit_sha: "d".repeat(40),
+    expected_commit_shas: ["b".repeat(40), "d".repeat(40)],
+  };
+  server.notify("item/started", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp-base-sync",
+      server: "workspace-git",
+      tool: "prepare_existing_pull_request_update",
+      arguments: argumentsValue,
+      status: "inProgress",
+    },
+  });
+  server.notify("item/completed", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    item: {
+      type: "mcpToolCall",
+      id: "mcp-base-sync",
+      server: "workspace-git",
+      tool: "prepare_existing_pull_request_update",
+      arguments: argumentsValue,
+      status: "completed",
+      result: {
+        structuredContent: {
+          status: "awaiting_human_approval",
+          operation_id: "66666666-6666-4666-8666-666666666666",
+          approval_expires_at: new Date(Date.now() + 60_000).toISOString(),
+          approval_target: "existing_pr_update_24",
+          scope,
+          approval_scope: { kind: "existing_pull_request_update", ...scope },
+          plan_hash: "6".repeat(64),
+          execute_tool: "execute_approved_existing_pull_request_update",
+          external_write: false,
+        },
+      },
+    },
+  });
+}
+
 function notifyRepositorySettingsPlan(server: FakeAppServer): void {
   const argumentsValue = {
     repo_id: "showtalk-taishi",
@@ -5137,6 +5212,48 @@ test("settles a terminal private workspace-git execution without fabricating a h
     events.some((event) => event.type === "user_input.requested"),
     false,
   );
+});
+
+test("classifies a base-sync existing PR update as push-only automation", async () => {
+  const server = new FakeAppServer();
+  const inputs: WorkspaceGitAutomationInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    koeId: "implementer",
+    workspaceGitAutomationProvider: automationProvider(async (input) => {
+      inputs.push(input);
+      return {
+        status: "terminal_executed",
+        operation_id: input.plan.operation_id,
+        plan_hash: input.plan.plan_hash,
+        receipt_id: "receipt-base-sync",
+      };
+    }),
+  });
+  const eventsPromise = collectEvents(
+    adapter.sendMessage(
+      { id: "thr_1" },
+      automationSlackRequest("Push the approved base merge"),
+    ),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyExistingBaseSyncPlan(server);
+  server.request({
+    id: 813,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  while (server.errorResponses.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed", itemsView: "full", items: [] },
+  });
+  await eventsPromise;
+
+  assert.equal(inputs.length, 1);
+  assert.deepEqual(inputs[0]?.plan.capabilities, ["push"]);
+  assert.deepEqual(inputs[0]?.plan.paths, ["src/a.ts", "src/b.ts"]);
 });
 
 test("keeps an uncertain provider result blocked without manual fallback", async () => {
