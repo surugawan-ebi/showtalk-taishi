@@ -339,6 +339,31 @@ function existingPullRequestUpdateNotification() {
   };
 }
 
+function existingPullRequestBaseSyncNotification() {
+  const notification = existingPullRequestUpdateNotification();
+  const mergeSha = "c".repeat(40);
+  const baseSha = "7".repeat(40);
+  const argumentsRecord = notification.item.arguments as Record<string, unknown>;
+  argumentsRecord.update_mode = "push_base_merge";
+  argumentsRecord.expected_base_sha = baseSha;
+  argumentsRecord.expected_merge_commit_sha = mergeSha;
+  const scope = notification.item.result.structuredContent.scope as Record<
+    string,
+    unknown
+  >;
+  scope.update_mode = "push_base_merge";
+  scope.expected_base_sha = baseSha;
+  scope.expected_merge_commit_sha = mergeSha;
+  scope.expected_commit_shas = [baseSha, mergeSha];
+  const approvalScope = notification.item.result.structuredContent
+    .approval_scope as Record<string, unknown>;
+  approvalScope.update_mode = "push_base_merge";
+  approvalScope.expected_base_sha = baseSha;
+  approvalScope.expected_merge_commit_sha = mergeSha;
+  approvalScope.expected_commit_shas = [baseSha, mergeSha];
+  return notification;
+}
+
 test("captures every public exact-plan field from a publication prepare result", () => {
   assert.deepEqual(captureWorkspaceGitPlan(publicationNotification()), {
     turnId: "turn_1",
@@ -574,6 +599,7 @@ test("captures an exact existing Pull Request update plan", () => {
       configuredRootIdentity: "f".repeat(64),
       relativePath: "existing-pr/showtalk-18",
       pushRef: "refs/heads/codex/approval-fix",
+      updateMode: "commit_paths",
       expiresAt: "2026-08-28T20:00:00+09:00",
     },
   });
@@ -583,6 +609,91 @@ test("captures an exact existing Pull Request update plan", () => {
   assert.throws(
     () => captureWorkspaceGitPlan(substituted),
     /paths do not match input/u,
+  );
+});
+
+test("captures and fixes every base-sync commit and total-diff boundary", () => {
+  const notification = existingPullRequestBaseSyncNotification();
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "existing_pull_request_update");
+  if (capture?.plan.operation !== "existing_pull_request_update") return;
+  assert.equal(capture.plan.updateMode, "push_base_merge");
+  assert.equal(capture.plan.expectedBaseSha, "7".repeat(40));
+  assert.equal(capture.plan.expectedMergeCommitSha, "c".repeat(40));
+  assert.deepEqual(capture.plan.expectedCommitShas, [
+    "7".repeat(40),
+    "c".repeat(40),
+  ]);
+  assert.deepEqual(capture.plan.paths, ["src/slack/frontend.ts"]);
+
+  const changedCommits = existingPullRequestBaseSyncNotification();
+  (changedCommits.item.result.structuredContent.scope as Record<string, unknown>)
+    .expected_commit_shas = [
+    "8".repeat(40),
+    "c".repeat(40),
+  ];
+  assert.throws(
+    () => captureWorkspaceGitPlan(changedCommits),
+    /approval scope does not match|commit/u,
+  );
+
+  const mismatchedMerge = existingPullRequestBaseSyncNotification();
+  (mismatchedMerge.item.result.structuredContent.scope as Record<string, unknown>)
+    .expected_merge_commit_sha = "9".repeat(40);
+  assert.throws(
+    () => captureWorkspaceGitPlan(mismatchedMerge),
+    /base synchronization scope does not match input/u,
+  );
+
+  const substitutions: Array<[string, (value: ReturnType<typeof existingPullRequestBaseSyncNotification>) => void]> = [
+    ["remote parent", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_remote_head_sha", "8".repeat(40)); }],
+    ["base parent", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_base_sha", "8".repeat(40)); }],
+    ["merge head", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_local_head_sha", "8".repeat(40)); }],
+    ["complete diff", (value) => { Reflect.set(value.item.result.structuredContent.scope, "paths", ["src/other.ts"]); }],
+    ["temporary clone", (value) => { Reflect.set(value.item.result.structuredContent.scope, "temporary_workspace_id", `tmp_${"8".repeat(64)}`); }],
+    ["clone identity", (value) => { Reflect.set(value.item.result.structuredContent.scope, "clone_identity", "8".repeat(64)); }],
+    ["Pull Request", (value) => { Reflect.set(value.item.result.structuredContent.scope, "pull_request_number", 19); }],
+    ["snapshot", (value) => { Reflect.set(value.item.result.structuredContent.scope, "expected_snapshot_id", "8".repeat(64)); }],
+  ];
+  for (const [name, substitute] of substitutions) {
+    const changed = existingPullRequestBaseSyncNotification();
+    substitute(changed);
+    assert.throws(() => captureWorkspaceGitPlan(changed), Error, name);
+  }
+
+  const substitutedRemoteParent = existingPullRequestBaseSyncNotification();
+  for (const scopeKey of ["scope", "approval_scope"] as const) {
+    Reflect.set(
+      substitutedRemoteParent.item.result.structuredContent[scopeKey],
+      "expected_remote_head_sha",
+      "8".repeat(40),
+    );
+  }
+  assert.throws(
+    () => captureWorkspaceGitPlan(substitutedRemoteParent),
+    /heads do not match input/u,
+  );
+
+  const malformedBaseParent = existingPullRequestBaseSyncNotification();
+  const malformedBaseSha = "z".repeat(40);
+  Reflect.set(malformedBaseParent.item.arguments, "expected_base_sha", malformedBaseSha);
+  for (const scopeKey of ["scope", "approval_scope"] as const) {
+    Reflect.set(
+      malformedBaseParent.item.result.structuredContent[scopeKey],
+      "expected_base_sha",
+      malformedBaseSha,
+    );
+  }
+  assert.throws(
+    () => captureWorkspaceGitPlan(malformedBaseParent),
+    /base synchronization scope does not match input/u,
+  );
+
+  const unknownInput = existingPullRequestBaseSyncNotification();
+  Reflect.set(unknownInput.item.arguments, "expected_base_sync_receipt_id", `sync_${"8".repeat(64)}`);
+  assert.throws(
+    () => captureWorkspaceGitPlan(unknownInput),
+    /input is invalid/u,
   );
 });
 
