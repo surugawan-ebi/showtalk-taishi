@@ -12,6 +12,7 @@ import {
   type WorkspaceGitHumanDecisionInput,
 } from "../../src/approvals/workspace-git-human-decision-broker.js";
 import {
+  classifyWorkspaceGitManualWorkerFailure,
   createWorkspaceGitHumanDecisionBrokerFromEnvironment,
   inspectWorkspaceGitManualConfiguration,
 } from "../../src/approvals/workspace-git-manual-worker-transport.js";
@@ -169,6 +170,30 @@ test("loads only the configured manual v1 composition in an isolated worker", as
   } finally {
     await broker.close?.();
   }
+});
+
+test("classifies worker startup errors without retaining private details", () => {
+  assert.equal(
+    classifyWorkspaceGitManualWorkerFailure({
+      code: "ERR_MODULE_NOT_FOUND",
+      message: "Cannot find /private/example/manual-module.mjs",
+    }),
+    "module_not_found",
+  );
+  assert.equal(
+    classifyWorkspaceGitManualWorkerFailure({
+      code: "ERR_UNKNOWN_FILE_EXTENSION",
+      path: "/private/example/worker.ts",
+    }),
+    "unknown_file_extension",
+  );
+  assert.equal(
+    classifyWorkspaceGitManualWorkerFailure({
+      code: "ERR_PRIVATE_DETAIL",
+      message: "secret-value",
+    }),
+    "unclassified",
+  );
 });
 
 test("fails closed for an unsupported private composition", async () => {
