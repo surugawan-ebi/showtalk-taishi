@@ -15,7 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  verify-matrix:
+    name: verify (${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -41,3 +42,29 @@ jobs:
 
       - name: Audit production dependencies
         run: npm audit --omit=dev
+
+  verify:
+    name: verify
+    if: ${{ always() }}
+    needs:
+      - verify-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require every matrix verification to succeed
+        env:
+          VERIFY_MATRIX_RESULT: ${{ needs.verify-matrix.result }}
+        run: |
+          case "$VERIFY_MATRIX_RESULT" in
+            success)
+              echo "All matrix verification jobs succeeded."
+              ;;
+            failure|cancelled|skipped)
+              echo "::error::Matrix verification result: $VERIFY_MATRIX_RESULT"
+              exit 1
+              ;;
+            *)
+              echo "::error::Matrix verification did not return a known successful result."
+              exit 1
+              ;;
+          esac
