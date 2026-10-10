@@ -13,7 +13,7 @@ configuration, tool schemas, and state formats may still change.
 
 ## Development setup
 
-Use Node.js 22 or newer and install the locked dependencies:
+Use Node.js 22.19.0 or newer and install the locked dependencies:
 
 ```bash
 npm ci

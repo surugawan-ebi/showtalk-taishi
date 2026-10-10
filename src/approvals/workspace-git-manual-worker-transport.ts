@@ -16,6 +16,43 @@ const STATE_ROOT_ENV_VAR = "WORKSPACE_GIT_STATE_ROOT";
 const WORKER_START_TIMEOUT_MS = 15_000;
 const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 
+export type WorkspaceGitManualWorkerFailureClassification =
+  | "invalid_contract"
+  | "module_not_found"
+  | "unknown_file_extension"
+  | "unsupported_typescript_syntax"
+  | "worker_initialization_failed"
+  | "unclassified";
+
+/** Reduces worker startup errors to a path- and message-free allowlist. */
+export function classifyWorkspaceGitManualWorkerFailure(
+  error: unknown,
+): WorkspaceGitManualWorkerFailureClassification {
+  const record = asRecord(error);
+  if (record?.message === "Manual workspace-git composition is invalid") {
+    return "invalid_contract";
+  }
+  const code = record?.code;
+  if (code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND") {
+    return "module_not_found";
+  }
+  if (code === "ERR_UNKNOWN_FILE_EXTENSION") {
+    return "unknown_file_extension";
+  }
+  if (code === "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX") {
+    return "unsupported_typescript_syntax";
+  }
+  if (code === "ERR_WORKER_INIT_FAILED") {
+    return "worker_initialization_failed";
+  }
+  return "unclassified";
+}
+
+export function workspaceGitDecisionWorkerUrl(moduleUrl: string): URL {
+  const extension = new URL(moduleUrl).pathname.endsWith(".ts") ? ".ts" : ".js";
+  return new URL(`./workspace-git-decision-worker${extension}`, moduleUrl);
+}
+
 export type WorkspaceGitManualConfigurationInspection =
   | {
       readonly status: "not_configured";
@@ -179,15 +216,18 @@ class WorkerManualHumanDecisionTransport
       this.#rejectReady = rejectReady;
     });
     this.#worker = new Worker(
-      new URL("./workspace-git-decision-worker.js", import.meta.url),
+      workspaceGitDecisionWorkerUrl(import.meta.url),
       {
         workerData: { modulePath, stateRoot },
         env: { [STATE_ROOT_ENV_VAR]: stateRoot },
       },
     );
     this.#worker.on("message", (message: unknown) => this.#onMessage(message));
-    this.#worker.once("error", () => {
-      this.#fail(new Error("workspace-git manual decision worker failed"));
+    this.#worker.once("error", (error) => {
+      const classification = classifyWorkspaceGitManualWorkerFailure(error);
+      this.#fail(new Error(
+        `workspace-git manual decision worker failed (${classification})`,
+      ));
     });
     this.#worker.once("exit", () => {
       if (!this.#closed) {
