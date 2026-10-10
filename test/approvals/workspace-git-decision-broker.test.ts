@@ -15,6 +15,7 @@ import {
   classifyWorkspaceGitManualWorkerFailure,
   createWorkspaceGitHumanDecisionBrokerFromEnvironment,
   inspectWorkspaceGitManualConfiguration,
+  workspaceGitDecisionWorkerUrl,
 } from "../../src/approvals/workspace-git-manual-worker-transport.js";
 import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
@@ -174,6 +175,12 @@ test("loads only the configured manual v1 composition in an isolated worker", as
 
 test("classifies worker startup errors without retaining private details", () => {
   assert.equal(
+    classifyWorkspaceGitManualWorkerFailure(
+      new Error("Manual workspace-git composition is invalid"),
+    ),
+    "invalid_contract",
+  );
+  assert.equal(
     classifyWorkspaceGitManualWorkerFailure({
       code: "ERR_MODULE_NOT_FOUND",
       message: "Cannot find /private/example/manual-module.mjs",
@@ -196,6 +203,21 @@ test("classifies worker startup errors without retaining private details", () =>
   );
 });
 
+test("uses a source worker under tsx and a JavaScript worker after build", () => {
+  assert.equal(
+    workspaceGitDecisionWorkerUrl(
+      "file:///repo/src/approvals/workspace-git-manual-worker-transport.ts",
+    ).href,
+    "file:///repo/src/approvals/workspace-git-decision-worker.ts",
+  );
+  assert.equal(
+    workspaceGitDecisionWorkerUrl(
+      "file:///repo/dist/approvals/workspace-git-manual-worker-transport.js",
+    ).href,
+    "file:///repo/dist/approvals/workspace-git-decision-worker.js",
+  );
+});
+
 test("fails closed for an unsupported private composition", async () => {
   await assert.rejects(
     createWorkspaceGitHumanDecisionBrokerFromEnvironment({
@@ -204,7 +226,7 @@ test("fails closed for an unsupported private composition", async () => {
           .pathname,
       WORKSPACE_GIT_STATE_ROOT: "/tmp/showtalk-manual-broker-fixture",
     }),
-    /manual decision worker failed|manual decision worker exited/u,
+    /manual decision worker failed \(invalid_contract\)/u,
   );
 });
 
