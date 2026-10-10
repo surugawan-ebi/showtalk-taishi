@@ -60,7 +60,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "@slack/bolt": "^5.0.0",
     "@slack/types": "^3.0.0",
     "@slack/web-api": "^8.0.0",
