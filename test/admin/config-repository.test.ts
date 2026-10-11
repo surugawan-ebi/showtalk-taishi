@@ -178,6 +178,76 @@ test("saves Koe settings to a private sidecar without rewriting operator config"
   );
 });
 
+test("deletes one consultation while preserving others and advances readback revision", async () => {
+  const configWithSpecialist = source
+    .replace(
+      "      reviewer:\n        scope: Strict review only.",
+      [
+        "      reviewer:",
+        "        scope: Strict review only.",
+        "      specialist:",
+        "        scope: Specialist production only.",
+      ].join("\n"),
+    )
+    .replace(
+      "permissions:\n",
+      [
+        "  specialist:",
+        "    adapter: codex",
+        "    workspace:",
+        "      path: /workspace/specialist",
+        "    slack:",
+        "      channel_id: C333",
+        "      conversation_scope: channel",
+        "    role: Produce specialist assets.",
+        "permissions:",
+        "",
+      ].join("\n"),
+    );
+  const path = await createConfig(configWithSpecialist);
+  const repository = createRepository(path);
+  const before = await repository.read();
+  const agents = before.agents.map((agent) => {
+    if (agent.id !== "leader") return agent;
+    const { reviewer: _removed, ...consultations } = agent.consultations;
+    return { ...agent, consultations };
+  });
+
+  const saved = await repository.save({ revision: before.revision, agents });
+  const readback = await repository.read();
+
+  assert.notEqual(saved.revision, before.revision);
+  assert.equal(readback.revision, saved.revision);
+  assert.equal(readback.agents[0]?.consultations.reviewer, undefined);
+  assert.equal(
+    readback.agents[0]?.consultations.specialist?.scope,
+    "Specialist production only.",
+  );
+  await assert.rejects(
+    repository.save({ revision: before.revision, agents: before.agents }),
+    AdminConfigConflictError,
+  );
+});
+
+test("deletes the final consultation and preserves that deletion after reload", async () => {
+  const path = await createConfig();
+  const repository = createRepository(path);
+  const before = await repository.read();
+  const agents = before.agents.map((agent) =>
+    agent.id === "leader" ? { ...agent, consultations: {} } : agent
+  );
+
+  const saved = await repository.save({ revision: before.revision, agents });
+  const overrides = await readFile(overridesPathFor(path), "utf8");
+  const reloaded = createRepository(path);
+
+  assert.deepEqual(saved.agents[0]?.consultations, {});
+  assert.match(overrides, /\/agents\/leader\/consultations\/reviewer\/scope/u);
+  assert.match(overrides, /"value": null/u);
+  assert.deepEqual((await reloaded.read()).agents[0]?.consultations, {});
+  assert.equal(await readFile(path, "utf8"), source);
+});
+
 test("rejects stale revisions and leaves the current config untouched", async () => {
   const path = await createConfig();
   const repository = createRepository(path);
