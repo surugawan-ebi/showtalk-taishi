@@ -71,6 +71,10 @@ import {
   parseApprovalTextCommand, buildApprovalTextCommandHint,
   type ApprovalTextAttributionProfile,
 } from "./approval-text-command.js";
+import {
+  createDotOriginDiagnosticReporter,
+  shouldSuppressDotUserMention,
+} from "./dot-origin.js";
 import { validateSlackActionSource } from "./interaction-source.js";
 import {
   GIT_APPROVAL_RECOVERY_ACTION_PREFIX,
@@ -172,6 +176,8 @@ export interface SlackFrontendOptions {
   readonly approvalTextAttributionProfile?: ApprovalTextAttributionProfile;
   readonly interactionAudit?: InteractionAudit;
   readonly workAttentionChannelId?: string;
+  /** Test/composition sink for bounded, payload-free dot rejection records. */
+  readonly dotOriginDiagnosticWrite?: (line: string) => void;
 }
 
 export interface HumanSlackMessage {
@@ -261,12 +267,14 @@ export class SlackFrontend {
   readonly #gitApprovalDetails: WorkspaceGitApprovalDetailsStore;
   readonly #choiceContinuations: StructuredChoiceContinuationStore;
   readonly #permissionApprovalCards: PermissionApprovalCardTracker;
+  readonly #activeDotTurnUsers = new Map<string, Map<string, number>>();
   readonly #approvalTextStore: ApprovalTextStore;
   readonly #approvalTextAttributionProfile: ApprovalTextAttributionProfile | undefined;
   readonly #now: () => number;
   readonly #interactionAudit: InteractionAudit;
   readonly #workAttentionChannelId: string | undefined;
   readonly #connectionHealth: SlackConnectionHealth | undefined;
+  readonly #reportDotOriginRejection: (event: unknown) => void;
   #activeMessageHandlers = 0;
   #restartPending = false;
   #stopPromise: Promise<void> | undefined;
@@ -302,6 +310,10 @@ export class SlackFrontend {
     this.#interactionAudit = options.interactionAudit ??
       createInteractionAudit(console.info, this.#now);
     this.#workAttentionChannelId = options.workAttentionChannelId;
+    this.#reportDotOriginRejection = createDotOriginDiagnosticReporter(
+      options.dotOriginDiagnosticWrite ?? console.info,
+      this.#now,
+    );
     this.#choiceContinuations = new StructuredChoiceContinuationStore(this.#now);
     this.#presentationsByChannel = options.presentationsByChannel ?? {};
     this.#durableEventLedger = options.durableEventLedger;
@@ -684,6 +696,7 @@ export class SlackFrontend {
           request,
           this.#defaultNotificationUserId,
           this.#presentation(request.sourceChannelId),
+          !this.#permissionApprovalIsDotTurn(request),
         ),
       );
       if (typeof posted.ts !== "string") {
@@ -1269,6 +1282,40 @@ export class SlackFrontend {
     this.#approvalTextStore.forget(requestId);
   }
 
+  #trackDotTurn(
+    channelId: string,
+    rootThreadTs: string,
+    sourceUserId: string | undefined,
+    isDotTurn: boolean,
+  ): (() => void) | undefined {
+    if (!isDotTurn || sourceUserId === undefined) return undefined;
+    const key = slackTurnKey(channelId, rootThreadTs);
+    const users = this.#activeDotTurnUsers.get(key) ?? new Map<string, number>();
+    users.set(sourceUserId, (users.get(sourceUserId) ?? 0) + 1);
+    this.#activeDotTurnUsers.set(key, users);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.#activeDotTurnUsers.get(key);
+      if (current === undefined) return;
+      const count = current.get(sourceUserId) ?? 0;
+      if (count <= 1) current.delete(sourceUserId);
+      else current.set(sourceUserId, count - 1);
+      if (current.size === 0) this.#activeDotTurnUsers.delete(key);
+    };
+  }
+
+  #permissionApprovalIsDotTurn(
+    request: PermissionApprovalPresentation,
+  ): boolean {
+    if (request.sourceSlackUserId === undefined ||
+        request.sourceRootThreadTs === undefined) return false;
+    return this.#activeDotTurnUsers
+      .get(slackTurnKey(request.sourceChannelId, request.sourceRootThreadTs))
+      ?.has(request.sourceSlackUserId) === true;
+  }
+
   async #handleApprovalTextMessage(
     event: unknown,
     body: unknown,
@@ -1360,12 +1407,18 @@ export class SlackFrontend {
       if (await this.#handleApprovalTextMessage(event, body, client, logger)) return;
       const message = parseHumanSlackMessage(event);
       if (message === undefined) return;
+      // Keep this classification on the individual turn. It must not become a
+      // sticky property of the Slack thread: a later direct human message in
+      // the same thread is allowed to receive the normal notification.
+      const suppressDotUserMention = shouldSuppressDotUserMention(event);
       const slackEnvelopeIdentity = parseSlackEventEnvelopeIdentity(body);
       if (!this.#agentChannels.has(message.channel)) return;
       if (message.text.trim().length === 0 && message.fileIds.length === 0) return;
       const agentId = this.#agentIdsByChannel.get(message.channel);
       if (agentId === undefined) return;
+      if (!suppressDotUserMention) this.#reportDotOriginRejection(event);
       const finishHandler = this.#beginSlackHandler();
+      let releaseDotTurn: (() => void) | undefined;
       try {
         if (this.#restartPending) {
           const rootThreadTs = message.thread_ts ?? message.ts;
@@ -1379,14 +1432,25 @@ export class SlackFrontend {
         }
         const rootThreadTs =
           typeof message.thread_ts === "string" ? message.thread_ts : message.ts;
+        releaseDotTurn = this.#trackDotTurn(
+          message.channel,
+          rootThreadTs,
+          message.user,
+          suppressDotUserMention,
+        );
         const projector = new SlackThreadProjector(
           client,
           message.channel,
           rootThreadTs,
           {
-            ...(typeof message.user === "string"
+              ...(typeof message.user === "string"
               ? { sourceUserId: message.user }
               : {}),
+              mentionSourceUserInTurnMessages: !suppressDotUserMention,
+              // Keep the notification policy separate from authenticated
+              // responder binding; dot turns suppress both ordinary and card
+              // mentions, while direct human turns retain the prior behavior.
+              mentionSourceUserInActionableMessages: !suppressDotUserMention,
               presentation: this.#presentation(message.channel),
               gitApprovalDetailsStore: this.#gitApprovalDetails,
               choiceContinuationStore: this.#choiceContinuations,
@@ -1605,6 +1669,7 @@ export class SlackFrontend {
           }
         }
       } finally {
+        releaseDotTurn?.();
         await this.#durableEventLedger
           ?.record(body.event_id)
           .catch((error) => logger.error(error));
@@ -2470,6 +2535,7 @@ export function permissionApprovalPostArguments(
   request: PermissionApprovalPresentation,
   defaultNotificationUserId?: string,
   presentation: SlackMessagePresentation = {},
+  mentionSourceUser = true,
 ) {
   const notificationUserId =
     request.sourceSlackUserId ?? defaultNotificationUserId;
@@ -2484,8 +2550,8 @@ export function permissionApprovalPostArguments(
     ...(request.sourceRootThreadTs === undefined
       ? {}
       : { thread_ts: request.sourceRootThreadTs }),
-    text: `${notificationUserId === undefined ? "" : `<@${notificationUserId}> `}${request.sourceAgentId} Koe requests permission: ${request.summary}`,
-    blocks: [...buildPermissionApprovalBlocks(routedRequest), approvalTextHintBlock(request.requestId)],
+    text: `${mentionSourceUser && notificationUserId !== undefined ? `<@${notificationUserId}> ` : ""}${request.sourceAgentId} Koe requests permission: ${request.summary}`,
+    blocks: [...buildPermissionApprovalBlocks(routedRequest, mentionSourceUser), approvalTextHintBlock(request.requestId)],
     ...presentation,
   };
 }
@@ -3006,6 +3072,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object"
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function slackTurnKey(channelId: string, rootThreadTs: string): string {
+  return `${channelId}\u0000${rootThreadTs}`;
 }
 
 function publicErrorMessage(error: unknown): string {

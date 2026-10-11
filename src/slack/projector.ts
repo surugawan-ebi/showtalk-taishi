@@ -73,9 +73,17 @@ export interface SlackThreadProjectorOptions {
   readonly sourceUserId?: string;
   /**
    * Whether ordinary turn messages should notify the source user. Structured
-   * requests still use sourceUserId to bind and notify the authenticated human.
+   * requests keep using sourceUserId for binding; their display mention is
+   * controlled separately by mentionSourceUserInActionableMessages.
    */
   readonly mentionSourceUserInTurnMessages?: boolean;
+  /**
+   * Whether actionable status/error messages should notify the source user.
+   * Defaults to the ordinary-turn setting so Koe visits retain their
+   * historical suppression; direct Slack turns may opt in explicitly while
+   * keeping ordinary/final replies quiet.
+   */
+  readonly mentionSourceUserInActionableMessages?: boolean;
   readonly presentation?: SlackMessagePresentation;
   readonly now?: () => number;
   readonly heartbeatScheduler?: HeartbeatScheduler;
@@ -94,6 +102,8 @@ export class SlackThreadProjector {
   readonly #sourceUserId: string | undefined;
   readonly #sourceUserMention: string | undefined;
   readonly #mentionSourceUserInTurnMessages: boolean;
+  readonly #mentionSourceUserInActionableMessages: boolean;
+  readonly #actionableSourceUserMention: string | undefined;
   readonly #presentation: SlackMessagePresentation;
   readonly #now: () => number;
   readonly #heartbeatScheduler: HeartbeatScheduler;
@@ -157,6 +167,13 @@ export class SlackThreadProjector {
       : formatSlackUserMention(options.sourceUserId);
     this.#mentionSourceUserInTurnMessages =
       options.mentionSourceUserInTurnMessages ?? true;
+    this.#mentionSourceUserInActionableMessages =
+      options.mentionSourceUserInActionableMessages ??
+      this.#mentionSourceUserInTurnMessages;
+    this.#actionableSourceUserMention =
+      this.#mentionSourceUserInActionableMessages
+        ? this.#sourceUserMention
+        : undefined;
     this.#presentation = options.presentation ?? {};
     this.#now = options.now ?? Date.now;
     this.#heartbeatScheduler =
@@ -875,13 +892,13 @@ export class SlackThreadProjector {
   ): Promise<void> {
     const includesSourceMention =
       notifySourceUser &&
-      this.#mentionSourceUserInTurnMessages &&
-      this.#sourceUserMention !== undefined;
+      this.#mentionSourceUserInActionableMessages &&
+      this.#actionableSourceUserMention !== undefined;
     const postedText = this.#formatActionableMessage(text, includesSourceMention);
     // Slack clients can derive notification copy from either the top-level
     // fallback or Block Kit text, so keep the actionable mention in both.
     const postedBlocks = includesSourceMention && blocks !== undefined
-      ? [sourceMentionBlock(this.#sourceUserMention), ...blocks]
+      ? [sourceMentionBlock(this.#actionableSourceUserMention!), ...blocks]
       : blocks;
     if (includesSourceMention) assertSafeSlackMessage(postedText);
     await this.#client.chat.postMessage({
@@ -912,7 +929,7 @@ export class SlackThreadProjector {
     };
     const fallback = this.#formatActionableMessage(
       `Git操作の承認待ち: ${event.plan.repoId} / ${event.plan.mode}`,
-      this.#sourceUserMention !== undefined,
+      this.#actionableSourceUserMention !== undefined,
     );
     const canToggleDetails = this.#gitApprovalDetailsStore !== undefined;
     const expiresAt = Date.parse(event.expiresAt);
@@ -945,11 +962,11 @@ export class SlackThreadProjector {
       channel: this.#channelId,
       thread_ts: this.#rootThreadTs,
       text: fallback,
-      mrkdwn: this.#sourceUserMention !== undefined,
+      mrkdwn: this.#actionableSourceUserMention !== undefined,
       blocks:
-        this.#sourceUserMention === undefined
+        this.#actionableSourceUserMention === undefined
           ? renderedBlocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
+          : [sourceMentionBlock(this.#actionableSourceUserMention), ...renderedBlocks],
       ...this.#presentation,
     });
     if (typeof posted.ts !== "string") {
@@ -978,9 +995,9 @@ export class SlackThreadProjector {
         pathsExpanded: !canToggleDetails,
         bodyExpanded: !canToggleDetails,
       },
-      ...(this.#sourceUserMention === undefined
+      ...(this.#actionableSourceUserMention === undefined
         ? {}
-        : { sourceUserMention: this.#sourceUserMention }),
+        : { sourceUserMention: this.#actionableSourceUserMention }),
     });
     if (approvalTextHint !== undefined) {
       this.#rememberApprovalText({
@@ -1017,9 +1034,9 @@ export class SlackThreadProjector {
           ts: details.routing.messageTs,
           text: fallback,
           blocks:
-            details.sourceUserMention === undefined
+            this.#actionableSourceUserMention === undefined
               ? blocks
-              : [sourceMentionBlock(details.sourceUserMention), ...blocks],
+              : [sourceMentionBlock(this.#actionableSourceUserMention), ...blocks],
         }).then(() => undefined)
       );
       // The App Server request is already terminal. Never retain actionable
@@ -1054,7 +1071,7 @@ export class SlackThreadProjector {
       if (details === undefined) return;
       const fallback = this.#formatActionableMessage(
         "Git操作の承認期限が切れました。この計画は実行できません。",
-        this.#sourceUserMention !== undefined,
+        this.#actionableSourceUserMention !== undefined,
       );
       const blocks = buildExpiredWorkspaceGitApprovalBlocks(
         details.plan,
@@ -1066,9 +1083,9 @@ export class SlackThreadProjector {
           ts: details.routing.messageTs,
           text: fallback,
           blocks:
-            details.sourceUserMention === undefined
+            this.#actionableSourceUserMention === undefined
               ? blocks
-              : [sourceMentionBlock(details.sourceUserMention), ...blocks],
+              : [sourceMentionBlock(this.#actionableSourceUserMention), ...blocks],
         }).then(() => undefined)
       );
       if (updated) {
@@ -1099,13 +1116,13 @@ export class SlackThreadProjector {
     });
     const fallback = this.#formatActionableMessage(
       event.summary,
-      this.#sourceUserMention !== undefined,
+      this.#actionableSourceUserMention !== undefined,
     );
     const posted = await this.#client.chat.postMessage({
       channel: this.#channelId,
       thread_ts: this.#rootThreadTs,
       text: fallback,
-      mrkdwn: this.#sourceUserMention !== undefined,
+      mrkdwn: this.#actionableSourceUserMention !== undefined,
       ...this.#presentation,
     });
     if (typeof posted.ts !== "string") {
@@ -1137,9 +1154,9 @@ export class SlackThreadProjector {
       ts: posted.ts,
       text: fallback,
       blocks:
-        this.#sourceUserMention === undefined
+        this.#actionableSourceUserMention === undefined
           ? renderedBlocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
+          : [sourceMentionBlock(this.#actionableSourceUserMention), ...renderedBlocks],
     });
     this.#interactionAudit?.({
       event: "approval.controls_attached",
@@ -1215,7 +1232,7 @@ export class SlackThreadProjector {
           ? " workspace-gitのGit承認ではありません。"
           : ""),
       blocks:
-        continuation.responderUserId === undefined
+        !this.#mentionSourceUserInActionableMessages || continuation.responderUserId === undefined
           ? blocks
           : [sourceMentionBlock(`<@${continuation.responderUserId}>`), ...blocks],
     });
@@ -1369,13 +1386,13 @@ export class SlackThreadProjector {
       event.question.purpose === "external_action_confirmation"
         ? `外部操作の確認（Git承認ではありません）: ${event.question.header}`
         : `選択してください: ${event.question.header}`,
-      this.#sourceUserMention !== undefined,
+      this.#actionableSourceUserMention !== undefined,
     );
     const posted = await this.#client.chat.postMessage({
       channel: this.#channelId,
       thread_ts: this.#rootThreadTs,
       text: fallback,
-      mrkdwn: this.#sourceUserMention !== undefined,
+      mrkdwn: this.#actionableSourceUserMention !== undefined,
       ...this.#presentation,
     });
     if (typeof posted.ts !== "string") {
@@ -1425,9 +1442,9 @@ export class SlackThreadProjector {
       ts: posted.ts,
       text: fallback,
       blocks:
-        this.#sourceUserMention === undefined
+        this.#actionableSourceUserMention === undefined
           ? renderedBlocks
-          : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
+          : [sourceMentionBlock(this.#actionableSourceUserMention), ...renderedBlocks],
     });
     this.#interactionAudit?.({
       event: "choice.controls_attached",
@@ -1472,18 +1489,18 @@ export class SlackThreadProjector {
     if (event === undefined || this.#gitApprovalRecoveryPublished) return;
     const fallback = this.#formatActionableMessage(
       "Git操作は承認されていません。必要な操作を新しいメッセージとして依頼してください。",
-      this.#sourceUserMention !== undefined,
+      this.#actionableSourceUserMention !== undefined,
     );
     await this.#client.chat.postMessage({
       channel: this.#channelId,
       thread_ts: this.#rootThreadTs,
       text: fallback,
-      mrkdwn: this.#sourceUserMention !== undefined,
+      mrkdwn: this.#actionableSourceUserMention !== undefined,
       blocks:
-        this.#sourceUserMention === undefined
+        this.#actionableSourceUserMention === undefined
           ? buildGitApprovalRecoveryBlocks(event.message)
           : [
-              sourceMentionBlock(this.#sourceUserMention),
+              sourceMentionBlock(this.#actionableSourceUserMention),
               ...buildGitApprovalRecoveryBlocks(event.message),
             ],
       ...this.#presentation,
