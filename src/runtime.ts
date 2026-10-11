@@ -2,6 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, constants, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
+import {
+  ClaudeCodeAdapter,
+  type ClaudeQueryFunction,
+  type ClaudeSessionLookup,
+} from "./adapters/claude/adapter.js";
+import { ClaudeModelCatalog } from "./adapters/claude/model-catalog.js";
 import { CodexAdapter } from "./adapters/codex/adapter.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
 import {
@@ -156,6 +162,10 @@ export interface CreateRuntimeOptions {
   readonly workspaceGitHumanDecisionBrokerFactory?: WorkspaceGitHumanDecisionBrokerFactory;
   /** Private hosts may inject an opaque provider client; OSS defaults manual. */
   readonly workspaceGitAutomationProviderFactory?: WorkspaceGitAutomationProviderFactoryAny;
+  /** Test seam replacing the Claude Agent SDK `query()` for claude-code Koe. */
+  readonly claudeQuery?: ClaudeQueryFunction;
+  /** Test seam replacing the Claude session existence lookup. */
+  readonly claudeSessionExists?: ClaudeSessionLookup;
   readonly workspaceGitAutonomyControlBrokerFactory?: WorkspaceGitAutonomyControlBrokerFactoryV4;
 }
 
@@ -317,6 +327,7 @@ async function createLockedRuntime(
   recentGatewayRestartReceipts = [...gatewayRestartReplayGuard.list()];
   const clients: CodexAppServerClient[] = [];
   const codexAdapters: CodexAdapter[] = [];
+  const claudeAdapters: ClaudeCodeAdapter[] = [];
   const workspaceGitApprovalDetailsStore = new WorkspaceGitApprovalDetailsStore();
   const workspaceGitAutomationProviders: WorkspaceGitAutomationProviderAny[] = [];
   if (
@@ -360,13 +371,65 @@ async function createLockedRuntime(
     const mcpEndpoint = await mcpServer.start();
     const childrenByAdapter = new Map<string, Map<string, AgentAdapter>>();
     const codexAdaptersByAgent = new Map<string, CodexAdapter>();
-    const modelCatalogsByAgent = new Map<string, CodexModelCatalog>();
+    const claudeAdaptersByAgent = new Map<string, ClaudeCodeAdapter>();
+    const modelCatalogsByAgent = new Map<
+      string,
+      Pick<CodexModelCatalog, "list">
+    >();
     for (const [agentId, agentConfig] of Object.entries(config.agents)) {
       const adapterConfig = config.adapters[agentConfig.adapter];
       if (adapterConfig === undefined) {
         throw new Error(`Koe ${agentId} references an unavailable adapter`);
       }
       const credential = await mcpServer.provisionAgent(agentId);
+      if (adapterConfig.type === "claude-code") {
+        const configuredModel = agentConfig.model ?? adapterConfig.model;
+        const configuredReasoningEffort =
+          agentConfig.reasoning_effort ?? adapterConfig.reasoning_effort;
+        const claude = new ClaudeCodeAdapter({
+          kind: agentConfig.adapter,
+          koeId: agentId,
+          ...(configuredModel === undefined ? {} : { model: configuredModel }),
+          ...(configuredReasoningEffort === undefined
+            ? {}
+            : { reasoningEffort: configuredReasoningEffort }),
+          permissionMode: adapterConfig.permission_mode,
+          allowedTools: adapterConfig.allowed_tools,
+          settingSources: adapterConfig.setting_sources,
+          ...(adapterConfig.max_turns === undefined
+            ? {}
+            : { maxTurns: adapterConfig.max_turns }),
+          ...(adapterConfig.command === undefined
+            ? {}
+            : { pathToClaudeCodeExecutable: adapterConfig.command }),
+          approvalTimeoutMs: adapterConfig.approval_timeout_minutes * 60_000,
+          env: createClaudeChildEnvironment(
+            config,
+            credential.token,
+            process.env,
+            adapterConfig.env_passthrough,
+          ),
+          mcp: { url: credential.url, bearerTokenEnvVar: MCP_TOKEN_ENV_VAR },
+          ...(options.claudeQuery === undefined ? {} : { query: options.claudeQuery }),
+          ...(options.claudeSessionExists === undefined
+            ? {}
+            : { sessionExists: options.claudeSessionExists }),
+        });
+        claudeAdapters.push(claude);
+        claudeAdaptersByAgent.set(agentId, claude);
+        modelCatalogsByAgent.set(agentId, new ClaudeModelCatalog());
+        workStoppageMonitor.observeConnection(agentId, true);
+        let claudeChildren = childrenByAdapter.get(agentConfig.adapter);
+        if (claudeChildren === undefined) {
+          claudeChildren = new Map();
+          childrenByAdapter.set(agentConfig.adapter, claudeChildren);
+        }
+        claudeChildren.set(
+          agentId,
+          new WorkMonitoringAgentAdapter(agentId, claude, workStoppageMonitor),
+        );
+        continue;
+      }
       const codexChildEnvironment = createCodexChildEnvironment(
         config,
         credential.token,
@@ -619,6 +682,17 @@ async function createLockedRuntime(
           });
         }
         for (const setting of settings) {
+          const claude = claudeAdaptersByAgent.get(setting.id);
+          const claudeConfig = config.agents[setting.id];
+          if (claude !== undefined && claudeConfig !== undefined) {
+            const claudeAdapterConfig = config.adapters[claudeConfig.adapter];
+            claude.updateModelSettings({
+              model: setting.model ?? claudeAdapterConfig?.model,
+              reasoningEffort:
+                setting.reasoning_effort ?? claudeAdapterConfig?.reasoning_effort,
+            });
+            continue;
+          }
           const adapter = codexAdaptersByAgent.get(setting.id);
           const agentConfig = config.agents[setting.id];
           if (adapter === undefined || agentConfig === undefined) continue;
@@ -705,6 +779,7 @@ async function createLockedRuntime(
           permissionApprovals,
           frontend,
           codexAdapters,
+          claudeAdapters,
           clients,
           workspaceGitAutomationProviders,
           stateStore,
@@ -718,6 +793,7 @@ async function createLockedRuntime(
   } catch (error) {
     const errors: unknown[] = [error];
     mcpService.beginShutdown();
+    for (const adapter of claudeAdapters) adapter.shutdown();
     for (const adapter of codexAdapters) adapter.shutdown();
     const rejectionResults = await Promise.allSettled(
       codexAdapters.map((adapter) => adapter.waitForSystemRejections()),
@@ -982,6 +1058,7 @@ async function shutdownRuntime(input: {
   readonly permissionApprovals: PermissionApprovalCoordinator;
   readonly frontend: TaishiFrontend;
   readonly codexAdapters: readonly CodexAdapter[];
+  readonly claudeAdapters?: readonly ClaudeCodeAdapter[];
   readonly clients: readonly CodexAppServerClient[];
   readonly workspaceGitAutomationProviders: readonly WorkspaceGitAutomationProviderAny[];
   readonly stateStore: FileStateStore;
@@ -989,6 +1066,7 @@ async function shutdownRuntime(input: {
 }): Promise<void> {
   const errors: unknown[] = [];
   input.mcpService.beginShutdown();
+  for (const adapter of input.claudeAdapters ?? []) adapter.shutdown();
   for (const adapter of input.codexAdapters) adapter.shutdown();
   const rejectionResults = await Promise.allSettled(
     input.codexAdapters.map((adapter) => adapter.waitForSystemRejections()),
@@ -1037,6 +1115,35 @@ export function createCodexChildEnvironment(
   childEnvironment[MCP_TOKEN_ENV_VAR] = mcpToken;
   return childEnvironment;
 }
+
+/**
+ * Environment for a Claude Code child. Starts from the same Gateway-credential
+ * filtered allowlist as Codex, adds Claude authentication variables, and
+ * carries the per-Koe MCP bearer token for `${VAR}` header expansion.
+ */
+export function createClaudeChildEnvironment(
+  config: TaishiConfig,
+  mcpToken: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  passthrough: readonly string[] = [],
+): NodeJS.ProcessEnv {
+  const childEnvironment = createCodexProbeEnvironment(config, environment, [
+    ...CLAUDE_ENVIRONMENT_ALLOWLIST,
+    ...passthrough,
+  ]);
+  childEnvironment[MCP_TOKEN_ENV_VAR] = mcpToken;
+  return childEnvironment;
+}
+
+const CLAUDE_ENVIRONMENT_ALLOWLIST = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+] as const;
 
 /** Removes Gateway-only credentials before any Codex App Server subprocess. */
 export function createCodexProbeEnvironment(

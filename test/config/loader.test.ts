@@ -9,6 +9,16 @@ import {
   expandEnvironmentReferences,
   loadConfig,
 } from "../../src/config/loader.js";
+import type {
+  AdapterConfig,
+  ClaudeAdapterConfig,
+  CodexAdapterConfig,
+} from "../../src/config/schema.js";
+
+function codexAdapter(adapter: AdapterConfig | undefined): CodexAdapterConfig {
+  assert.equal(adapter?.type, "codex-app-server");
+  return adapter as CodexAdapterConfig;
+}
 
 const source = `
 version: 1
@@ -52,10 +62,10 @@ test("loads config and expands environment references", async () => {
     WORKSPACE: "/tmp/project",
   });
   assert.equal(config.agents.implementer?.workspace.path, "/tmp/project");
-  assert.equal(config.adapters.codex?.approval_policy, "on-request");
-  assert.equal(config.adapters.codex?.approvals_reviewer, "auto_review");
-  assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, undefined);
-  assert.equal(config.adapters.codex?.sandbox, "workspace-write");
+  assert.equal(codexAdapter(config.adapters.codex).approval_policy, "on-request");
+  assert.equal(codexAdapter(config.adapters.codex).approvals_reviewer, "auto_review");
+  assert.equal(codexAdapter(config.adapters.codex).live_acceptance_mcp_probe, undefined);
+  assert.equal(codexAdapter(config.adapters.codex).sandbox, "workspace-write");
   assert.equal(config.agents.implementer?.adapter_session_id, undefined);
   assert.equal(config.agents.implementer?.consultations, undefined);
   assert.equal(config.agents.implementer?.automatic_choice_mode, "off");
@@ -812,9 +822,9 @@ test("loads explicit Codex permission overrides", async () => {
     BOT_TOKEN: "xoxb-test",
     WORKSPACE: "/tmp/project",
   });
-  assert.equal(config.adapters.codex?.approval_policy, "never");
-  assert.equal(config.adapters.codex?.approvals_reviewer, "auto_review");
-  assert.equal(config.adapters.codex?.sandbox, "read-only");
+  assert.equal(codexAdapter(config.adapters.codex).approval_policy, "never");
+  assert.equal(codexAdapter(config.adapters.codex).approvals_reviewer, "auto_review");
+  assert.equal(codexAdapter(config.adapters.codex).sandbox, "read-only");
 });
 
 test("rejects the removed untrusted Codex approval setting", async () => {
@@ -859,7 +869,7 @@ test("loads the live acceptance MCP probe only with human approval routing", asy
     BOT_TOKEN: "xoxb-test",
     WORKSPACE: "/tmp/project",
   });
-  assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, true);
+  assert.equal(codexAdapter(config.adapters.codex).live_acceptance_mcp_probe, true);
 });
 
 test("rejects a live acceptance MCP probe without human approval routing", async () => {
@@ -930,10 +940,10 @@ test("recovers auto-review config by disabling a leftover live acceptance probe"
     ),
   );
   const config = await loadConfig(path, environment);
-  assert.equal(config.adapters.codex?.live_acceptance_mcp_probe, false);
-  assert.equal(config.adapters.codex?.approvals_reviewer, "auto_review");
-  assert.equal(config.adapters.codex?.approval_policy, "on-request");
-  assert.equal(config.adapters.codex?.sandbox, "workspace-write");
+  assert.equal(codexAdapter(config.adapters.codex).live_acceptance_mcp_probe, false);
+  assert.equal(codexAdapter(config.adapters.codex).approvals_reviewer, "auto_review");
+  assert.equal(codexAdapter(config.adapters.codex).approval_policy, "on-request");
+  assert.equal(codexAdapter(config.adapters.codex).sandbox, "workspace-write");
 });
 
 test("loads a bounded per-Agent Slack display name and icon", async () => {
@@ -1045,6 +1055,116 @@ test("rejects Gateway credential names in Agent environment passthrough", async 
     }),
     /Gateway or Slack token variables cannot be passed through/,
   );
+});
+
+const claudeEnvironment = {
+  STATE_FILE: "/tmp/state.json",
+  APP_TOKEN: "xapp-test",
+  BOT_TOKEN: "xoxb-test",
+  WORKSPACE: "/tmp/project",
+};
+
+const claudeSource = source.replace(
+  "    type: codex-app-server\n    command: codex\n    transport: stdio",
+  "    type: claude-code",
+);
+
+async function writeConfig(text: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(path, text);
+  return path;
+}
+
+test("loads a claude-code adapter with defaults", async () => {
+  assert.notEqual(claudeSource, source);
+  const config = await loadConfig(await writeConfig(claudeSource), claudeEnvironment);
+  const adapter = config.adapters.codex as ClaudeAdapterConfig;
+  assert.equal(adapter.type, "claude-code");
+  assert.equal(adapter.permission_mode, "default");
+  assert.deepEqual(adapter.setting_sources, ["user", "project", "local"]);
+  assert.equal(adapter.approval_timeout_minutes, 30);
+  assert.deepEqual(adapter.allowed_tools, []);
+  assert.equal(adapter.command, undefined);
+  assert.equal(adapter.max_turns, undefined);
+});
+
+test("rejects bypassPermissions for a claude-code adapter", async () => {
+  await assert.rejects(
+    loadConfig(
+      await writeConfig(
+        claudeSource.replace("type: claude-code", "type: claude-code\n    permission_mode: bypassPermissions"),
+      ),
+      claudeEnvironment,
+    ),
+    ConfigError,
+  );
+});
+
+test("rejects unsupported claude-code reasoning effort overrides", async () => {
+  await assert.rejects(
+    loadConfig(
+      await writeConfig(
+        claudeSource.replace("type: claude-code", "type: claude-code\n    reasoning_effort: extreme"),
+      ),
+      claudeEnvironment,
+    ),
+    ConfigError,
+  );
+
+  const mixed = source
+    .replace(
+      "    transport: stdio\n",
+      "    transport: stdio\n  claude:\n    type: claude-code\n",
+    )
+    .replace(
+      "permissions:",
+      "  reviewer:\n    adapter: claude\n    reasoning_effort: extreme\n    workspace:\n      path: \"${WORKSPACE}\"\n    slack:\n      channel_id: C456\n    role: Review changes.\npermissions:",
+    );
+  await assert.rejects(
+    loadConfig(await writeConfig(mixed), claudeEnvironment),
+    ConfigError,
+  );
+});
+
+test("accepts explicit claude-code settings and rejects duplicate setting sources", async () => {
+  const explicit = claudeSource.replace(
+    "type: claude-code",
+    "type: claude-code\n    permission_mode: acceptEdits\n    allowed_tools: [Read]\n    setting_sources: [user]\n    approval_timeout_minutes: 5",
+  );
+  const config = await loadConfig(await writeConfig(explicit), claudeEnvironment);
+  const adapter = config.adapters.codex as ClaudeAdapterConfig;
+  assert.equal(adapter.permission_mode, "acceptEdits");
+  assert.deepEqual(adapter.allowed_tools, ["Read"]);
+  assert.deepEqual(adapter.setting_sources, ["user"]);
+  assert.equal(adapter.approval_timeout_minutes, 5);
+
+  await assert.rejects(
+    loadConfig(
+      await writeConfig(
+        claudeSource.replace("type: claude-code", "type: claude-code\n    setting_sources: [user, user]"),
+      ),
+      claudeEnvironment,
+    ),
+    ConfigError,
+  );
+});
+
+test("loads a config mixing codex and claude-code agents", async () => {
+  const mixed = source
+    .replace(
+      "    transport: stdio\n",
+      "    transport: stdio\n  claude:\n    type: claude-code\n",
+    )
+    .replace(
+      "permissions:",
+      "  reviewer:\n    adapter: claude\n    workspace:\n      path: \"${WORKSPACE}\"\n    slack:\n      channel_id: C456\n    role: Review changes.\npermissions:",
+    );
+  const config = await loadConfig(await writeConfig(mixed), claudeEnvironment);
+  assert.equal(config.adapters.codex?.type, "codex-app-server");
+  assert.equal(config.adapters.claude?.type, "claude-code");
+  assert.equal(config.agents.implementer?.adapter, "codex");
+  assert.equal(config.agents.reviewer?.adapter, "claude");
 });
 
 test("rejects AppOps approval key names in Agent environment passthrough", async () => {

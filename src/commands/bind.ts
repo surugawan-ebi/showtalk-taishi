@@ -210,6 +210,11 @@ async function validateCodexThread(
   if (adapter === undefined) {
     throw new Error(`Koe ${agentId} references an unavailable adapter`);
   }
+  if (adapter.type !== "codex-app-server") {
+    throw new Error(
+      `Koe ${agentId} uses a Claude Code adapter; set adapter_session_id in config.yaml to bind an existing Claude session`,
+    );
+  }
 
   let client: CodexAppServerClient | undefined;
   let reportedError: Error | undefined;

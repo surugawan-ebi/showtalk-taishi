@@ -46,6 +46,20 @@ That credential authenticates only the Koe identity and does not contain
 Slack credentials. The Permission Engine still evaluates every protected tool
 operation.
 
+### Claude Code adapter
+
+A `claude-code` Koe keeps the same boundary. `bypassPermissions` is not an
+accepted `permission_mode`, so tool use that is not covered by `allowed_tools`
+or the user's Claude settings becomes a Slack approval card. "Allow session"
+grants are session-scoped rules held by the running Claude session and never written to Claude
+settings files. The child receives the same kind of filtered environment as
+Codex: only `HOME`, Claude/Anthropic authentication and cloud-provider switches,
+runtime and proxy variables, and names in `env_passthrough`. Slack tokens are
+removed. The Koe's MCP bearer token is passed through an environment variable
+and `${VAR}` header expansion, so it never appears in process arguments.
+`allowed_tools` and `setting_sources` widen what Claude may do without a prompt;
+treat them as operator-owned policy.
+
 ## MCP boundary
 
 The MCP Streamable HTTP server:

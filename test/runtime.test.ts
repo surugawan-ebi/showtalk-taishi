@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   assertWorkspaceGitManualRuntimeOptions,
   buildWorkMonitorObservations,
+  createClaudeChildEnvironment,
   createCodexChildEnvironment,
   createCodexProbeEnvironment,
   createRegistry,
@@ -327,8 +328,8 @@ test("keeps the current autonomy revision for an unchanged canonical policy", ()
 test("does not leak Slack credentials into isolated Codex Agent processes", () => {
   const config = {
     slack: {
-      app_token: "xapp-secret",
-      bot_token: "xoxb-secret",
+      app_token: "synthetic-app-token",
+      bot_token: "synthetic-bot-token",
     },
   } as TaishiConfig;
   const environment = createCodexChildEnvironment(config, "agent-mcp-secret", {
@@ -1143,5 +1144,32 @@ test("rejects a declared adapter session already owned by another Koe", () => {
   assert.throws(
     () => createRegistry(config, state),
     /already recorded for Koe reviewer/,
+  );
+});
+
+test("Claude child environment drops Slack tokens and keeps Claude authentication", () => {
+  const config = {
+    slack: {
+      app_token: "synthetic-app-token",
+      bot_token: "synthetic-bot-token",
+    },
+  } as TaishiConfig;
+  assert.deepEqual(
+    createClaudeChildEnvironment(config, "agent-mcp-secret", {
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "synthetic-anthropic-key",
+      CLAUDE_CONFIG_DIR: "/home/synthetic/.claude",
+      SLACK_APP_TOKEN: "synthetic-app-token",
+      RENAMED_BOT_CREDENTIAL: "synthetic-bot-token",
+      ANTHROPIC_AUTH_TOKEN: "synthetic-bot-token",
+      SHOWTALK_TAISHI_MCP_TOKEN: "old-agent-token",
+      GITHUB_TOKEN: "not-forwarded",
+    }),
+    {
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "synthetic-anthropic-key",
+      CLAUDE_CONFIG_DIR: "/home/synthetic/.claude",
+      SHOWTALK_TAISHI_MCP_TOKEN: "agent-mcp-secret",
+    },
   );
 });

@@ -205,6 +205,87 @@ or its configured call name, resolves it back to the canonical ID, and checks
 the relationship and scope. An available or idle Koe that is not listed remains
 unreachable.
 
+## Claude Code adapter
+
+A Koe can be backed by Claude Code instead of Codex through
+`@anthropic-ai/claude-agent-sdk`. Declare an adapter with
+`type: claude-code` and point any Koe at it. Codex and Claude Koe can run side
+by side in one Gateway.
+
+```yaml
+adapters:
+  codex:
+    type: codex-app-server
+    command: "${CODEX_COMMAND}"
+    transport: stdio
+  claude:
+    type: claude-code
+    # Optional. Omit to use the binary bundled with the SDK.
+    # command: "/opt/claude/bin/claude"
+    model: sonnet
+    reasoning_effort: medium
+    permission_mode: default
+    allowed_tools:
+      - "Read"
+      - "Bash(npm test:*)"
+    approval_timeout_minutes: 30
+
+agents:
+  implementer:
+    adapter: codex
+    workspace:
+      path: "${IMPLEMENTER_WORKSPACE}"
+    slack:
+      channel_id: "${SLACK_CHANNEL_IMPLEMENTER}"
+    role: "Implementation Koe."
+
+  claude_reviewer:
+    adapter: claude
+    workspace:
+      path: "${REVIEWER_WORKSPACE}"
+    slack:
+      channel_id: "${SLACK_CHANNEL_CLAUDE_REVIEWER}"
+    role: "Review Koe backed by Claude Code."
+```
+
+| Field | Meaning |
+| --- | --- |
+| `command` | Optional explicit `claude` executable. Defaults to the SDK-bundled binary. |
+| `model` | Optional model ID or alias (`default`, `opus`, `sonnet`, `haiku`). |
+| `reasoning_effort` | Optional `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `permission_mode` | `default` (default), `acceptEdits`, or `plan`. `bypassPermissions` is deliberately not accepted. |
+| `allowed_tools` | Claude permission rules that skip Slack approval, such as `Read` or `Bash(npm test:*)`. |
+| `setting_sources` | Subset of `user`, `project`, `local`. Defaults to all three, so `CLAUDE.md` and the operator's Claude settings apply. |
+| `max_turns` | Optional per-turn limit on agentic turns. |
+| `approval_timeout_minutes` | How long a Slack approval card waits. Defaults to 30. |
+| `env_passthrough` | Extra environment variable names for the child process. |
+
+Authentication reuses the host. The child receives a filtered environment that
+includes `HOME`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, and
+`CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`, so an existing
+`claude login` works. Slack tokens never reach it. `taishi doctor` checks that
+the Agent SDK loads, that an explicit `command` runs, and that any configured
+Claude session exists. `npm run smoke:claude-mcp` runs a real Claude turn
+through the Gateway and its MCP endpoint without connecting to Slack.
+
+Behavior notes:
+
+- Each Slack turn is one Agent SDK query that resumes the persistent Claude
+  session (a UUID). Sessions survive a Gateway restart.
+  `adapter_session_id` may name an existing Claude session UUID, for
+  `conversation_scope: channel` only. `taishi bind` is Codex-only.
+- Tool permission prompts appear as Slack approval cards: Allow once, Allow
+  session, Deny, Cancel. Allow session adds a session-scoped rule and is never
+  written to Claude settings. Text approvals work as for Codex.
+- The Gateway MCP tools are mounted as the `showtalk_taishi` MCP server.
+- Images are passed as native image input; audio arrives as a local path
+  notice. The `AskUserQuestion` tool is disabled, so questions appear in the
+  reply text. Structured choices and the workspace-git exact-plan flow are
+  Codex-only for now.
+- Interrupt and Status work. The Management UI model list shows the aliases
+  `default`, `opus`, `sonnet`, and `haiku`.
+
 ## Management UI
 
 When `gateway.admin_ui.enabled` is true, open the configured loopback address,
