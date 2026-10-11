@@ -15,6 +15,11 @@ import type { CoreStateSnapshot, QueuedDelegationJob } from "../core/index.js";
 import type { PersistedPermissionApprovalCard } from "../slack/permission-card-tracker.js";
 import type { PersistedWorkspaceGitAutonomyActivation } from "../approvals/workspace-git-autonomy-control.js";
 import {
+  emptyWorkStoppageMonitorSnapshot,
+  validateWorkStoppageMonitorSnapshot,
+  type WorkStoppageMonitorSnapshot,
+} from "../diagnostics/work-stoppage-monitor.js";
+import {
   validateGatewayRestartReceipt,
   type RecentGatewayRestartReceipt,
 } from "./gateway-restart-replay-guard.js";
@@ -30,6 +35,8 @@ export interface RuntimeState {
   workspaceGitAutonomyActivations?: readonly PersistedWorkspaceGitAutonomyActivation[];
   /** Monotonic generation preventing config-revision ABA from reviving authority. */
   workspaceGitAutonomyRevisionState?: WorkspaceGitAutonomyRevisionState;
+  /** Payload-free incident deduplication state retained across worker restarts. */
+  workStoppageMonitor?: WorkStoppageMonitorSnapshot;
 }
 
 export interface WorkspaceGitAutonomyRevisionState {
@@ -55,6 +62,7 @@ export function emptyRuntimeState(): RuntimeState {
     recentGatewayRestartReceipts: [],
     permissionApprovalCards: [],
     workspaceGitAutonomyActivations: [],
+    workStoppageMonitor: emptyWorkStoppageMonitorSnapshot(),
   };
 }
 
@@ -338,11 +346,24 @@ function validateRuntimeState(value: unknown): RuntimeState {
     (runtime.workspaceGitAutonomyRevisionState !== undefined &&
       !isWorkspaceGitAutonomyRevisionState(
         runtime.workspaceGitAutonomyRevisionState,
-      ))
+      )) ||
+    (runtime.workStoppageMonitor !== undefined &&
+      !isWorkStoppageMonitorSnapshot(runtime.workStoppageMonitor))
   ) {
     throw new Error("Unsupported or corrupt ShowTalk Taishi runtime state");
   }
   return value as RuntimeState;
+}
+
+function isWorkStoppageMonitorSnapshot(
+  value: unknown,
+): value is WorkStoppageMonitorSnapshot {
+  try {
+    validateWorkStoppageMonitorSnapshot(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isQueuedDelegationJob(value: unknown): value is QueuedDelegationJob {

@@ -44,6 +44,22 @@ URL. Applying new scopes to an existing App may require reauthorization.
 Configured human approvers belong in `slack.approver_user_ids` or its
 environment-backed value.
 
+### Work-attention notification channel
+
+To feed an existing Slack `message` event integration, configure one channel:
+
+```yaml
+slack:
+  work_attention_channel_id: "${SLACK_WORK_ATTENTION_CHANNEL_ID}"
+```
+
+The referenced environment variable contains the existing channel ID. Invite
+the existing ShowTalk bot to that channel. This uses the App's existing
+`chat:write` capability; it adds no webhook, API token, OAuth scope, destination
+credential, or approval authority. If the setting is omitted, the monitor emits
+only its local machine-readable audit event.
+
+
 ## Conversation mapping
 
 `agents.<id>.slack.conversation_scope` controls backend-thread mapping:

@@ -9,6 +9,7 @@ import { ApprovalTextStore } from "../../src/slack/approval-text-store.js";
 import { SlackFrontend, type SlackFrontendOptions } from "../../src/slack/frontend.js";
 import { createInteractionAudit } from "../../src/slack/interaction-audit.js";
 import { WorkspaceGitApprovalDetailsStore } from "../../src/slack/user-input-blocks.js";
+import { WORK_ATTENTION_SLACK_MARKER } from "../../src/slack/work-attention-notification.js";
 
 // All Slack and Gateway operations below are in-memory fakes. No App is
 // started, files downloaded, private broker connected, or work executed.
@@ -185,6 +186,93 @@ function registerNative(h: ReturnType<typeof harness>, decisions: readonly Agent
   h.gateway.pending.add(nativeId);
   return route;
 }
+
+test("work attention uses the stable new-root Slack message contract", async () => {
+  const h = harness({ workAttentionChannelId: "CATTENTION" });
+  await h.frontend.presentWorkAttention({
+    component: "showtalk.work_attention",
+    version: 1,
+    event: "attention_required",
+    incidentRef: "0123456789abcdef",
+    occurrence: 1,
+    agentId: "test-koe",
+    sourceChannelId: "CSOURCE",
+    sourceRootThreadTs: "1791221976.640199",
+    state: "waiting_for_input",
+    reason: "hidden_approval_wait",
+    lastProgressAt: "2026-10-06T00:00:00.000Z",
+    detectedAt: "2026-10-06T00:00:30.000Z",
+    nextAction: "check_slack_controls",
+  });
+
+  assert.deepEqual(h.app.posts, [{
+    channel: "CATTENTION",
+    mrkdwn: false,
+    text: [
+      WORK_ATTENTION_SLACK_MARKER,
+      "incident_id: 0123456789abcdef",
+      "status: detected",
+      "target_koe: test-koe",
+      "source_thread: CSOURCE/1791221976.640199",
+      "reason: hidden_approval_wait",
+      "last_progress_at: 2026-10-06T00:00:00.000Z",
+      "next_safe_action: check_slack_controls",
+    ].join("\n"),
+  }]);
+  assert.equal("thread_ts" in h.app.posts[0]!, false);
+
+  await h.app.message(h.app.posts[0]!.text as string, { bot_id: "BSHOWTALK" });
+  assert.equal(h.gateway.humanTurns, 0, "the bot notification never starts a Codex turn");
+});
+
+test("work attention recovery preserves the incident ID and omits unavailable source", async () => {
+  const h = harness({ workAttentionChannelId: "CATTENTION" });
+  await h.frontend.presentWorkAttention({
+    component: "showtalk.work_attention",
+    version: 1,
+    event: "recovered",
+    incidentRef: "fedcba9876543210",
+    occurrence: 2,
+    agentId: "test-koe",
+    state: "running",
+    reason: "connection_lost",
+    lastProgressAt: "2026-10-06T01:00:00.000Z",
+    detectedAt: "2026-10-06T01:00:10.000Z",
+    nextAction: "no_action_recovered",
+  });
+  const text = String(h.app.posts[0]?.text);
+  assert.match(text, /^SHOWTALK_WORK_ATTENTION_V1\nincident_id: fedcba9876543210\nstatus: recovered\n/u);
+  assert.match(text, /\nsource_thread: unavailable\n/u);
+});
+
+test("Gateway drain waits for an in-flight work-attention Slack post", async () => {
+  const h = harness({ workAttentionChannelId: "CATTENTION" });
+  const barrier = deferred();
+  h.app.postBarrier = barrier.promise;
+  const posting = h.frontend.presentWorkAttention({
+    component: "showtalk.work_attention",
+    version: 1,
+    event: "attention_required",
+    incidentRef: "0123456789abcdef",
+    occurrence: 1,
+    agentId: "test-koe",
+    state: "tool_running",
+    reason: "tool_progress_stall_suspected",
+    lastProgressAt: "2026-10-06T00:00:00.000Z",
+    detectedAt: "2026-10-06T01:00:00.000Z",
+    nextAction: "inspect_tool",
+  });
+  assert.equal(h.frontend.isIdle(), false);
+  let drained = false;
+  const waiting = h.frontend.waitForIdle().then(() => { drained = true; });
+  await Promise.resolve();
+  assert.equal(drained, false);
+
+  barrier.resolve();
+  await posting;
+  await waiting;
+  assert.equal(h.frontend.isIdle(), true);
+});
 
 test("text native allow-once and rejection use the same single-use button handlers", async () => {
   for (const attributed of [false, true]) {

@@ -12,6 +12,7 @@ import type {
   WorkspaceGitApprovalPlan,
 } from "../core/index.js";
 import type { RuntimeSlackAttachment } from "../mcp/workspace-attachments.js";
+import type { WorkAttentionNotification } from "../diagnostics/work-stoppage-monitor.js";
 import type {
   PermissionApprovalCoordinator,
   PermissionApprovalPresentation,
@@ -129,6 +130,7 @@ import {
   parseWorkspaceGitAutonomyToken,
   type WorkspaceGitAutonomyCardOperation,
 } from "./workspace-git-autonomy-blocks.js";
+import { workAttentionSlackPostArguments } from "./work-attention-notification.js";
 
 export interface SlackFrontendOptions {
   readonly appToken: string;
@@ -165,6 +167,7 @@ export interface SlackFrontendOptions {
   /** Composition/test dependency; never derived from a Slack message. */
   readonly approvalTextAttributionProfile?: ApprovalTextAttributionProfile;
   readonly interactionAudit?: InteractionAudit;
+  readonly workAttentionChannelId?: string;
 }
 
 export interface HumanSlackMessage {
@@ -258,6 +261,7 @@ export class SlackFrontend {
   readonly #approvalTextAttributionProfile: ApprovalTextAttributionProfile | undefined;
   readonly #now: () => number;
   readonly #interactionAudit: InteractionAudit;
+  readonly #workAttentionChannelId: string | undefined;
   #activeMessageHandlers = 0;
   #restartPending = false;
   #stopPromise: Promise<void> | undefined;
@@ -292,6 +296,7 @@ export class SlackFrontend {
       ? undefined : Object.freeze({ ...options.approvalTextAttributionProfile });
     this.#interactionAudit = options.interactionAudit ??
       createInteractionAudit(console.info, this.#now);
+    this.#workAttentionChannelId = options.workAttentionChannelId;
     this.#choiceContinuations = new StructuredChoiceContinuationStore(this.#now);
     this.#presentationsByChannel = options.presentationsByChannel ?? {};
     this.#durableEventLedger = options.durableEventLedger;
@@ -346,6 +351,28 @@ export class SlackFrontend {
   waitForIdle(): Promise<void> {
     if (this.isIdle()) return Promise.resolve();
     return new Promise<void>((resolve) => this.#idleWaiters.add(resolve));
+  }
+
+  async presentWorkAttention(
+    notification: WorkAttentionNotification,
+  ): Promise<void> {
+    if (this.#workAttentionChannelId === undefined) {
+      throw new Error("Slack work-attention channel is not configured");
+    }
+    const finishHandler = this.#beginSlackHandler();
+    try {
+      const result = await this.#app.client.chat.postMessage(
+        workAttentionSlackPostArguments(
+          this.#workAttentionChannelId,
+          notification,
+        ),
+      );
+      if (typeof result.ts !== "string") {
+        throw new Error("Slack did not return a timestamp for the work-attention message");
+      }
+    } finally {
+      finishHandler();
+    }
   }
 
   #beginSlackHandler(): () => void {
