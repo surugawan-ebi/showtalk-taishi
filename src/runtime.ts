@@ -46,6 +46,7 @@ import {
   type RuntimeSlackPort,
 } from "./mcp/index.js";
 import { SlackFrontend } from "./slack/frontend.js";
+import type { SlackConnectionStatus } from "./slack/connection-health.js";
 import {
   APPROVAL_DELIVERY_BUILD_IDENTITY,
   createInteractionAudit,
@@ -96,6 +97,7 @@ export interface RunningTaishi {
   workspaceGitAutonomyStatuses(): readonly WorkspaceGitAutonomyStatus[];
   start(): Promise<void>;
   beginRestart(): void;
+  slackConnectionStatus(): SlackConnectionStatus | "unknown";
   waitForIdle(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -119,6 +121,7 @@ export interface RuntimeAgentModelSettings {
 export interface TaishiFrontend extends RuntimeSlackPort {
   start(): Promise<void>;
   beginRestart(): void;
+  connectionStatus?(): SlackConnectionStatus | "unknown";
   isIdle(): boolean;
   waitForIdle(): Promise<void>;
   stop(): Promise<void>;
@@ -662,6 +665,7 @@ async function createLockedRuntime(
         mcpService.beginDrain();
         mcpServer.beginDrain();
       },
+      slackConnectionStatus: () => frontend.connectionStatus?.() ?? "unknown",
       waitForIdle: async () => {
         while (true) {
           await Promise.all([

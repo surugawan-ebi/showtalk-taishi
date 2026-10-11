@@ -1,4 +1,4 @@
-import { App } from "@slack/bolt";
+import { App, SocketModeReceiver } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import type { WebClient } from "@slack/web-api";
 
@@ -131,6 +131,10 @@ import {
   type WorkspaceGitAutonomyCardOperation,
 } from "./workspace-git-autonomy-blocks.js";
 import { workAttentionSlackPostArguments } from "./work-attention-notification.js";
+import {
+  SlackConnectionHealth,
+  type SlackConnectionStatus,
+} from "./connection-health.js";
 
 export interface SlackFrontendOptions {
   readonly appToken: string;
@@ -262,6 +266,7 @@ export class SlackFrontend {
   readonly #now: () => number;
   readonly #interactionAudit: InteractionAudit;
   readonly #workAttentionChannelId: string | undefined;
+  readonly #connectionHealth: SlackConnectionHealth | undefined;
   #activeMessageHandlers = 0;
   #restartPending = false;
   #stopPromise: Promise<void> | undefined;
@@ -309,12 +314,18 @@ export class SlackFrontend {
           }),
     });
     this.#defaultNotificationUserId = options.approverUserIds[0];
+    const receiver = app === undefined
+      ? new SocketModeReceiver({ appToken: options.appToken })
+      : undefined;
     this.#app = app ?? new App({
       token: options.botToken,
       appToken: options.appToken,
       socketMode: true,
+      ...(receiver === undefined ? {} : { receiver }),
       ignoreSelf: true,
     });
+    this.#connectionHealth = receiver === undefined
+      ? undefined : new SlackConnectionHealth(receiver.client);
     this.#delegationProjector = new SlackDelegationProjector(
       this.#app.client,
       this.#presentationsByChannel,
@@ -326,17 +337,29 @@ export class SlackFrontend {
   }
 
   async start(): Promise<void> {
-    await this.#app.start();
+    this.#connectionHealth?.start();
+    try {
+      await this.#app.start();
+    } catch (error) {
+      this.#connectionHealth?.stop();
+      throw error;
+    }
     await this.#recoverPermissionApprovalCards();
   }
 
   async stop(): Promise<void> {
+    this.#connectionHealth?.stop();
     this.#stopPromise ??= Promise.resolve(this.#app.stop()).then(() => undefined);
     await this.#stopPromise;
   }
 
   beginRestart(): void {
     this.#restartPending = true;
+    this.#connectionHealth?.stop();
+  }
+
+  connectionStatus(): SlackConnectionStatus | "unknown" {
+    return this.#connectionHealth?.status() ?? "unknown";
   }
 
   /** Adapter-side terminal notification fence; never performs a Slack write. */

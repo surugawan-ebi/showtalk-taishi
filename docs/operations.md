@@ -298,8 +298,17 @@ request IDs, logs, or credentials. Notification-delivery failure emits a
 separate fixed local record and is not retried automatically. No webhook, Slack
 scope, approval authority, interrupt, restart, or automatic approval is added.
 
-
 ## Restart and service operation
+
+The Worker observes Socket Mode connection, close, and reconnect events and
+checks the live socket every 30 seconds. It writes payload-free
+`showtalk.slack_connection` transitions (`connected`, `disconnected`,
+`degraded`, `recovered`) once per change. A disconnection lasting three minutes
+becomes `degraded`. The authenticated localhost `/api/health` response includes
+`slack_connection` and reports `status: "degraded"` for that condition. This
+distinguishes a live Gateway process from a usable Slack connection. Detection
+does not post to Slack or automatically restart the Worker; investigate network
+and SDK errors before a human requests a restart.
 
 Use the public [Gateway restart and approval-bridge verification](gateway-restart-verification.md)
 gate whenever restart or structured-input behavior changes.
