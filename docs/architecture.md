@@ -359,6 +359,18 @@ conversation's ID before its next turn so completed work added from Codex App
 can be incorporated. This is history shared within one mapping key, not live
 App-to-Slack stream mirroring or automatic sharing across Slack roots.
 
+### Claude Code adapter
+
+The `claude-code` adapter (`src/adapters/claude/`) implements the same
+`AgentAdapter` boundary through `@anthropic-ai/claude-agent-sdk`. Each Slack
+turn is one SDK query that resumes the persistent Claude session, so there is no
+long-lived protocol process. Tool permission callbacks are projected as Slack
+approval requests, the Gateway MCP tools are mounted as the `showtalk_taishi`
+MCP server, and the child environment is filtered by the runtime. Structured
+choices and the workspace-git exact-plan flow are not yet advertised as
+capabilities; core degrades accordingly. See
+[Configuration](configuration.md#claude-code-adapter).
+
 ### Session registry and runtime state
 
 The session registry maintains the minimum durable state needed for recovery:

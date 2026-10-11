@@ -37,6 +37,13 @@ const reasoningEffortSchema = z
     (value) => !/[\u0000-\u001f\u007f]/u.test(value),
     "Reasoning effort must not contain control characters",
   );
+const claudeReasoningEffortSchema = z.enum([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 const environmentVariableNameSchema = z
   .string()
   .min(1)
@@ -197,6 +204,76 @@ const slackPresentationSchema = z
     "Configure either icon_url or icon_emoji, not both",
   );
 
+const envPassthroughSchema = z
+  .array(environmentVariableNameSchema)
+  .max(64)
+  .refine(
+    (names) => new Set(names).size === names.length,
+    "Koe environment pass-through names must be unique",
+  )
+  .default([]);
+
+const codexAdapterSchema = z
+  .object({
+    type: z.literal("codex-app-server"),
+    command: z.string().min(1),
+    transport: z.literal("stdio"),
+    model: modelIdSchema.optional(),
+    reasoning_effort: reasoningEffortSchema.optional(),
+    approval_policy: z
+      .enum(["on-request", "never"])
+      .default("on-request"),
+    approvals_reviewer: z
+      .enum(["user", "auto_review", "guardian_subagent"])
+      .default("auto_review"),
+    live_acceptance_mcp_probe: z.boolean().optional(),
+    sandbox: z
+      .enum(["read-only", "workspace-write", "danger-full-access"])
+      .default("workspace-write"),
+    env_passthrough: envPassthroughSchema,
+  })
+  .strict();
+
+const claudeToolRuleSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .refine(
+    (value) => value === value.trim(),
+    "Tool rule must not have surrounding whitespace",
+  )
+  .refine(
+    (value) => !/[\u0000-\u001f\u007f]/u.test(value),
+    "Tool rule must not contain control characters",
+  );
+
+/**
+ * Claude Code through the Claude Agent SDK. `bypassPermissions` is
+ * intentionally not accepted: every gated tool call must reach Slack.
+ */
+const claudeAdapterSchema = z
+  .object({
+    type: z.literal("claude-code"),
+    /** Optional explicit `claude` executable; the SDK-bundled binary otherwise. */
+    command: z.string().min(1).optional(),
+    model: modelIdSchema.optional(),
+    reasoning_effort: claudeReasoningEffortSchema.optional(),
+    permission_mode: z.enum(["default", "acceptEdits", "plan"]).default("default"),
+    allowed_tools: z.array(claudeToolRuleSchema).max(128).default([]),
+    setting_sources: z
+      .array(z.enum(["user", "project", "local"]))
+      .max(3)
+      .refine(
+        (sources) => new Set(sources).size === sources.length,
+        "Claude setting sources must be unique",
+      )
+      .default(["user", "project", "local"]),
+    max_turns: z.number().int().min(1).max(1_000).optional(),
+    approval_timeout_minutes: z.number().int().min(1).max(24 * 60).default(30),
+    env_passthrough: envPassthroughSchema,
+  })
+  .strict();
+
 export const taishiConfigSchema = z
   .object({
     version: z.literal(1),
@@ -232,33 +309,7 @@ export const taishiConfigSchema = z
     adapters: z
       .record(
         z.string().min(1),
-        z
-          .object({
-            type: z.literal("codex-app-server"),
-            command: z.string().min(1),
-            transport: z.literal("stdio"),
-            model: modelIdSchema.optional(),
-            reasoning_effort: reasoningEffortSchema.optional(),
-            approval_policy: z
-              .enum(["on-request", "never"])
-              .default("on-request"),
-            approvals_reviewer: z
-              .enum(["user", "auto_review", "guardian_subagent"])
-              .default("auto_review"),
-            live_acceptance_mcp_probe: z.boolean().optional(),
-            sandbox: z
-              .enum(["read-only", "workspace-write", "danger-full-access"])
-              .default("workspace-write"),
-            env_passthrough: z
-              .array(environmentVariableNameSchema)
-              .max(64)
-              .refine(
-                (names) => new Set(names).size === names.length,
-                "Koe environment pass-through names must be unique",
-              )
-              .default([]),
-          })
-          .strict(),
+        z.discriminatedUnion("type", [codexAdapterSchema, claudeAdapterSchema]),
       )
       .refine((adapters) => Object.keys(adapters).length > 0, "At least one adapter is required"),
     agents: z
@@ -292,7 +343,12 @@ export const taishiConfigSchema = z
   .strict()
   .superRefine((config, context) => {
     for (const [name, adapter] of Object.entries(config.adapters)) {
-      if (adapter.live_acceptance_mcp_probe !== true) continue;
+      if (
+        adapter.type !== "codex-app-server" ||
+        adapter.live_acceptance_mcp_probe !== true
+      ) {
+        continue;
+      }
       if (adapter.approval_policy !== "on-request") {
         context.addIssue({
           code: "custom",
@@ -336,6 +392,18 @@ export const taishiConfigSchema = z
           code: "custom",
           path: ["agents", name, "adapter"],
           message: `Unknown adapter: ${agent.adapter}`,
+        });
+      }
+      const configuredAdapter = config.adapters[agent.adapter];
+      if (
+        configuredAdapter?.type === "claude-code" &&
+        agent.reasoning_effort !== undefined &&
+        !claudeReasoningEffortSchema.safeParse(agent.reasoning_effort).success
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["agents", name, "reasoning_effort"],
+          message: "Unsupported Claude reasoning effort",
         });
       }
       const existing = channels.get(agent.slack.channel_id);
@@ -450,3 +518,6 @@ export const taishiConfigSchema = z
 
 export type TaishiConfig = z.infer<typeof taishiConfigSchema>;
 export type PolicyDecision = z.infer<typeof policyDecisionSchema>;
+export type AdapterConfig = TaishiConfig["adapters"][string];
+export type CodexAdapterConfig = Extract<AdapterConfig, { type: "codex-app-server" }>;
+export type ClaudeAdapterConfig = Extract<AdapterConfig, { type: "claude-code" }>;

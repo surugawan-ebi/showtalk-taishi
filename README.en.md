@@ -26,8 +26,8 @@
 
 ShowTalk Taishi is a local-first, self-hosted Slack front end and switchboard
 for AI coding agents. It makes durable Codex threads available as a daily Slack
-control surface while preserving an `AgentAdapter` boundary for future Claude
-Code, Gemini CLI, and other integrations.
+control surface while preserving an `AgentAdapter` boundary for Claude Code, Gemini CLI, and other
+integrations.
 
 The name is inspired by Prince Shōtoku, traditionally associated in Japan with
 listening to several people at once. Taishi calls each persistent AI identity a
@@ -65,15 +65,16 @@ Slack is the human interface, Koe directory, activity log, and approval
 surface. Koe-to-Koe messages travel directly through the Gateway instead of
 Slack events, making routing explicit and avoiding accidental bot loops.
 
-The first implemented adapter runs Codex App Server over stdio. Slack connects
-through Socket Mode, so the host Mac or Linux machine does not need a public
-HTTP server.
+Implemented adapters run Codex App Server over stdio and Claude Code through
+the Agent SDK. Slack connects through Socket Mode, so the host Mac or Linux
+machine does not need a public HTTP server.
 
 ## Highlights
 
 | | Capability | What it provides |
 | --- | --- | --- |
 | 🗣️ | **Persistent Koe** | Reuse durable Codex threads with channel-wide or Slack-thread-scoped mapping |
+| 🤖 | **Multiple backends** | Choose Codex App Server or Claude Code (`claude-code` adapter) per Koe |
 | 🔀 | **Koe consultations** | Direct `agent.send` visits protected by allowlists, scopes, hop limits, and busy handling |
 | ✅ | **Slack-native decisions** | Clearly separated command, file-change, ordinary-choice, non-Git external-action, and exact Git-plan flows |
 | 📎 | **Images and audio** | Native multi-image input, safe audio-file ingress, origin-bound artifact replies, and inline generated-image projection |
@@ -107,7 +108,7 @@ workspace.
 
 - macOS or Linux
 - Node.js 22 or newer
-- an installed and authenticated `codex` CLI
+- an installed and authenticated `codex` CLI, or Claude Code authentication (for example `claude login`)
 - permission to create and install a Slack App
 
 ### 1. Install

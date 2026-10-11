@@ -2,6 +2,7 @@
 
 import { dirname, join, resolve } from "node:path";
 
+import { doctorClaudeAdapter } from "./adapters/claude/doctor.js";
 import { CodexAppServerClient } from "./adapters/codex/app-server-client.js";
 import {
   parseCliArguments,
@@ -99,6 +100,10 @@ async function doctor(path: string, offline: boolean): Promise<void> {
     checks.push("workspace-git:manual-configuration-metadata");
   }
   for (const [name, adapter] of Object.entries(config.adapters)) {
+    if (adapter.type === "claude-code") {
+      checks.push(...(await doctorClaudeAdapter(config, name, adapter)));
+      continue;
+    }
     let client: CodexAppServerClient | undefined;
     try {
       client = await CodexAppServerClient.spawn({

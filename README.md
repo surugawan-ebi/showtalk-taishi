@@ -26,7 +26,7 @@
 
 ShowTalk Taishiは、AIコーディングエージェントのためのローカルファーストな
 Slackフロントエンド兼スイッチボードです。Codexの永続スレッドを日常的に
-Slackから操作しながら、将来のClaude Code、Gemini CLIなども接続できる
+Slackから操作しながら、Claude Codeにも対応し、Gemini CLIなども接続できる
 `AgentAdapter`境界を保ちます。
 
 名前の由来は、複数人の声を同時に聞き分けたと伝えられる聖徳太子です。
@@ -91,14 +91,16 @@ Slackは、人間との会話、Koeのディレクトリ、活動ログ、承認
 Koe間のメッセージはSlackイベントを経由せず、Gatewayが直接配送するため、
 ルーティングが明示され、bot同士の誤反応ループを避けられます。
 
-最初の実装済みアダプターはCodex App Serverをstdioで使用します。Slackとは
-Socket Modeで接続するため、ホストのMacやLinuxに公開HTTPサーバーは不要です。
+実装済みアダプターは、stdioでCodex App Serverを使うものと、Agent SDK経由の
+Claude Codeです。SlackとはSocket Modeで
+接続するため、ホストのMacやLinuxに公開HTTPサーバーは不要です。
 
 ## 主な機能
 
 | | 機能 | 内容 |
 | --- | --- | --- |
 | 🗣️ | **永続するKoe** | チャンネル単位またはSlackスレッド単位で、Codexスレッドを継続利用 |
+| 🤖 | **複数のバックエンド** | KoeごとにCodex App ServerまたはClaude Code（`claude-code`アダプター）を選択 |
 | 🔀 | **Koe間の相談** | allowlist、scope、hop数、busy保護付きの`agent.send`で別Koeへ直接相談 |
 | ✅ | **Slackネイティブ確認** | コマンド、ファイル変更、通常選択、非Git外部操作、exact Git planをBlock Kitで明確に分離 |
 | 📎 | **画像・音声** | 複数画像のnative入力、音声ファイルの安全な受信、要求元スレッドに束縛された返信、インライン生成画像の投影 |
@@ -128,7 +130,7 @@ Koeへ渡され、理解や文字起こしはworkspaceで利用できる別tool�
 
 - macOSまたはLinux
 - Node.js 22以上
-- インストール・認証済みの`codex` CLI
+- インストール・認証済みの`codex` CLI、またはClaude Codeの認証（`claude login`など）
 - Slack Appを作成・インストールできる権限
 
 ### 1. インストール

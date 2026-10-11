@@ -49,6 +49,19 @@ adapters:
     # additional build/runtime variable this Koe really needs.
     env_passthrough: []
 
+  # Optional Claude Code adapter. Reuses an existing `claude login` on the host.
+  # Point a Koe at it with `adapter: claude`. bypassPermissions is not allowed.
+  # claude:
+  #   type: claude-code
+  #   # command: "${CLAUDE_COMMAND}"   # default: SDK-bundled binary
+  #   model: sonnet
+  #   reasoning_effort: medium
+  #   permission_mode: default         # default | acceptEdits | plan
+  #   allowed_tools: ["Read", "Bash(npm test:*)"]
+  #   setting_sources: [user, project, local]
+  #   approval_timeout_minutes: 30
+  #   env_passthrough: []
+
 agents:
   implementer:
     adapter: codex
@@ -115,6 +128,18 @@ agents:
   # set conversation_scope to slack_thread, and omit adapter_session_id. Each
   # Slack root then gets a separate backend thread; only the explicitly delegated
   # information plus fixed role/project sources in that hub are available.
+
+  # Claude Code-backed Koe (requires the `claude` adapter above).
+  # claude_reviewer:
+  #   adapter: claude
+  #   workspace:
+  #     path: "${IMPLEMENTER_WORKSPACE}"
+  #   slack:
+  #     channel_id: "${SLACK_CHANNEL_CLAUDE_REVIEWER}"
+  #     conversation_scope: channel
+  #     call_name: "Claude係"
+  #   role: |
+  #     You are a Claude Code-backed Koe in ShowTalk Taishi.
 
 permissions:
   defaults:
