@@ -318,6 +318,16 @@ approved restart pauses new work, drains accepted responses and active turns,
 flushes state, exits the Worker with a reserved restart code, and starts a fresh
 Worker using the latest local code.
 
+The Worker logs payload-free idle status for Gateway turns, Slack handlers, MCP
+operations, and MCP HTTP requests while draining. Every five minutes it also
+checks whether an idle waiter missed its final wakeup. It keeps waiting while
+any component has accepted work and never interrupts that work to accelerate
+replacement. Replacement occurs only after the normal shutdown and state
+flushing succeed. A blocked or failed shutdown does not request replacement and
+needs investigation. The restart does not use process signals to force
+replacement. Work-attention polling stops when draining begins so it cannot add
+new Slack posts to the pending work.
+
 For `gateway.restart`, the permission card is terminalized before authorization
 is released, a bounded replay receipt is persisted, and the restart callback is
 deferred until the MCP HTTP response has finished. A replacement Worker that

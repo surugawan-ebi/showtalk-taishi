@@ -97,6 +97,12 @@ export interface RunningTaishi {
   workspaceGitAutonomyStatuses(): readonly WorkspaceGitAutonomyStatus[];
   start(): Promise<void>;
   beginRestart(): void;
+  idleComponents(): {
+    readonly gateway: boolean;
+    readonly slack: boolean;
+    readonly mcpService: boolean;
+    readonly mcpServer: boolean;
+  };
   slackConnectionStatus(): SlackConnectionStatus | "unknown";
   waitForIdle(): Promise<void>;
   stop(): Promise<void>;
@@ -665,6 +671,12 @@ async function createLockedRuntime(
         mcpService.beginDrain();
         mcpServer.beginDrain();
       },
+      idleComponents: () => ({
+        gateway: gateway.isIdle(),
+        slack: frontend.isIdle(),
+        mcpService: mcpService.isIdle(),
+        mcpServer: mcpServer.isIdle(),
+      }),
       slackConnectionStatus: () => frontend.connectionStatus?.() ?? "unknown",
       waitForIdle: async () => {
         while (true) {
