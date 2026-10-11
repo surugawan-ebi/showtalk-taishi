@@ -6,6 +6,7 @@ import type { AgentApproval, AgentEvent, AgentUserInputResponse, Gateway, Worksp
 import { WorkspaceGitHumanDecisionBrokerError, type WorkspaceGitHumanDecisionInput } from "../../src/approvals/workspace-git-human-decision-broker.js";
 import { PermissionApprovalCoordinator } from "../../src/permissions/approval-coordinator.js";
 import { ApprovalTextStore } from "../../src/slack/approval-text-store.js";
+import { CHATGPT_ATTRIBUTION_PROFILE } from "../../src/slack/approval-text-command.js";
 import { SlackFrontend, type SlackFrontendOptions } from "../../src/slack/frontend.js";
 import { createInteractionAudit } from "../../src/slack/interaction-audit.js";
 import { WorkspaceGitApprovalDetailsStore } from "../../src/slack/user-input-blocks.js";
@@ -27,6 +28,7 @@ const nativeId = `codex:${uuid}`;
 const gitId = `codex-input:${uuid}`;
 const choiceId = `codex-choice:${uuid}`;
 const attributionProfile = { appId: "ACHATGPT", userId: "UCHATGPT" };
+const dotConnectorSourceUser = "UDOTSOURCE";
 
 type RecordValue = Record<string, unknown>;
 type Listener = (args: RecordValue) => Promise<void>;
@@ -172,6 +174,21 @@ function attributedCommand(command: string) {
         ] },
       ],
     },
+  };
+}
+
+function dotConnectorMessageFields(prompt: string): RecordValue {
+  const footer = `*使用して送信されました* <@${CHATGPT_ATTRIBUTION_PROFILE.userId}>`;
+  return {
+    user: dotConnectorSourceUser,
+    app_id: CHATGPT_ATTRIBUTION_PROFILE.appId,
+    text: `${prompt} ${footer}`,
+    blocks: [
+      { type: "rich_text", elements: [
+        { type: "rich_text_section", elements: [{ type: "text", text: prompt }] },
+      ] },
+      { type: "context", elements: [{ type: "mrkdwn", text: footer, verbatim: false }] },
+    ],
   };
 }
 
@@ -420,6 +437,80 @@ test("restart and unregistered cards keep text approvals inert", async () => {
   restarted.frontend.beginRestart();
   await restarted.app.message(`承認 ${nativeId}`);
   assert.equal(restarted.gateway.approvals.length, 0);
+});
+
+test("dot-origin notification suppression is per turn while approval routing stays bound", async () => {
+  const dot = harness();
+  dot.gateway.eventToProject = { type: "message.completed", text: "dot final answer" };
+  const dotFields = dotConnectorMessageFields("dot request");
+  const dotTurn = dot.app.message(dotFields.text as string, dotFields);
+  await Promise.race([
+    dot.gateway.projected.promise,
+    dotTurn.then(() => { throw new Error("dot turn completed before projection"); }),
+  ]);
+  dot.gateway.finishTurn.resolve();
+  await dotTurn;
+  assert.ok([...dot.app.posts, ...dot.app.updates].every(
+    (call) => !String(call.text).includes(`<@${dotConnectorSourceUser}>`),
+  ));
+
+  // A new frontend/projector for a later human turn must not inherit a
+  // thread-level suppression decision from the preceding dot turn.
+  const human = harness();
+  human.gateway.eventToProject = { type: "message.completed", text: "human final answer" };
+  const humanTurn = human.app.message("direct human follow-up", { user: "U1" });
+  await Promise.race([
+    human.gateway.projected.promise,
+    humanTurn.then(() => { throw new Error("human turn completed before projection"); }),
+  ]);
+  human.gateway.finishTurn.resolve();
+  await humanTurn;
+  assert.ok([...human.app.posts, ...human.app.updates].some(
+    (call) => String(call.text).includes("<@U1>"),
+  ));
+
+  const audit: string[] = [];
+  const approval = harness({ interactionAudit: (event) => {
+    if (event.event === "choice.request_received" || event.event === "choice.card_posted" ||
+        event.event === "choice.controls_attached") audit.push(event.event);
+  } });
+  approval.gateway.eventToProject = {
+    type: "choice.requested",
+    requestId: choiceId,
+    expiresAt: new Date(expiresAt).toISOString(),
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "Test action",
+      prompt: "Target: synthetic target\nScope: no-op test\nImpact: no external writes",
+      allowsOther: false,
+      options: [
+        { id: "option_1", label: "外部操作を承認（Git承認ではありません）", description: "Confirm" },
+        { id: "option_2", label: "外部操作を拒否・保留", description: "Reject" },
+      ],
+    },
+  };
+  const approvalFields = dotConnectorMessageFields("approval request");
+  const approvalTurn = approval.app.message(approvalFields.text as string, approvalFields);
+  await Promise.race([
+    approval.gateway.projected.promise,
+    approvalTurn.then(() => { throw new Error("approval turn completed before projection"); }),
+  ]);
+  const displayed = approval.store.get(choiceId);
+  assert.ok(displayed);
+  assert.equal(displayed.kind, "external");
+  assert.equal(displayed.routing.responderUserId, dotConnectorSourceUser);
+  assert.ok([
+    ...approval.app.posts,
+    ...approval.app.updates,
+  ].every((call) =>
+    !String(call.text).includes(`<@${dotConnectorSourceUser}>`) &&
+    !JSON.stringify(call.blocks ?? []).includes(`<@${dotConnectorSourceUser}>`),
+  ));
+  assert.deepEqual(audit, ["choice.request_received", "choice.card_posted", "choice.controls_attached"]);
+  approval.gateway.finishTurn.resolve();
+  await approvalTurn;
 });
 
 async function projectChoice(h: ReturnType<typeof harness>, sourceUser = user, ordinary = false) {

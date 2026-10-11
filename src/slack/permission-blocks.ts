@@ -15,12 +15,13 @@ export interface PermissionActionValue {
 
 export function buildPermissionApprovalBlocks(
   request: PermissionApprovalPresentation,
+  mentionSourceUser = true,
 ): KnownBlock[] {
   const value = JSON.stringify({
     requestId: request.requestId,
     channelId: request.sourceChannelId,
   } satisfies PermissionActionValue);
-  const heading = `${userMention(request.sourceSlackUserId)}*${escapeMrkdwn(request.sourceAgentId)} Koe requests permission*\n`;
+  const heading = `${mentionSourceUser ? userMention(request.sourceSlackUserId) : ""}*${escapeMrkdwn(request.sourceAgentId)} Koe requests permission*\n`;
   return [
     {
       type: "section",

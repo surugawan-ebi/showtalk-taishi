@@ -212,6 +212,9 @@ export class SlackDelegationProjector {
               // Keep the authenticated human bound to structured requests,
               // but do not notify them for ordinary Koe-to-Koe activity.
               mentionSourceUserInTurnMessages: false,
+              // Delegated structured choices retain the established ping;
+              // dot-origin turns set this policy explicitly in SlackFrontend.
+              mentionSourceUserInActionableMessages: true,
             }),
         presentation: presentationForChannel(
           this.#presentations,

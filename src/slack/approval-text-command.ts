@@ -20,7 +20,7 @@ export interface ApprovalTextAttributionProfile {
 // These are public application/attribution identifiers, never approver IDs or
 // proof of who authored a message. Unknown installations fail closed. Changes
 // require a deliberate profile update; never learn this profile from a reply.
-const CHATGPT_ATTRIBUTION_PROFILE: ApprovalTextAttributionProfile = Object.freeze({
+export const CHATGPT_ATTRIBUTION_PROFILE: ApprovalTextAttributionProfile = Object.freeze({
   appId: "A097V82EGG2",
   userId: "U0BMNN5TQMA",
 });
