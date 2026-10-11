@@ -248,6 +248,57 @@ With `slack_thread` scope, separate visits create separate backend threads in
 the target workspace. They receive the delegated request and configured
 workspace sources, but not automatic memory from other Slack roots.
 
+## Work-attention monitoring
+
+The Worker classifies Koe activity from adapter events, fixed interaction-audit
+events, explicit adapter connection observations, and a deterministic 15-second
+state reconciliation. A normal Codex transport close requests a worker restart
+immediately, so that path can stop reconciliation before the 30-second
+connection-loss grace and is not guaranteed to emit a connection-loss notice.
+It does not call a model. States distinguish queued, running, tool-running,
+waiting for input, failed, terminal, and unknown. A lack of text alone is not a
+failure: running work is only suspected after 15 minutes without a progress
+event, and a known tool call has a separate 60-minute threshold.
+Reconciliation treats a volatile persisted session status as unknown unless the
+current Worker also holds the process-local turn lease; stale `running` state is
+never used by itself as proof that work is active.
+
+Waiting input becomes visible only after the corresponding Slack controls event.
+A callback-bound request without that event for 30 seconds is classified as a
+hidden approval/input wait. Displayed waits, hidden waits, failure, observed
+connection loss, and recovery have separate incident reasons. Each reason is emitted once
+per incident; recovery closes it, and a later recurrence receives a new
+occurrence number. This bounded deduplication state survives Worker replacement.
+
+Every transition also remains available as a machine-readable log record with
+`component: "showtalk.work_attention"`. When
+`slack.work_attention_channel_id` is configured, the same transition is posted
+as a new Slack root message (never an edit, delete, or thread reply) using this
+exact eight-line contract:
+
+```text
+SHOWTALK_WORK_ATTENTION_V1
+incident_id: <16 lowercase hex characters>
+status: <detected|recovered>
+target_koe: <configured Koe ID>
+source_thread: <Slack channel ID>/<root timestamp>|unavailable
+reason: <fixed work-attention reason>
+last_progress_at: <ISO-8601 timestamp>
+next_safe_action: <fixed safe-action classifier>
+```
+
+Slack markdown is disabled. The incident ID identifies one occurrence and is
+the same on its detection and recovery messages; duplicate reconciliation does
+not repost it. A later recurrence has a new incident ID. Bot-authored Slack
+messages remain excluded from human-message routing, so this notification does
+not start a Codex turn.
+
+The contract never contains approval text, prompts, answers, tool input/output,
+request IDs, logs, or credentials. Notification-delivery failure emits a
+separate fixed local record and is not retried automatically. No webhook, Slack
+scope, approval authority, interrupt, restart, or automatic approval is added.
+
+
 ## Restart and service operation
 
 Use the public [Gateway restart and approval-bridge verification](gateway-restart-verification.md)

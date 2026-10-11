@@ -49,7 +49,16 @@ import { SlackFrontend } from "./slack/frontend.js";
 import {
   APPROVAL_DELIVERY_BUILD_IDENTITY,
   createInteractionAudit,
+  type InteractionAudit,
 } from "./diagnostics/approval-delivery-audit.js";
+import {
+  WorkMonitoringAgentAdapter,
+  WorkStoppageMonitor,
+  createWorkAttentionAudit,
+  emptyWorkStoppageMonitorSnapshot,
+  type KoeExecutionState,
+  type WorkAttentionNotification,
+} from "./diagnostics/work-stoppage-monitor.js";
 import { createSlackMessagePresentation } from "./slack/presentation.js";
 import { WorkspaceGitApprovalDetailsStore } from "./slack/user-input-blocks.js";
 import {
@@ -66,6 +75,7 @@ import {
 } from "./permissions/approval-coordinator.js";
 
 const MCP_TOKEN_ENV_VAR = "SHOWTALK_TAISHI_MCP_TOKEN";
+const WORK_MONITOR_RECONCILE_INTERVAL_MS = 15_000;
 
 export interface RunningTaishi {
   readonly gateway: Gateway;
@@ -114,6 +124,9 @@ export interface TaishiFrontend extends RuntimeSlackPort {
   stop(): Promise<void>;
   presentPermissionApproval(request: PermissionApprovalPresentation): Promise<void>;
   settlePermissionApproval(settlement: PermissionApprovalSettlement): Promise<void>;
+  presentWorkAttention?(
+    notification: WorkAttentionNotification,
+  ): Promise<void>;
   presentWorkspaceGitAutonomyControl?(
     agentId: string,
     operation: "enable" | "disable",
@@ -204,14 +217,6 @@ async function createLockedRuntime(
     throw new Error("Unsupported workspace-git autonomy control broker contract");
   }
   const registry = createRegistry(config, state);
-  const approvalDeliveryAudit = createInteractionAudit(
-    console.info,
-    Date.now,
-    {
-      workerId: randomUUID(),
-      buildIdentity: APPROVAL_DELIVERY_BUILD_IDENTITY,
-    },
-  );
   let recentGatewayRestartReceipts = [
     ...(state.recentGatewayRestartReceipts ?? []),
   ];
@@ -228,6 +233,8 @@ async function createLockedRuntime(
         ? legacyWorkspaceGitAutonomyRevisions(config)
         : [],
     );
+  let workStoppageMonitorSnapshot = state.workStoppageMonitor ??
+    emptyWorkStoppageMonitorSnapshot();
   let runtimeStateMutationQueue: Promise<void> = Promise.resolve();
   const saveCurrentRuntimeState = async () => {
     await stateStore.save({
@@ -237,6 +244,7 @@ async function createLockedRuntime(
       permissionApprovalCards,
       workspaceGitAutonomyActivations,
       workspaceGitAutonomyRevisionState,
+      workStoppageMonitor: workStoppageMonitorSnapshot,
     });
   };
   const mutateRuntimeState = (operation: () => Promise<void>): Promise<void> => {
@@ -245,6 +253,44 @@ async function createLockedRuntime(
     return task;
   };
   const persist = () => mutateRuntimeState(saveCurrentRuntimeState);
+  const workAttentionAudit = createWorkAttentionAudit(console.info);
+  let presentWorkAttention:
+    | ((notification: WorkAttentionNotification) => Promise<void>)
+    | undefined;
+  const workStoppageMonitor = new WorkStoppageMonitor({
+    snapshot: workStoppageMonitorSnapshot,
+    notify: async (notification) => {
+      workAttentionAudit.notify(notification);
+      if (config.slack.work_attention_channel_id === undefined) return;
+      if (presentWorkAttention === undefined) {
+        throw new Error("Slack work-attention presenter is unavailable");
+      }
+      await presentWorkAttention(notification);
+    },
+    observeDeliveryFailure: workAttentionAudit.observeDeliveryFailure,
+    onSnapshotChanged: (snapshot) => {
+      workStoppageMonitorSnapshot = snapshot;
+      void persist().catch((error: unknown) => {
+        console.error(
+          `ShowTalk Taishi could not persist work-attention state: ${
+            error instanceof Error ? error.message : "unknown error"
+          }`,
+        );
+      });
+    },
+  });
+  const rawApprovalDeliveryAudit = createInteractionAudit(
+    console.info,
+    Date.now,
+    {
+      workerId: randomUUID(),
+      buildIdentity: APPROVAL_DELIVERY_BUILD_IDENTITY,
+    },
+  );
+  const approvalDeliveryAudit: InteractionAudit = (input) => {
+    rawApprovalDeliveryAudit(input);
+    workStoppageMonitor.observeInteractionAudit(input);
+  };
   const gatewayRestartReplayGuard = new GatewayRestartReplayGuard({
     initialReceipts: recentGatewayRestartReceipts,
     persist: (receipts) =>
@@ -323,6 +369,7 @@ async function createLockedRuntime(
         env: codexChildEnvironment,
       });
       clients.push(client);
+      workStoppageMonitor.observeConnection(agentId, true);
       modelCatalogsByAgent.set(agentId, new CodexModelCatalog(client));
       const configuredModel = agentConfig.model ?? adapterConfig.model;
       const configuredReasoningEffort =
@@ -385,9 +432,10 @@ async function createLockedRuntime(
                 : { workspaceGitAutomationRevisions: workspaceGitAutomationSetting }),
             }),
       });
-      if (options.onRestartRequested !== undefined) {
-        client.onClose(() => options.onRestartRequested?.());
-      }
+      client.onClose(() => {
+        workStoppageMonitor.observeConnection(agentId, false);
+        options.onRestartRequested?.();
+      });
       codexAdapters.push(child);
       codexAdaptersByAgent.set(agentId, child);
       let children = childrenByAdapter.get(agentConfig.adapter);
@@ -395,7 +443,10 @@ async function createLockedRuntime(
         children = new Map();
         childrenByAdapter.set(agentConfig.adapter, children);
       }
-      children.set(agentId, child);
+      children.set(
+        agentId,
+        new WorkMonitoringAgentAdapter(agentId, child, workStoppageMonitor),
+      );
     }
     await persist();
     const adapters = [...childrenByAdapter].map(
@@ -448,6 +499,9 @@ async function createLockedRuntime(
       attachmentRoot,
       permissionApprovals,
       interactionAudit: approvalDeliveryAudit,
+      ...(config.slack.work_attention_channel_id === undefined
+        ? {}
+        : { workAttentionChannelId: config.slack.work_attention_channel_id }),
       workspaceGitApprovalDetailsStore,
       ...(workspaceGitDecisionBroker === undefined
         ? {}
@@ -500,6 +554,15 @@ async function createLockedRuntime(
     const frontend =
       options.frontendFactory?.(gateway, frontendOptions) ??
       new SlackFrontend(gateway, frontendOptions);
+    if (config.slack.work_attention_channel_id !== undefined) {
+      if (frontend.presentWorkAttention === undefined) {
+        throw new Error(
+          "Configured Slack work-attention channel requires frontend support",
+        );
+      }
+      presentWorkAttention = (notification) =>
+        frontend.presentWorkAttention!(notification);
+    }
     permissionApprovals.setPresenter((request) =>
       frontend.presentPermissionApproval(request),
     );
@@ -509,6 +572,12 @@ async function createLockedRuntime(
     mcpService.attach(router, gateway, frontend);
 
     let stopPromise: Promise<void> | undefined;
+    let workMonitorTimer: NodeJS.Timeout | undefined;
+    const reconcileWorkMonitor = () => {
+      workStoppageMonitor.reconcileRuntime(
+        buildWorkMonitorObservations(registry),
+      );
+    };
     return {
       gateway,
       router,
@@ -575,8 +644,20 @@ async function createLockedRuntime(
       },
       workspaceGitAutonomyStatuses: () =>
         frontend.workspaceGitAutonomyStatuses?.() ?? [],
-      start: async () => startFrontendWithStateRollback(frontend, stateStore, state),
+      start: async () => {
+        await startFrontendWithStateRollback(frontend, stateStore, state);
+        reconcileWorkMonitor();
+        workMonitorTimer ??= setInterval(
+          reconcileWorkMonitor,
+          WORK_MONITOR_RECONCILE_INTERVAL_MS,
+        );
+        workMonitorTimer.unref();
+      },
       beginRestart: () => {
+        if (workMonitorTimer !== undefined) {
+          clearInterval(workMonitorTimer);
+          workMonitorTimer = undefined;
+        }
         frontend.beginRestart();
         mcpService.beginDrain();
         mcpServer.beginDrain();
@@ -598,6 +679,10 @@ async function createLockedRuntime(
         }
       },
       stop: () => {
+        if (workMonitorTimer !== undefined) {
+          clearInterval(workMonitorTimer);
+          workMonitorTimer = undefined;
+        }
         stopPromise ??= shutdownRuntime({
           mcpService,
           mcpServer,
@@ -1307,6 +1392,91 @@ function normalizeSessionAfterRestart(
     updatedAt: now().toISOString(),
   };
 }
+
+export function buildWorkMonitorObservations(
+  registry: InMemoryAgentRegistry,
+): Array<{
+  readonly agentId: string;
+  readonly state: KoeExecutionState;
+  readonly sessionId?: string;
+  readonly sourceChannelId?: string;
+  readonly sourceRootThreadTs?: string;
+  readonly updatedAt?: string;
+}> {
+  const sessions = registry.listSessions();
+  return registry.listAgents().map((agent) => {
+    const active = registry.hasActiveAgentTurn(agent.id)
+      ? registry.getActiveSession(agent.id)
+      : undefined;
+    const latest = active ?? sessions
+      .filter((session) => session.agentId === agent.id)
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
+    const queuedJob = registry.listQueuedDelegations(agent.id)
+      .filter((job) => job.state === "queued")
+      .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[0];
+    const state = active !== undefined
+      ? workMonitorStateFromAgentStatus(active.status)
+      : queuedJob !== undefined
+      ? "queued"
+      : latest === undefined
+        ? "unknown"
+        : passiveWorkMonitorStateFromAgentStatus(latest.status);
+    return {
+      agentId: agent.id,
+      state,
+      ...(latest === undefined
+        ? {}
+        : { sessionId: latest.id }),
+      ...(state === "queued" && queuedJob !== undefined
+        ? { updatedAt: queuedJob.createdAt }
+        : latest === undefined
+          ? {}
+          : { updatedAt: latest.updatedAt }),
+      ...(active?.activeTurn?.type === "slack"
+        ? {
+            sourceChannelId: active.activeTurn.channelId,
+            sourceRootThreadTs: active.activeTurn.rootThreadTs,
+          }
+        : {}),
+    };
+  });
+}
+
+function passiveWorkMonitorStateFromAgentStatus(
+  status: AgentSessionRecord["status"],
+): KoeExecutionState {
+  switch (status) {
+    case "failed":
+      return "failed";
+    case "idle":
+    case "interrupted":
+      return "terminal";
+    case "starting":
+    case "running":
+    case "waiting_for_approval":
+    case "waiting_for_input":
+      return "unknown";
+  }
+}
+
+function workMonitorStateFromAgentStatus(
+  status: AgentSessionRecord["status"],
+): KoeExecutionState {
+  switch (status) {
+    case "starting":
+    case "running":
+      return "running";
+    case "waiting_for_approval":
+    case "waiting_for_input":
+      return "waiting_for_input";
+    case "failed":
+      return "failed";
+    case "idle":
+    case "interrupted":
+      return "terminal";
+  }
+}
+
 
 export async function validateRuntimePrerequisites(
   config: TaishiConfig,

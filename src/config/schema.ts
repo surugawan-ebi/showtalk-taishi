@@ -226,6 +226,7 @@ export const taishiConfigSchema = z
             (ids) => new Set(ids).size === ids.length,
             "Slack approver user IDs must be unique",
           ),
+        work_attention_channel_id: slackChannelIdSchema.optional(),
       })
       .strict(),
     adapters: z

@@ -23,6 +23,9 @@ slack:
   bot_token: "${SLACK_BOT_TOKEN}"
   approver_user_ids:
     - "${SLACK_APPROVER_USER_ID}"
+  # Optional. Emits each work-attention detection/recovery as a new root
+  # message for an existing downstream Slack message-event integration.
+  # work_attention_channel_id: "${SLACK_WORK_ATTENTION_CHANNEL_ID}"
 
 adapters:
   codex:

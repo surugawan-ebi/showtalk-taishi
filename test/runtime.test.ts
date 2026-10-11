@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   assertWorkspaceGitManualRuntimeOptions,
+  buildWorkMonitorObservations,
   createCodexChildEnvironment,
   createCodexProbeEnvironment,
   createRegistry,
@@ -14,6 +15,7 @@ import {
   workspaceGitAutonomyPolicyFingerprint,
   workspaceGitAutonomySettingsFromConfig,
 } from "../src/runtime.js";
+import { InMemoryAgentRegistry } from "../src/core/index.js";
 import { taishiConfigSchema, type TaishiConfig } from "../src/config/schema.js";
 import type { RuntimeState } from "../src/state/file-state-store.js";
 
@@ -46,6 +48,129 @@ test("rejects Workspace Git automation injection at the runtime boundary", () =>
   );
   assert.doesNotThrow(() => assertWorkspaceGitManualRuntimeOptions({}));
 });
+
+test("requires the process-local lease before monitoring a persisted active turn", () => {
+  const registry = new InMemoryAgentRegistry();
+  registry.registerAgent({
+    id: "implementer",
+    adapter: "fake",
+    channelId: "CIMPLEMENTER",
+  });
+  registry.addSession({
+    id: "session-1",
+    agentId: "implementer",
+    adapter: "fake",
+    adapterSession: { id: "backend-1" },
+    status: "running",
+    activeTurn: {
+      type: "slack",
+      channelId: "CIMPLEMENTER",
+      rootThreadTs: "1791221976.640199",
+      messageTs: "1791221976.640200",
+      startedAt: "2026-10-07T00:00:00.000Z",
+    },
+    createdAt: "2026-10-07T00:00:00.000Z",
+    updatedAt: "2026-10-07T00:00:00.000Z",
+  });
+
+  assert.deepEqual(buildWorkMonitorObservations(registry), [{
+    agentId: "implementer",
+    state: "unknown",
+    sessionId: "session-1",
+    updatedAt: "2026-10-07T00:00:00.000Z",
+  }]);
+
+  const release = registry.reserveAgentTurn("implementer");
+  assert.deepEqual(buildWorkMonitorObservations(registry), [{
+    agentId: "implementer",
+    state: "running",
+    sessionId: "session-1",
+    sourceChannelId: "CIMPLEMENTER",
+    sourceRootThreadTs: "1791221976.640199",
+    updatedAt: "2026-10-07T00:00:00.000Z",
+  }]);
+  release();
+});
+
+test("uses queued delegation acceptance time with no or old target session", () => {
+  const queueAcceptedAt = "2026-10-07T01:00:00.000Z";
+  const createQueuedRegistry = (withOldTargetSession: boolean) => {
+    const registry = new InMemoryAgentRegistry();
+    registry.registerAgent({
+      id: "source",
+      adapter: "fake",
+      channelId: "CSOURCE",
+    });
+    registry.registerAgent({
+      id: "target",
+      adapter: "fake",
+      channelId: "CTARGET",
+    });
+    registry.addSession({
+      id: "source-session",
+      agentId: "source",
+      adapter: "fake",
+      adapterSession: { id: "source-backend" },
+      status: "idle",
+      createdAt: "2026-10-07T00:00:00.000Z",
+      updatedAt: "2026-10-07T00:00:00.000Z",
+    });
+    if (withOldTargetSession) {
+      registry.addSession({
+        id: "old-target-session",
+        agentId: "target",
+        adapter: "fake",
+        adapterSession: { id: "old-target-backend" },
+        status: "idle",
+        createdAt: "2026-10-06T00:00:00.000Z",
+        updatedAt: "2026-10-06T00:00:00.000Z",
+      });
+    }
+    registry.enqueueQueuedDelegation({
+      version: 1,
+      id: `delegation-${withOldTargetSession ? "old" : "fresh"}`,
+      requestKey: `request-${withOldTargetSession ? "old" : "fresh"}`,
+      source: {
+        type: "slack",
+        agentId: "source",
+        channelId: "CSOURCE",
+        rootThreadTs: "1791221976.640199",
+        messageTs: "1791221976.640200",
+        sessionId: "source-session",
+        adapterSessionId: "source-backend",
+        turnStartedAt: "2026-10-07T00:59:00.000Z",
+      },
+      targetAgentId: "target",
+      targetAdapter: "fake",
+      targetChannelId: "CTARGET",
+      targetConversationScope: "channel",
+      consultationScope: "bounded test",
+      permissionDecision: "allow",
+      message: "synthetic queued work",
+      depth: 1,
+      state: "queued",
+      pendingChildIds: [],
+      childOutcomes: [],
+      createdAt: queueAcceptedAt,
+      queueExpiresAt: "2026-10-07T02:00:00.000Z",
+      updatedAt: queueAcceptedAt,
+    });
+    return registry;
+  };
+
+  for (const withOldTargetSession of [false, true]) {
+    const target = buildWorkMonitorObservations(
+      createQueuedRegistry(withOldTargetSession),
+    ).find((observation) => observation.agentId === "target");
+    assert.deepEqual(target, {
+      agentId: "target",
+      state: "queued",
+      ...(withOldTargetSession ? { sessionId: "old-target-session" } : {}),
+      updatedAt: queueAcceptedAt,
+    });
+  }
+});
+
 
 test("injects only configured Koe consultation targets into the role", () => {
   const config = taishiConfigSchema.parse({

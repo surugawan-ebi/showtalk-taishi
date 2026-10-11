@@ -62,6 +62,27 @@ test("loads config and expands environment references", async () => {
   assert.deepEqual(config.gateway.admin_ui, { enabled: false, port: 4_781 });
 });
 
+test("loads an optional work-attention Slack channel", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "  approver_user_ids:",
+      "  work_attention_channel_id: \"\${WORK_ATTENTION_CHANNEL}\"\n  approver_user_ids:",
+    ),
+  );
+  const config = await loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORK_ATTENTION_CHANNEL: "CATTENTION",
+    WORKSPACE: "/tmp/project",
+  });
+  assert.equal(config.slack.work_attention_channel_id, "CATTENTION");
+});
+
+
 test("loads the opt-in Koe ordinary top-choice mode", async () => {
   const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
   const path = join(directory, "config.yaml");
