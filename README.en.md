@@ -20,7 +20,7 @@
 <p align="center">
   <img alt="Status: Preview" src="https://img.shields.io/badge/status-preview-B6452C?style=flat-square">
   <img alt="Version: 0.0.1" src="https://img.shields.io/badge/version-0.0.1-263238?style=flat-square">
-  <img alt="Node.js 22+" src="https://img.shields.io/badge/Node.js-22%2B-3C873A?style=flat-square">
+  <img alt="Node.js 22.19+" src="https://img.shields.io/badge/Node.js-22.19%2B-3C873A?style=flat-square">
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-2D6A8A?style=flat-square">
 </p>
 
@@ -106,7 +106,7 @@ workspace.
 ### Requirements
 
 - macOS or Linux
-- Node.js 22 or newer
+- Node.js 22.19.0 or newer
 - an installed and authenticated `codex` CLI
 - permission to create and install a Slack App
 
