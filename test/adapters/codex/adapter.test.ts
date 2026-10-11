@@ -93,6 +93,7 @@ class FakeAppServer implements CodexAppServer {
   onListTurns?: (callCount: number) => void | Promise<void>;
   interruptFailures = 0;
   userInputResponseError: Error | undefined;
+  respondErrorError: Error | undefined;
   closed = false;
   readonly #notifications = new Set<(method: string, params: unknown) => void>();
   readonly #requests = new Set<(event: ServerRequestEvent) => void>();
@@ -288,6 +289,7 @@ class FakeAppServer implements CodexAppServer {
   }
 
   respondError(id: RpcId, error: RpcError): void {
+    if (this.respondErrorError !== undefined) throw this.respondErrorError;
     this.errorResponses.push({
       id,
       code: error.code,
@@ -1122,6 +1124,10 @@ test("creates a Codex thread with workspace and role instructions", async () => 
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
     /external_action_approval.*exactly two options in this order.*承認して実行.*Recommended.*拒否・保留.*non-empty descriptions.*Target:.*Scope:.*Impact:/su,
+  );
+  assert.match(
+    server.threadStarts[0]?.developerInstructions ?? "",
+    /only these three newline-separated, non-empty lines:\nTarget: <target>\nScope: <scope>\nImpact: <impact>\n/u,
   );
   assert.match(
     server.threadStarts[0]?.developerInstructions ?? "",
@@ -3550,6 +3556,149 @@ test("bridges non-blocking ordinary structured choices from current Codex normal
   }]);
 });
 
+test("reports an external-action timeout as expiry without fabricating an empty answer", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, {
+    approvalTimeoutMs: 25,
+    gitPlanBindingGraceMs: 1,
+  });
+  const events: AgentEvent[] = [];
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Wait for the bounded external confirmation", source: { type: "human" } },
+    )) {
+      events.push(event);
+      if (event.type === "choice.expired") {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed" },
+        });
+      }
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 1101,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  await consuming;
+
+  const requested = events.find((event) => event.type === "choice.requested");
+  assert.ok(requested?.type === "choice.requested");
+  assert.ok(events.some((event) =>
+    event.type === "choice.expired" && event.requestId === requested.requestId
+  ));
+  assert.ok(events.some((event) =>
+    event.type === "error" && event.code === "STRUCTURED_INPUT_EXPIRED"
+  ));
+  assert.deepEqual(server.userInputResponses, []);
+  assert.equal(server.errorResponses.length, 1);
+  assert.equal(server.errorResponses[0]?.id, 1101);
+  assert.match(server.errorResponses[0]?.message ?? "", /expired/u);
+});
+
+test("reports a choice answered at the deadline through the same expiry lifecycle", async () => {
+  const server = new FakeAppServer();
+  const adapter = new CodexAdapter(server, {
+    approvalTimeoutMs: 60_000,
+    gitPlanBindingGraceMs: 1,
+  });
+  const session = { id: "thr_1" };
+  const events: AgentEvent[] = [];
+  let resolveRequested!: (
+    event: Extract<AgentEvent, { type: "choice.requested" }>,
+  ) => void;
+  const requestedPromise = new Promise<
+    Extract<AgentEvent, { type: "choice.requested" }>
+  >((resolve) => {
+    resolveRequested = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      session,
+      { text: "Answer exactly at the deadline", source: { type: "human" } },
+    )) {
+      events.push(event);
+      if (event.type === "choice.requested") resolveRequested(event);
+      if (event.type === "choice.expired") {
+        server.notify("turn/completed", {
+          threadId: "thr_1",
+          turn: { id: "turn_1", status: "completed" },
+        });
+      }
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 1102,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  const requested = await requestedPromise;
+  const originalNow = Date.now;
+  Date.now = () => Date.parse(requested.expiresAt);
+  try {
+    await assert.rejects(
+      adapter.respondToUserInput(session, {
+        requestId: requested.requestId,
+        answer: { questionId: requested.question.id, optionId: "option_1" },
+      }),
+      /expired/u,
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+  await consuming;
+
+  assert.ok(events.some((event) =>
+    event.type === "choice.expired" && event.requestId === requested.requestId
+  ));
+  assert.ok(events.some((event) =>
+    event.type === "error" && event.code === "STRUCTURED_INPUT_EXPIRED"
+  ));
+  assert.deepEqual(server.userInputResponses, []);
+  assert.equal(server.errorResponses[0]?.id, 1102);
+});
+
+test("projects choice expiry before surfacing an App Server transport failure", async () => {
+  const server = new FakeAppServer();
+  server.respondErrorError = new Error("synthetic response transport failure");
+  const adapter = new CodexAdapter(server, {
+    approvalTimeoutMs: 25,
+    gitPlanBindingGraceMs: 1,
+  });
+  const events: AgentEvent[] = [];
+  let streamError: unknown;
+  const consuming = (async () => {
+    try {
+      for await (const event of adapter.sendMessage(
+        { id: "thr_1" },
+        { text: "Expire across a failed response transport", source: { type: "human" } },
+      )) {
+        events.push(event);
+      }
+    } catch (error) {
+      streamError = error;
+    }
+  })();
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 1103,
+    method: "item/tool/requestUserInput",
+    params: externalActionQuestion(),
+  });
+  await consuming;
+
+  assert.match(String(streamError), /synthetic response transport failure/u);
+  assert.ok(events.some((event) => event.type === "choice.expired"));
+  assert.ok(events.some((event) =>
+    event.type === "error" && event.code === "STRUCTURED_INPUT_EXPIRED"
+  ));
+  assert.deepEqual(server.errorResponses, []);
+});
+
 test("auto-selects the first option for every ordinary question when the Koe opts in", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, {
@@ -3859,12 +4008,24 @@ test("repairs one malformed external-action confirmation without a Slack error",
       }],
     },
   });
+  await new Promise((resolve) => setImmediate(resolve));
+  const repairData = server.errorResponses[0]?.data as
+    | { questionTemplate?: unknown }
+    | undefined;
+  assert.ok(Array.isArray(repairData?.questionTemplate));
+  assert.ok(repairData.questionTemplate.every((line) => typeof line === "string"));
+  const repairedQuestion = repairData.questionTemplate
+    .map((line) => line
+      .replace("<target>", "Gateway worker")
+      .replace("<scope>", "one bounded restart")
+      .replace("<impact>", "brief Slack reconnect"))
+    .join("\n");
   server.request({
     id: 908,
     method: "item/tool/requestUserInput",
     params: {
       ...params,
-      questions: [{ ...question }],
+      questions: [{ ...question, question: repairedQuestion }],
     },
   });
   await consuming;
@@ -3873,13 +4034,18 @@ test("repairs one malformed external-action confirmation without a Slack error",
   assert.equal(server.errorResponses[0]?.id, 907);
   assert.match(
     server.errorResponses[0]?.message ?? "",
-    /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED.*exactly once.*direct tool call.*never through functions\.exec.*external_action_approval.*承認して実行.*Recommended.*拒否・保留/su,
+    /EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED.*exactly once.*direct tool call.*never through functions\.exec.*external_action_approval.*承認して実行.*Recommended.*拒否・保留.*only these three newline-separated.*Target: <target>\nScope: <scope>\nImpact: <impact>\nDo not add a heading/su,
   );
   assert.deepEqual(server.errorResponses[0]?.data, {
     recovery: "retry_external_action_approval",
     attempt: 1,
     questionId: "external_action_approval",
     requiredQuestionFields: ["Target", "Scope", "Impact"],
+    questionTemplate: [
+      "Target: <target>",
+      "Scope: <scope>",
+      "Impact: <impact>",
+    ],
     requiredOptionLabels: ["承認して実行", "拒否・保留"],
     requireNonEmptyDescriptions: true,
     requireBlocking: true,

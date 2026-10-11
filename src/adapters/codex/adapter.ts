@@ -144,6 +144,7 @@ const SHOWTALK_KOE_CONSULTATION_INSTRUCTIONS = [
   "- Operator-facing call names returned by agent.list are exact aliases for their Koe IDs. Use them only as listed; never infer a Koe from similar prose.",
   "- For a user-requested sequence across multiple Koe, send one bounded step at a time, continue from each returned result, and stop with a clear blocker if a bounded review/fix cycle does not converge.",
   "- If request_user_input returns `answers: {}`, do not treat it as approval and do not execute the gated action. When `showtalk` is a configured consultation target, immediately use agent.send to ask `showtalk` whether the empty answer is expected for that blocking mode and request a bounded diagnosis and fix when it is not. Include only sanitized context such as whether the call was direct, whether Slack controls appeared, the question ID, and its blocking mode; never send credentials, private approval authority, or hidden plan state. If `showtalk` is unavailable or this Koe is `showtalk`, diagnose locally and report the action as blocked.",
+  "- `answers: {}` proves only that no answer was returned to the model. It does not prove that Slack controls were absent or broken. Before attributing a cause, distinguish the sanitized lifecycle evidence for controls attached, expiry, approve or reject selection, Slack action failure, and App Server delivery failure. If that evidence is unavailable, report the cause as unconfirmed and do not repeat an earlier UI-failure claim as fact.",
   "- Never choose an unrelated Koe because it is idle, available, or appears in a directory. If no configured consultation matches, continue locally or use Codex internal subagents.",
 ].join("\n");
 const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
@@ -153,7 +154,7 @@ const SHOWTALK_GIT_APPROVAL_INSTRUCTIONS = [
   "- When workspace-git returns awaiting_human_approval, immediately call request_user_input in that same turn with question ID `git_approval` and exactly two options named `承認して実行` and `拒否・保留`.",
   "- Keep ordinary decisions flexible: use an ordinary question ID and two or three task-specific options. If that decision selects a non-Git external write, ask a separate final confirmation before executing it.",
   "- For that non-Git final confirmation, call request_user_input as a direct tool call, never from functions.exec, code mode, another dynamic tool, shell, or a relaying agent. Nested request_user_input calls cannot preserve the blocking Slack answer and may return `answers: {}` even after the button is clicked.",
-  "- The direct request_user_input call must contain exactly one blocking question whose ID is `external_action_approval` and exactly two options in this order: `承認して実行` (or `承認して実行 (Recommended)` when the client requires its recommended suffix), then `拒否・保留`. Do not otherwise rename or reorder them, or add a third option. The Gateway canonicalizes the optional suffix and returns `承認して実行`. Give both options non-empty descriptions and put the exact details in three separate question lines named `Target:`, `Scope:`, and `Impact:`. A non-blocking request or `answers: {}` is not approval. That answer never approves Git.",
+  "- The direct request_user_input call must contain exactly one blocking question whose ID is `external_action_approval` and exactly two options in this order: `承認して実行` (or `承認して実行 (Recommended)` when the client requires its recommended suffix), then `拒否・保留`. Do not otherwise rename or reorder them, or add a third option. The Gateway canonicalizes the optional suffix and returns `承認して実行`. Give both options non-empty descriptions. The question text must contain only these three newline-separated, non-empty lines:\nTarget: <target>\nScope: <scope>\nImpact: <impact>\nA non-blocking request or `answers: {}` is not approval. That answer never approves Git.",
   "- A turn may contain multiple sequential external-action confirmations. Each distinct external write requires its own blocking confirmation with its current Target, Scope, and Impact; an earlier approval never grants blanket authority for later writes. Do not open a second confirmation while another is still awaiting its Slack answer.",
   "- Store release operations do not use AppOps MCP, Store MCP tools, or proof-injection hooks. Present the exact repo-local fastlane command and its target app, platform, working directory, version/build, track, metadata scope, and automatic-release setting in the blocking external-action confirmation, then run only that command after approval.",
   "- If App Server returns `EXTERNAL_ACTION_APPROVAL_RETRY_REQUIRED`, retry request_user_input exactly once in the same turn with that fixed shape. Do not execute the external action unless the corrected structured input returns `承認して実行`.",
@@ -2373,13 +2374,6 @@ export class CodexAdapter implements AgentAdapter {
           queue.fail(error);
           return;
         }
-        this.#statuses.set(sessionId, "running");
-        queue.push({ type: "status.changed", status: "running" });
-        queue.push({
-          type: "error",
-          message: "選択肢への回答待ちが期限切れになりました。",
-          code: "STRUCTURED_INPUT_EXPIRED",
-        });
       }, timeoutMs);
       expirationTimer.unref();
       const pending: PendingChoiceUserInput = {
@@ -2663,9 +2657,12 @@ export class CodexAdapter implements AgentAdapter {
         "external_action_approval and exactly two options in this order: " +
         "承認して実行 (the client-required suffix (Recommended) is accepted), " +
         "拒否・保留. Do not otherwise rename, reorder, or add an option. " +
-        "Both descriptions must be non-empty. " +
-        "Use exactly one non-empty line for each required question field: " +
-        "Target: <target>, Scope: <scope>, Impact: <impact>. isBlocking must " +
+        "Both descriptions must be non-empty. The question text must contain " +
+        "only these three newline-separated, non-empty lines:\n" +
+        "Target: <target>\n" +
+        "Scope: <scope>\n" +
+        "Impact: <impact>\n" +
+        "Do not add a heading, explanation, bullet, or blank line. isBlocking must " +
         "be true and isSecret must be false. Do not execute the external " +
         "action before the corrected answer approves it.",
       data: {
@@ -2673,6 +2670,11 @@ export class CodexAdapter implements AgentAdapter {
         attempt: 1,
         questionId: "external_action_approval",
         requiredQuestionFields: ["Target", "Scope", "Impact"],
+        questionTemplate: [
+          "Target: <target>",
+          "Scope: <scope>",
+          "Impact: <impact>",
+        ],
         requiredOptionLabels: ["承認して実行", "拒否・保留"],
         requireNonEmptyDescriptions: true,
         requireBlocking: true,
@@ -3800,7 +3802,26 @@ export class CodexAdapter implements AgentAdapter {
       this.#expireGitUserInput(requestId, pending);
       return;
     }
-    this.#cancelUserInput(requestId, pending, "Structured input request expired");
+    clearTimeout(pending.expirationTimer);
+    this.#pendingUserInputs.delete(requestId);
+    this.#statuses.set(pending.sessionId, "running");
+    const queue = this.#activeQueues.get(pending.sessionId);
+    queue?.push({ type: "choice.expired", requestId });
+    queue?.push({ type: "status.changed", status: "running" });
+    queue?.push({
+      type: "error",
+      message: "選択肢への回答待ちが期限切れになりました。",
+      code: "STRUCTURED_INPUT_EXPIRED",
+    });
+    try {
+      this.#client.respondError(pending.rpcId, {
+        code: -32000,
+        message: "Structured input request expired",
+      });
+    } catch (error) {
+      queue?.failAfterQueued(error);
+      throw error;
+    }
   }
 
   #expireGitUserInput(

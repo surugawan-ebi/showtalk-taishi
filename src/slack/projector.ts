@@ -255,6 +255,9 @@ export class SlackThreadProjector {
       case "choice.resolved_externally":
         await this.#resolveChoiceExternally(event.requestId);
         break;
+      case "choice.expired":
+        await this.#expireChoice(event.requestId);
+        break;
       case "choice.answer_dispatched":
         await this.#markChoiceAnswerDispatched(event.requestId);
         break;
@@ -1087,6 +1090,13 @@ export class SlackThreadProjector {
   async #postApproval(
     event: Extract<AgentEvent, { type: "approval.requested" }>,
   ): Promise<void> {
+    this.#interactionAudit?.({
+      event: "approval.request_received",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+    });
     const fallback = this.#formatActionableMessage(
       event.summary,
       this.#sourceUserMention !== undefined,
@@ -1130,6 +1140,14 @@ export class SlackThreadProjector {
         this.#sourceUserMention === undefined
           ? renderedBlocks
           : [sourceMentionBlock(this.#sourceUserMention), ...renderedBlocks],
+    });
+    this.#interactionAudit?.({
+      event: "approval.controls_attached",
+      requestId: event.requestId,
+      channelId: this.#channelId,
+      rootThreadTs: this.#rootThreadTs,
+      messageTs: posted.ts,
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
     });
     if (approvalTextHint !== undefined) {
       this.#rememberApprovalText({
@@ -1200,6 +1218,48 @@ export class SlackThreadProjector {
         continuation.responderUserId === undefined
           ? blocks
           : [sourceMentionBlock(`<@${continuation.responderUserId}>`), ...blocks],
+    });
+  }
+
+  async #expireChoice(requestId: string): Promise<void> {
+    this.#forgetApprovalText(requestId);
+    const display =
+      this.#choiceContinuationStore?.getDisplayedForTerminalProjection(requestId);
+    const auditSessionId = display?.sessionId ?? this.#sessionId;
+    this.#interactionAudit?.({
+      event: "choice.expired",
+      requestId,
+      channelId: display?.channelId ?? this.#channelId,
+      rootThreadTs: display?.rootThreadTs ?? this.#rootThreadTs,
+      ...(display?.messageTs === undefined
+        ? {}
+        : { messageTs: display.messageTs }),
+      ...(auditSessionId === undefined ? {} : { sessionId: auditSessionId }),
+      outcome: "expired",
+    });
+    if (display === undefined) return;
+    const updated = await retryTerminalSlackUpdate(() =>
+      this.#client.chat.update({
+        channel: display.channelId,
+        ts: display.messageTs,
+        text:
+          display.question.purpose === "external_action_confirmation"
+            ? "表示済みの外部操作確認は、期限内に回答が確定しなかったため期限切れになりました。外部操作は未承認で、実行できません。"
+            : "表示済みの選択肢は、期限内に回答が確定しなかったため期限切れになりました。",
+        blocks: [],
+      }).then(() => undefined)
+    );
+    if (!updated) return;
+    this.#choiceContinuationStore?.forgetDisplayed(requestId, display.messageTs);
+    this.#choiceContinuationStore?.forgetDispatched(requestId);
+    this.#interactionAudit?.({
+      event: "choice.card_terminalized",
+      requestId,
+      channelId: display.channelId,
+      rootThreadTs: display.rootThreadTs,
+      messageTs: display.messageTs,
+      sessionId: display.sessionId,
+      outcome: "expired",
     });
   }
 

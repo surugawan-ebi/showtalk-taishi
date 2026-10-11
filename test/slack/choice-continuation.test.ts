@@ -153,3 +153,14 @@ test("retains only routing metadata after an answer is dispatched", () => {
   store.forgetDispatched(display.requestId);
   assert.equal(store.getDispatched(display.requestId), undefined);
 });
+
+test("retains expired display metadata only for terminal card projection", () => {
+  let now = 1_000;
+  const store = new StructuredChoiceContinuationStore(() => now);
+  const display = displayed(2_000);
+  store.rememberDisplayed(display);
+  now = 2_000;
+
+  assert.deepEqual(store.getDisplayedForTerminalProjection(display.requestId), display);
+  assert.equal(store.getDisplayed(display.requestId), undefined);
+});
