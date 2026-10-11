@@ -27,6 +27,81 @@ import {
 } from "./approvals/workspace-git-autonomy-control.js";
 import { GATEWAY_RESTART_EXIT_CODE } from "./supervisor.js";
 
+const GATEWAY_RESTART_DRAIN_TIMEOUT_MS = 5 * 60_000;
+const GATEWAY_RESTART_PROGRESS_INTERVAL_MS = 30_000;
+
+/** Give accepted work time to finish or emit a bounded progress checkpoint. */
+export async function waitForGatewayDrain(
+  waitForIdle: () => Promise<void>,
+  stopRequested: Promise<void>,
+  timeoutMs = GATEWAY_RESTART_DRAIN_TIMEOUT_MS,
+): Promise<"idle" | "stop" | "timeout"> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new RangeError("Gateway restart drain timeout must be positive");
+  }
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      stopRequested.then(() => "stop" as const),
+      waitForIdle().then(() => "idle" as const),
+      timedOut,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Complete a requested replacement without treating a failed shutdown as success. */
+export async function finishGatewayRestart(
+  runtime: Pick<Awaited<ReturnType<typeof createRuntime>>, "waitForIdle" | "idleComponents">,
+  stopRuntime: () => Promise<void>,
+  stopRequested: Promise<void>,
+  options: {
+    readonly timeoutMs?: number;
+    readonly progressIntervalMs?: number;
+    readonly log?: (message: string) => void;
+    readonly warn?: (message: string) => void;
+  } = {},
+): Promise<number> {
+  const log = options.log ?? console.log;
+  const warn = options.warn ?? console.warn;
+  const progressTimer = setInterval(() => {
+    log(`ShowTalk Taishi restart drain status: ${JSON.stringify(runtime.idleComponents())}`);
+  }, options.progressIntervalMs ?? GATEWAY_RESTART_PROGRESS_INTERVAL_MS);
+  progressTimer.unref();
+  let drainOutcome: "idle" | "stop";
+  const idle = runtime.waitForIdle();
+  try {
+    while (true) {
+      const outcome = await waitForGatewayDrain(
+        () => idle,
+        stopRequested,
+        options.timeoutMs,
+      );
+      if (outcome !== "timeout") {
+        drainOutcome = outcome;
+        break;
+      }
+      const components = runtime.idleComponents();
+      warn(`ShowTalk Taishi restart is still draining: ${JSON.stringify(components)}`);
+      if (Object.values(components).every(Boolean)) {
+        // No work remains; recover if an idle waiter missed its final wakeup.
+        drainOutcome = "idle";
+        break;
+      }
+    }
+  } finally {
+    clearInterval(progressTimer);
+  }
+  log("ShowTalk Taishi is stopping the runtime for restart.");
+  await stopRuntime();
+  log("ShowTalk Taishi runtime stopped; Gateway worker is exiting.");
+  return drainOutcome === "stop" ? 0 : GATEWAY_RESTART_EXIT_CODE;
+}
+
 export {
   isGatewayWorker,
   superviseGatewayWorker,
@@ -195,12 +270,7 @@ export async function runGatewayWorker(
     runtime.beginRestart();
     await stopAdmin();
     console.log("ShowTalk Taishi is draining active work before restart.");
-    const drainOutcome = await Promise.race([
-      runtime.waitForIdle().then(() => "idle" as const),
-      stopRequested.then(() => "stop" as const),
-    ]);
-    await stopRuntime();
-    return drainOutcome === "idle" ? GATEWAY_RESTART_EXIT_CODE : 0;
+    return finishGatewayRestart(runtime, stopRuntime, stopRequested);
   } finally {
     process.off("SIGINT", requestStopSignal);
     process.off("SIGTERM", requestStopSignal);

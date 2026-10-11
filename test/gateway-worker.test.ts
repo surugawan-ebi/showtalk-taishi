@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  finishGatewayRestart,
+  waitForGatewayDrain,
   workspaceGitRuntimeOptionsFromComposition,
 } from "../src/gateway-worker.js";
+import { GATEWAY_RESTART_EXIT_CODE } from "../src/supervisor.js";
 import type { WorkspaceGitApprovalPlan } from "../src/core/index.js";
 import type { WorkspaceGitAutomationProviderFactoryV4 } from "../src/approvals/workspace-git-automation-provider.js";
 import type { WorkspaceGitAutonomyControlBrokerFactoryV4 } from "../src/approvals/workspace-git-autonomy-control.js";
@@ -34,6 +37,112 @@ const plan = {
   commitMessage: "private host",
   expiresAt: "2099-01-01T00:00:00.000Z",
 } satisfies WorkspaceGitApprovalPlan;
+
+test("restart drain finishes when accepted work becomes idle", async () => {
+  let release!: () => void;
+  const idle = new Promise<void>((resolve) => { release = resolve; });
+  const draining = waitForGatewayDrain(
+    () => idle,
+    new Promise<void>(() => undefined),
+    1_000,
+  );
+  release();
+  assert.equal(await draining, "idle");
+});
+
+test("restart drain reports a timeout checkpoint while work remains active", async () => {
+  const pending = new Promise<void>(() => undefined);
+  assert.equal(
+    await waitForGatewayDrain(() => pending, pending, 20),
+    "timeout",
+  );
+});
+
+test("a pre-resolved stop request wins when restart drain is already idle", async () => {
+  assert.equal(
+    await waitForGatewayDrain(
+      async () => undefined,
+      Promise.resolve(),
+      1_000,
+    ),
+    "stop",
+  );
+});
+
+test("restart keeps waiting while accepted work is active", async () => {
+  let releaseIdle!: () => void;
+  const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+  const pending = new Promise<void>(() => undefined);
+  let sawWarning!: () => void;
+  const warned = new Promise<void>((resolve) => { sawWarning = resolve; });
+  let stops = 0;
+  const warnings: string[] = [];
+  const finishing = finishGatewayRestart(
+    {
+      waitForIdle: () => idle,
+      idleComponents: () => ({ gateway: false, slack: true, mcpService: true, mcpServer: true }),
+    },
+    async () => { stops += 1; },
+    pending,
+    { timeoutMs: 20, progressIntervalMs: 1_000, log: () => undefined, warn: (line) => { warnings.push(line); sawWarning(); } },
+  );
+  await warned;
+  assert.equal(stops, 0);
+  releaseIdle();
+  const exitCode = await finishing;
+  assert.equal(stops, 1);
+  assert.equal(exitCode, GATEWAY_RESTART_EXIT_CODE);
+  assert.match(warnings[0] ?? "", /"gateway":false/u);
+});
+
+test("restart recovers a missed idle wakeup only when every component is idle", async () => {
+  const pending = new Promise<void>(() => undefined);
+  let stops = 0;
+  const exitCode = await finishGatewayRestart(
+    {
+      waitForIdle: () => pending,
+      idleComponents: () => ({ gateway: true, slack: true, mcpService: true, mcpServer: true }),
+    },
+    async () => { stops += 1; },
+    pending,
+    { timeoutMs: 20, progressIntervalMs: 1_000, log: () => undefined, warn: () => undefined },
+  );
+  assert.equal(stops, 1);
+  assert.equal(exitCode, GATEWAY_RESTART_EXIT_CODE);
+});
+
+test("restart shutdown failure cannot request worker replacement", async () => {
+  const pending = new Promise<void>(() => undefined);
+  await assert.rejects(
+    finishGatewayRestart(
+      {
+        waitForIdle: async () => undefined,
+        idleComponents: () => ({ gateway: true, slack: true, mcpService: true, mcpServer: true }),
+      },
+      async () => { throw new Error("shutdown failed"); },
+      pending,
+      { log: () => undefined, warn: () => undefined },
+    ),
+    /shutdown failed/u,
+  );
+});
+
+test("supervisor stop request exits without scheduling a replacement", async () => {
+  const pending = new Promise<void>(() => undefined);
+  let requestStop!: () => void;
+  const stopRequested = new Promise<void>((resolve) => { requestStop = resolve; });
+  const exiting = finishGatewayRestart(
+    {
+      waitForIdle: () => pending,
+      idleComponents: () => ({ gateway: false, slack: true, mcpService: true, mcpServer: true }),
+    },
+    async () => undefined,
+    stopRequested,
+    { timeoutMs: 1_000, log: () => undefined, warn: () => undefined },
+  );
+  requestStop();
+  assert.equal(await exiting, 0);
+});
 
 test("adapts the manual human-decision composition without exposing authority", async () => {
   const recorded: unknown[] = [];
