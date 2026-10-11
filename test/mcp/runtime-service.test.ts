@@ -656,6 +656,30 @@ test("accepts agent.send durably and continues the final result", async () => {
   );
 });
 
+test("reports a delegation depth limit before queued admission", async () => {
+  const { service, registry, adapter } = setup();
+  const releaseTurn = bindActiveSource(registry, {
+    continuationDelegationId: "previous-delegation",
+    continuationDepth: 4,
+  });
+
+  await assert.rejects(
+    () => service.agentSend(
+      context("implementer", "depth-limit"),
+      "reviewer",
+      "Do not queue this request",
+    ),
+    (error) =>
+      error instanceof McpServiceError &&
+      error.code === "DELEGATION_DEPTH_EXCEEDED" &&
+      /Start a new human turn/u.test(error.message),
+  );
+
+  assert.equal(adapter.sendCalls, 0);
+  assert.deepEqual(registry.listQueuedDelegations(), []);
+  releaseTurn();
+});
+
 test("queues behind a busy Koe and runs exactly once after it becomes idle", async () => {
   const { service, registry, adapter, continuations } = setup();
   registry.addSession({
@@ -1211,7 +1235,10 @@ test("does not acknowledge or execute a queue entry when persistence fails", asy
       "reviewer",
       "Must not run",
     ),
-    /state unavailable/u,
+    (error) =>
+      error instanceof McpServiceError &&
+      error.code === "AGENT_SEND_FAILED" &&
+      error.message === "The Koe request could not be accepted or completed",
   );
   assert.equal(persistCalls, 1);
   assert.equal(adapter.sentTexts.includes("Must not run"), false);
