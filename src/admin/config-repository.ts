@@ -463,6 +463,12 @@ function applyAgentUpdate(
   for (const target of targets) {
     const nextScope = cleanOptional(incoming.consultations[target]?.scope);
     const previousScope = currentConsultations[target]?.scope;
+    if (nextScope === undefined) {
+      if (previousScope !== undefined) {
+        document.deleteIn([...root, "consultations", target]);
+      }
+      continue;
+    }
     setOptionalWhenChanged(
       document,
       [...root, "consultations", target, "scope"],
