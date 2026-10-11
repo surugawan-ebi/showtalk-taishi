@@ -30,6 +30,38 @@ const snapshot: AdminConfigSnapshot = {
 };
 const accessToken = "b".repeat(43);
 
+test("health reports a prolonged Slack disconnection without exposing credentials", async () => {
+  let slackConnection: "connected" | "degraded" = "connected";
+  const server = new LocalAdminServer({
+    port: 0,
+    accessToken,
+    repository: memoryRepository(),
+    slackConnectionStatus: () => slackConnection,
+    onRestartRequested: () => undefined,
+  });
+  const url = await server.start();
+  try {
+    const readHealth = async () => {
+      const response = await fetch(`${withoutHash(url)}api/health`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+      assert.equal(response.status, 200);
+      return response.json() as Promise<{ status: string; slack_connection: string }>;
+    };
+    assert.deepEqual(await readHealth(), {
+      status: "running",
+      slack_connection: "connected",
+    });
+    slackConnection = "degraded";
+    assert.deepEqual(await readHealth(), {
+      status: "degraded",
+      slack_connection: "degraded",
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
 test("starts at a token-free URL and issues a stable hardened session cookie", async () => {
   const repository = memoryRepository();
   const server = new LocalAdminServer({

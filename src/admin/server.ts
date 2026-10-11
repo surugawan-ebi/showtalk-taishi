@@ -21,6 +21,7 @@ import {
 } from "./config-repository.js";
 import { renderAdminPage } from "./ui.js";
 import type { WorkspaceGitAutonomyStatus } from "../approvals/workspace-git-autonomy-control.js";
+import type { SlackConnectionStatus } from "../slack/connection-health.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 1_048_576;
@@ -109,6 +110,7 @@ export interface LocalAdminServerOptions {
   readonly accessToken: string;
   readonly repository: AdminConfigPort;
   readonly modelCatalog?: AdminModelCatalogPort;
+  readonly slackConnectionStatus?: () => SlackConnectionStatus | "unknown";
   readonly workspaceGitAutonomy?: {
     list(): readonly WorkspaceGitAutonomyStatus[];
     request(agentId: string, operation: "enable" | "disable"): Promise<void>;
@@ -146,6 +148,9 @@ export class LocalAdminServer {
         ...(this.#options.modelCatalog === undefined
           ? {}
           : { modelCatalog: this.#options.modelCatalog }),
+        ...(this.#options.slackConnectionStatus === undefined
+          ? {}
+          : { slackConnectionStatus: this.#options.slackConnectionStatus }),
         ...(this.#options.workspaceGitAutonomy === undefined
           ? {}
           : { workspaceGitAutonomy: this.#options.workspaceGitAutonomy }),
@@ -297,8 +302,11 @@ async function handleRequest(
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/health") {
+    const slackConnection = options.slackConnectionStatus?.() ?? "unknown";
     writeJson(response, 200, {
-      status: isRestartScheduled() ? "restarting" : "running",
+      status: isRestartScheduled() ? "restarting"
+        : slackConnection === "degraded" ? "degraded" : "running",
+      slack_connection: slackConnection,
     });
     return;
   }

@@ -114,6 +114,7 @@ export async function runGatewayWorker(
         port: config.gateway.admin_ui.port,
         accessToken: adminToken!,
         repository: adminRepository!,
+        slackConnectionStatus: () => runtime.slackConnectionStatus(),
         modelCatalog: {
           list: async (agentId, listOptions = {}) => {
             const catalog = await runtime.listModels(agentId, listOptions);
