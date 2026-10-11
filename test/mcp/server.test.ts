@@ -775,6 +775,12 @@ test("sanitizes unknown service errors while preserving explicit bounded service
   const boundary = await runningBoundary(
     t,
     service({
+      agentSend: () => {
+        throw new McpServiceError(
+          "DELEGATION_DEPTH_EXCEEDED",
+          "The Koe consultation chain reached its safety limit. Start a new human turn before delegating again.",
+        );
+      },
       agentStatus: () => {
         if (exposePublicError) throw new McpServiceError("PERMISSION_DENIED", "Human approval denied this request");
         throw new Error("secret diagnostic detail");
@@ -800,6 +806,15 @@ test("sanitizes unknown service errors while preserving explicit bounded service
   });
   assert.equal(publicResult.isError, true);
   assert.match(JSON.stringify(publicResult), /PERMISSION_DENIED.*Human approval denied/u);
+
+  const depthResult = await client.callTool({
+    name: "agent.send",
+    arguments: { target: "reviewer", message: "One bounded follow-up" },
+  });
+  assert.equal(depthResult.isError, true);
+  const depthJson = JSON.stringify(depthResult);
+  assert.match(depthJson, /DELEGATION_DEPTH_EXCEEDED.*new human turn/u);
+  assert.doesNotMatch(depthJson, /SERVICE_ERROR/u);
 });
 
 test("closes idempotently, clears credentials, and stops accepting connections", async () => {

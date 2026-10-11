@@ -273,12 +273,20 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     context = this.#liveContext(context);
     this.#requireCaller(context);
     const targetAgentId = this.#requireAgentAddress(target).id;
-    return this.#once(
-      context,
-      "agent.send",
-      [targetAgentId, message],
-      () => this.#executeAgentSend(context, targetAgentId, message),
-    );
+    try {
+      return await this.#once(
+        context,
+        "agent.send",
+        [targetAgentId, message],
+        () => this.#executeAgentSend(context, targetAgentId, message),
+      );
+    } catch (error) {
+      // The queued path performs routing and durable admission before a target
+      // turn starts. Normalize those CoreErrors here just like the legacy
+      // synchronous path so a deliberate safety rejection never degrades to
+      // the MCP boundary's opaque SERVICE_ERROR.
+      throw toPublicServiceError(error);
+    }
   }
 
   async gatewayRestart(
@@ -2198,11 +2206,17 @@ function latestSession(registry: InMemoryAgentRegistry, agentId: string) {
 function toPublicServiceError(error: unknown): McpServiceError {
   if (error instanceof McpServiceError) return error;
   if (error instanceof CoreError) {
+    if (error.code === "DELEGATION_DEPTH_EXCEEDED") {
+      return new McpServiceError(
+        error.code,
+        "The Koe consultation chain reached its safety limit. Start a new human turn before delegating again.",
+      );
+    }
     return new McpServiceError(error.code, truncatePublicError(error.message));
   }
   return new McpServiceError(
     "AGENT_SEND_FAILED",
-    "The target Koe could not complete the request",
+    "The Koe request could not be accepted or completed",
   );
 }
 

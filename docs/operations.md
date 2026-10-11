@@ -211,6 +211,11 @@ delegation ID, and releases the caller to finish its current turn. The target
 runs accepted work FIFO while retaining the one-active-turn-per-Koe boundary.
 The queued acknowledgement is not the target's result and must not be resent.
 A review/fix cycle needs an explicit retry bound and must not loop indefinitely.
+When a causation chain reaches the Router's hop limit, admission fails before a
+job or delegation ID is created with `DELEGATION_DEPTH_EXCEEDED`. This is a
+deliberate safety stop, not a switchboard outage: do not resend or restart the
+Gateway. Continue only from a new human-originated turn, which starts a new
+causation chain.
 
 If the target finishes after the source turn closes, Taishi resumes the source
 Koe on the backend conversation mapped to the original Slack root, queues it
