@@ -5,7 +5,9 @@ import {
   canSafelyRejectAfterPrivateGitDecisionFailure,
   assertContinuationStartAllowed,
   assertOriginalChoiceMatchesContinuation,
+  cancelUnprojectedChoice,
   cancelUnprojectedNativeApproval,
+  choiceAnswerAuditOutcome,
   choiceReceiptText,
   closeFailedPrivateGitDecisionBeforeRecovery,
   consumeContinuationIterator,
@@ -27,7 +29,7 @@ import {
   workspaceGitAutonomyStatus,
 } from "../../src/slack/frontend.js";
 import { WorkspaceGitHumanDecisionBrokerError } from "../../src/approvals/workspace-git-human-decision-broker.js";
-import type { WorkspaceGitApprovalPlan } from "../../src/core/index.js";
+import type { AgentEvent, WorkspaceGitApprovalPlan } from "../../src/core/index.js";
 
 const exactGitPlan = {
   operationId: "11111111-1111-4111-8111-111111111111",
@@ -76,6 +78,18 @@ test("distinguishes non-Git external-action receipts from ordinary answers", () 
   assert.equal(
     choiceReceiptText("U0123456789", "ordinary"),
     "回答をCodexへ送信しました（<@U0123456789>）。受理結果を確認中です。",
+  );
+});
+
+test("classifies only fixed external-action choices as approval decisions", () => {
+  assert.equal(choiceAnswerAuditOutcome(undefined, "option_1"), "select");
+  assert.equal(
+    choiceAnswerAuditOutcome("external_action_confirmation", "option_1"),
+    "approve",
+  );
+  assert.equal(
+    choiceAnswerAuditOutcome("external_action_confirmation", "option_2"),
+    "reject",
   );
 });
 
@@ -1087,4 +1101,51 @@ test("cancels a native approval whose Slack controls could not be displayed", as
     false,
   );
   assert.equal(calls.length, 1);
+});
+
+test("records a choice display failure only after cancelling the unprojected request", async () => {
+  const calls: unknown[] = [];
+  const audit: unknown[] = [];
+  const gateway = {
+    resolveSessionUserInput: async (...args: unknown[]) => {
+      calls.push(args);
+    },
+  };
+  const event = {
+    type: "choice.requested",
+    requestId: "codex-choice:11111111-1111-4111-8111-111111111120",
+    expiresAt: "2026-10-06T03:41:25.000+09:00",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "External action",
+      prompt: "Target: synthetic\nScope: test\nImpact: none",
+      options: [
+        { id: "option_1", label: "approve", description: "approve" },
+        { id: "option_2", label: "reject", description: "reject" },
+      ],
+      allowsOther: false,
+    },
+  } as const satisfies Extract<AgentEvent, { type: "choice.requested" }>;
+
+  assert.equal(await cancelUnprojectedChoice(
+    gateway,
+    "session-1",
+    event,
+    (input) => audit.push(input),
+    { channelId: "C1", rootThreadTs: "100.0" },
+  ), true);
+  assert.deepEqual(calls, [["session-1", {
+    requestId: event.requestId,
+    cancelled: true,
+  }]]);
+  assert.deepEqual(audit, [{
+    event: "choice.display_failed",
+    requestId: event.requestId,
+    channelId: "C1",
+    rootThreadTs: "100.0",
+    sessionId: "session-1",
+    outcome: "display_failed",
+  }]);
 });

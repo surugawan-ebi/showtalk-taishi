@@ -6,6 +6,8 @@ export const APPROVAL_DELIVERY_BUILD_IDENTITY =
 export type InteractionAuditEvent =
   | "approval_text.binding_validated"
   | "approval_text.failed"
+  | "approval.request_received"
+  | "approval.controls_attached"
   | "turn_start.collaboration_mode_attached"
   | "turn_start.dispatched"
   | "turn_start.bound"
@@ -22,6 +24,8 @@ export type InteractionAuditEvent =
   | "choice.request_received"
   | "choice.card_posted"
   | "choice.controls_attached"
+  | "choice.display_failed"
+  | "choice.expired"
   | "choice.action_received"
   | "choice.answer_recorded"
   | "choice.answer_dispatched"
@@ -56,6 +60,7 @@ const INTERACTION_AUDIT_OUTCOMES = [
   "deferred_queue_full",
   "delivery_failed",
   "direct_server_request",
+  "display_failed",
   "empty_answers_rejected",
   "error",
   "expired",
@@ -122,7 +127,64 @@ export interface InteractionAuditIdentity {
   readonly buildIdentity?: string;
 }
 
+export interface StructuredInputAuditSummary {
+  readonly presentation: "displayed" | "not_displayed" | "unknown";
+  readonly decision: "approved" | "rejected" | "none" | "unknown";
+  readonly terminal:
+    | "answered"
+    | "expired"
+    | "action_failed"
+    | "delivery_failed"
+    | "unknown";
+  /** Diagnostic signal only. It never establishes presentation or terminal cause. */
+  readonly emptyAnswerObserved: boolean;
+}
+
 export type InteractionAudit = (input: InteractionAuditInput) => void;
+
+/**
+ * Reduces sanitized lifecycle fixtures without inferring causality from an
+ * empty App Server answer. Conflicting evidence remains unknown.
+ */
+export function summarizeStructuredInputAudit(
+  events: readonly InteractionAuditInput[],
+): StructuredInputAuditSummary {
+  const displayed = events.some((event) => event.event === "choice.controls_attached");
+  const displayFailed = events.some((event) => event.event === "choice.display_failed");
+  const decisions = new Set(events.flatMap((event) =>
+    event.event === "choice.answer_recorded" &&
+        (event.outcome === "approve" || event.outcome === "reject")
+      ? [event.outcome]
+      : []
+  ));
+  const terminals = new Set(events.flatMap((event) => {
+    if (event.event === "choice.expired") return ["expired" as const];
+    if (event.event === "choice.delivery_failed") return ["delivery_failed" as const];
+    if (event.event === "choice.action_failed") return ["action_failed" as const];
+    if (
+      event.event === "choice.card_terminalized" &&
+      event.outcome === "answer_dispatched"
+    ) {
+      return ["answered" as const];
+    }
+    return [];
+  }));
+  return {
+    presentation: displayed === displayFailed
+      ? "unknown"
+      : displayed
+        ? "displayed"
+        : "not_displayed",
+    decision: decisions.size !== 1
+      ? decisions.size === 0 ? "none" : "unknown"
+      : decisions.has("approve") ? "approved" : "rejected",
+    terminal: terminals.size === 1 ? [...terminals][0]! : "unknown",
+    emptyAnswerObserved: events.some(
+      (event) => event.event === "structured_input.answer_dispatch_failed" &&
+        event.outcome === "empty_answers_rejected",
+    ),
+  };
+}
 
 /** Emits allowlisted lifecycle records without payloads, text, answers, or raw IDs. */
 export function createInteractionAudit(

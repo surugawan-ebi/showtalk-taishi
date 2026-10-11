@@ -82,6 +82,13 @@ export class StructuredChoiceContinuationStore {
     return this.#displayedByRequestId.get(requestId);
   }
 
+  /** Returns inert route data needed only to remove an expired Slack card. */
+  getDisplayedForTerminalProjection(
+    requestId: string,
+  ): StructuredChoiceDisplay | undefined {
+    return this.#displayedByRequestId.get(requestId);
+  }
+
   resolveExternally(requestId: string): StructuredChoiceContinuation | undefined {
     this.#prune();
     const existingId = this.#continuationIdByRequestId.get(requestId);

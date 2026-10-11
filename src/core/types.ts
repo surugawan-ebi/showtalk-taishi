@@ -537,6 +537,11 @@ export type AgentEvent =
       readonly requestId: string;
     }
   | {
+      /** The choice deadline elapsed without a complete accepted answer. */
+      readonly type: "choice.expired";
+      readonly requestId: string;
+    }
+  | {
       /** The complete fixed-schema answer was written to the App Server stream. */
       readonly type: "choice.answer_dispatched";
       readonly requestId: string;

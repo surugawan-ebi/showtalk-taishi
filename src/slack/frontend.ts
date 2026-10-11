@@ -1073,6 +1073,7 @@ export class SlackFrontend {
     this.#interactionAudit({
       event: "choice.answer_recorded",
       ...routing,
+      outcome: choiceAnswerAuditOutcome(routing.purpose, selectedOptionId),
     });
     await deliverChoiceAnswerBeforeReceipt(
       () => this.#gateway.resolveUserInput(
@@ -1439,10 +1440,13 @@ export class SlackFrontend {
               logger.error(error);
               if (result.event.type === "choice.requested") {
                 try {
-                  await this.#gateway.resolveSessionUserInput(result.sessionId, {
-                    requestId: result.event.requestId,
-                    cancelled: true,
-                  });
+                  await cancelUnprojectedChoice(
+                    this.#gateway,
+                    result.sessionId,
+                    result.event,
+                    this.#interactionAudit,
+                    { channelId: message.channel, rootThreadTs },
+                  );
                 } catch (resolutionError) {
                   throw new AggregateError(
                     [error, resolutionError],
@@ -1731,6 +1735,7 @@ export class SlackFrontend {
           this.#interactionAudit({
             event: "choice.answer_recorded",
             ...routing,
+            outcome: "other",
           });
           const selectedRouting = routing;
           await deliverChoiceAnswerBeforeReceipt(
@@ -2388,6 +2393,29 @@ export async function cancelUnprojectedNativeApproval(
   return true;
 }
 
+export async function cancelUnprojectedChoice(
+  gateway: Pick<Gateway, "resolveSessionUserInput">,
+  sessionId: string,
+  event: AgentEvent,
+  interactionAudit: InteractionAudit,
+  source: { readonly channelId: string; readonly rootThreadTs: string },
+): Promise<boolean> {
+  if (event.type !== "choice.requested") return false;
+  await gateway.resolveSessionUserInput(sessionId, {
+    requestId: event.requestId,
+    cancelled: true,
+  });
+  interactionAudit({
+    event: "choice.display_failed",
+    requestId: event.requestId,
+    channelId: source.channelId,
+    rootThreadTs: source.rootThreadTs,
+    sessionId,
+    outcome: "display_failed",
+  });
+  return true;
+}
+
 export function permissionApprovalPostArguments(
   request: PermissionApprovalPresentation,
   defaultNotificationUserId?: string,
@@ -2947,6 +2975,14 @@ export function choiceReceiptText(
   return continued
     ? `回答を新しいターンとして受け付けました（<@${userId}>）。`
     : `回答をCodexへ送信しました（<@${userId}>）。受理結果を確認中です。`;
+}
+
+export function choiceAnswerAuditOutcome(
+  purpose: "external_action_confirmation" | undefined,
+  optionId: string,
+): InteractionAuditOutcome {
+  if (purpose !== "external_action_confirmation") return "select";
+  return optionId === "option_1" ? "approve" : "reject";
 }
 
 /** Keeps Slack Web API latency out of the App Server callback lifetime. */

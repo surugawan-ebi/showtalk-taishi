@@ -83,6 +83,14 @@ Codex configuration and remove only the generated ShowTalk AppOps hook/trust
 entry. Taishi does not modify user configuration automatically.
 
 If `request_user_input` returns `answers: {}`, the gated action remains blocked.
+A bare empty answer establishes only that the model received no answer. It is
+not evidence that Slack controls were absent or broken. Diagnosis must keep
+card display (`choice.controls_attached`), expiry (`choice.expired`), approval
+or rejection (`choice.answer_recorded`), Slack action failure
+(`choice.action_failed`), and App Server delivery failure
+(`choice.delivery_failed`) distinct. When the correlated lifecycle evidence is
+unavailable, report the cause as unconfirmed instead of carrying a prior UI
+failure claim forward.
 A Koe with `showtalk` in its consultations immediately sends sanitized context
 there to determine whether the empty result was expected for the request mode
 and to request a bounded diagnosis and fix when it was not. The consultation

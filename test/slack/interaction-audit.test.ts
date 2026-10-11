@@ -3,8 +3,74 @@ import test from "node:test";
 
 import {
   createInteractionAudit,
+  summarizeStructuredInputAudit,
   type InteractionAuditInput,
 } from "../../src/slack/interaction-audit.js";
+
+test("keeps display, decision, expiry, and delivery causes distinct", () => {
+  const displayed = {
+    event: "choice.controls_attached",
+    outcome: "interactive",
+  } as const satisfies InteractionAuditInput;
+  assert.deepEqual(summarizeStructuredInputAudit([
+    displayed,
+    { event: "choice.expired", outcome: "expired" },
+  ]), {
+    presentation: "displayed",
+    decision: "none",
+    terminal: "expired",
+    emptyAnswerObserved: false,
+  });
+  assert.deepEqual(summarizeStructuredInputAudit([
+    displayed,
+    { event: "choice.answer_recorded", outcome: "approve" },
+    { event: "choice.card_terminalized", outcome: "answer_dispatched" },
+  ]), {
+    presentation: "displayed",
+    decision: "approved",
+    terminal: "answered",
+    emptyAnswerObserved: false,
+  });
+  assert.deepEqual(summarizeStructuredInputAudit([
+    displayed,
+    { event: "choice.answer_recorded", outcome: "reject" },
+    { event: "choice.card_terminalized", outcome: "answer_dispatched" },
+  ]), {
+    presentation: "displayed",
+    decision: "rejected",
+    terminal: "answered",
+    emptyAnswerObserved: false,
+  });
+  assert.deepEqual(summarizeStructuredInputAudit([
+    { event: "choice.display_failed", outcome: "display_failed" },
+  ]), {
+    presentation: "not_displayed",
+    decision: "none",
+    terminal: "unknown",
+    emptyAnswerObserved: false,
+  });
+  assert.deepEqual(summarizeStructuredInputAudit([
+    displayed,
+    { event: "choice.delivery_failed", outcome: "client_error" },
+  ]), {
+    presentation: "displayed",
+    decision: "none",
+    terminal: "delivery_failed",
+    emptyAnswerObserved: false,
+  });
+});
+
+test("does not infer a display or terminal failure from an empty answer alone", () => {
+  assert.deepEqual(summarizeStructuredInputAudit([{
+    event: "structured_input.answer_dispatch_failed",
+    outcome: "empty_answers_rejected",
+  }]), {
+    presentation: "unknown",
+    decision: "none",
+    terminal: "unknown",
+    emptyAnswerObserved: true,
+  });
+});
 
 test("text attribution uses fixed classification and hashed actor and message references", () => {
   const lines: string[] = [];

@@ -618,8 +618,10 @@ test("marks still-running tools unfinished when a turn projection closes", async
 
 test("keeps approvals and errors as separate actionable messages", async () => {
   const { client, posts, updates } = recordingClient();
+  const audit: InteractionAuditInput[] = [];
   const projector = new SlackThreadProjector(client, "C1", "100.0", {
     sourceUserId: "U123",
+    interactionAudit: (event) => { audit.push(event); },
   });
   projector.setSessionId("session-1");
 
@@ -648,6 +650,23 @@ test("keeps approvals and errors as separate actionable messages", async () => {
   });
   assert.equal(posts[2]?.text, ":warning: Turn failed\n\n<@U123>");
   assert.equal(posts[2]?.mrkdwn, true);
+  assert.deepEqual(audit, [
+    {
+      event: "approval.request_received",
+      requestId: "request-1",
+      channelId: "C1",
+      rootThreadTs: "100.0",
+      sessionId: "session-1",
+    },
+    {
+      event: "approval.controls_attached",
+      requestId: "request-1",
+      channelId: "C1",
+      rootThreadTs: "100.0",
+      messageTs: "102.1",
+      sessionId: "session-1",
+    },
+  ]);
 });
 
 test("projects an ordinary model question as non-Git Slack choices", async () => {
@@ -718,6 +737,114 @@ test("projects an external-action confirmation with an explicit non-Git warning"
   assert.match(rendered, /Git承認状態を変更しません/u);
   assert.match(rendered, /external_action_confirmation/u);
   assert.doesNotMatch(rendered, /taishi\.git_plan/u);
+});
+
+test("terminalizes a displayed external-action choice as expired, not display failure", async () => {
+  const { client, updates } = recordingClient();
+  const audit: InteractionAuditInput[] = [];
+  let now = Date.parse("2026-10-06T03:11:28.000+09:00");
+  const store = new StructuredChoiceContinuationStore(() => now);
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    sourceUserId: "U123",
+    choiceContinuationStore: store,
+    interactionAudit: (event) => audit.push(event),
+  });
+  projector.setSessionId("session_1");
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111121";
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: "2026-10-06T03:41:25.000+09:00",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "External action",
+      prompt: "Target: synthetic\nScope: test\nImpact: none",
+      options: [
+        { id: "option_1", label: "approve", description: "approve" },
+        { id: "option_2", label: "reject", description: "reject" },
+      ],
+      allowsOther: false,
+    },
+  });
+  now = Date.parse("2026-10-06T03:41:25.000+09:00");
+  await projector.project({ type: "choice.expired", requestId });
+
+  assert.match(String(updates.at(-1)?.text), /表示済み.*期限切れ/u);
+  assert.match(String(updates.at(-1)?.text), /未承認/u);
+  assert.deepEqual(updates.at(-1)?.blocks, []);
+  assert.ok(audit.some((event) =>
+    event.event === "choice.controls_attached" && event.requestId === requestId
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "choice.expired" && event.outcome === "expired"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "choice.card_terminalized" && event.outcome === "expired"
+  ));
+  assert.equal(audit.some((event) => event.event === "choice.display_failed"), false);
+});
+
+test("retains an expired choice route until a bounded terminal update succeeds", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let terminalFailures = 3;
+  const client = {
+    chat: {
+      postMessage: async () => ({ ok: true, ts: "102.1" }),
+      update: async (input: Record<string, unknown>) => {
+        updates.push(input);
+        if (
+          String(input.text).includes("期限切れ") &&
+          terminalFailures-- > 0
+        ) {
+          throw new Error("temporary Slack failure");
+        }
+        return { ok: true };
+      },
+    },
+  } as unknown as WebClient;
+  let now = 1_000;
+  const store = new StructuredChoiceContinuationStore(() => now);
+  const audit: InteractionAuditInput[] = [];
+  const projector = new SlackThreadProjector(client, "C1", "100.0", {
+    choiceContinuationStore: store,
+    interactionAudit: (event) => audit.push(event),
+  });
+  projector.setSessionId("session_1");
+  const requestId = "codex-choice:11111111-1111-4111-8111-111111111122";
+  await projector.project({
+    type: "choice.requested",
+    requestId,
+    expiresAt: new Date(2_000).toISOString(),
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "External action",
+      prompt: "Target: synthetic\nScope: test\nImpact: none",
+      options: [
+        { id: "option_1", label: "approve", description: "approve" },
+        { id: "option_2", label: "reject", description: "reject" },
+      ],
+      allowsOther: false,
+    },
+  });
+  now = 2_000;
+
+  await projector.project({ type: "choice.expired", requestId });
+  assert.ok(store.getDisplayedForTerminalProjection(requestId));
+  assert.equal(
+    audit.some((event) => event.event === "choice.card_terminalized"),
+    false,
+  );
+
+  await projector.project({ type: "choice.expired", requestId });
+  assert.equal(store.getDisplayedForTerminalProjection(requestId), undefined);
+  assert.deepEqual(updates.at(-1)?.blocks, []);
+  assert.ok(audit.some((event) =>
+    event.event === "choice.card_terminalized" && event.outcome === "expired"
+  ));
 });
 
 test("replaces an externally resolved ordinary choice with a new-turn continuation", async () => {
