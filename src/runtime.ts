@@ -150,6 +150,10 @@ export interface TaishiFrontend extends RuntimeSlackPort {
   updateWorkspaceGitAutonomySettings?(
     settings: readonly WorkspaceGitAutonomyRuntimeSettings[],
   ): void;
+  presentWorkAttention?(
+    notification: WorkAttentionNotification,
+  ): Promise<void>;
+  connectionStatus?(): SlackConnectionStatus | "unknown";
 }
 
 export interface CreateRuntimeOptions {
@@ -362,6 +366,7 @@ async function createLockedRuntime(
         : { onRestartRequested: options.onRestartRequested }),
       gatewayRestartReplayGuard,
       runtimeInstanceId: randomUUID(),
+      delegationAttachmentRoot: join(attachmentRoot, "delegations"),
       onStateChanged: persist,
     },
   );

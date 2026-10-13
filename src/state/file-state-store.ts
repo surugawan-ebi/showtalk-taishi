@@ -417,10 +417,34 @@ function isQueuedDelegationJob(value: unknown): value is QueuedDelegationJob {
     record.pendingChildIds.every(nonEmptyString) &&
     Array.isArray(record.childOutcomes) &&
     record.childOutcomes.every(isQueuedDelegationChildOutcome) &&
+    (record.attachments === undefined ||
+      (Array.isArray(record.attachments) &&
+        record.attachments.length > 0 &&
+        record.attachments.length <= 10 &&
+        record.attachments.every(isQueuedDelegationAttachment) &&
+        record.attachments.reduce(
+          (total, attachment) =>
+            total + Number((attachment as Record<string, unknown>).size),
+          0,
+        ) <= 50 * 1024 * 1024)) &&
     (record.turnFailure === undefined || isQueuedDelegationOutcome(record.turnFailure)) &&
     (record.sourceContinuationStarted === undefined ||
       typeof record.sourceContinuationStarted === "boolean") &&
     (record.outcome === undefined || isQueuedDelegationOutcome(record.outcome))
+  );
+}
+
+function isQueuedDelegationAttachment(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.kind === "image" &&
+    ["path", "name", "mimeType"].every((key) => nonEmptyString(record[key])) &&
+    Number.isSafeInteger(record.size) &&
+    Number(record.size) > 0 &&
+    Number(record.size) <= 25 * 1024 * 1024 &&
+    typeof record.sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(record.sha256)
   );
 }
 

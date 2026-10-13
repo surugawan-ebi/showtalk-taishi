@@ -55,7 +55,15 @@ try {
       break;
     case "start":
       if (isGatewayWorker()) {
-        process.exitCode = await runGatewayWorker(invocation.configPath);
+        const workerExitCode = await runGatewayWorker(invocation.configPath);
+        // Runtime shutdown has flushed state and released its lock. A Slack SDK
+        // reconnect timer must not keep the retired Worker alive and prevent
+        // the Supervisor from starting its replacement.
+        await Promise.all([
+          new Promise<void>((resolve) => process.stdout.write("", () => resolve())),
+          new Promise<void>((resolve) => process.stderr.write("", () => resolve())),
+        ]);
+        process.exit(workerExitCode);
       } else {
         await superviseGatewayWorker({
           onRestart: () => {

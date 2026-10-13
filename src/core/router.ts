@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentAdapter } from "./adapter.js";
+import type { AgentAdapter, AgentInputAttachment } from "./adapter.js";
 import { CoreError } from "./errors.js";
 import { InMemoryAgentRegistry } from "./registry.js";
 import type {
@@ -14,6 +14,7 @@ export interface DelegationRequest {
   readonly sourceAgentId: AgentId;
   readonly targetAgentId: AgentId;
   readonly message: string;
+  readonly attachments?: readonly AgentInputAttachment[];
   /** Trusted Slack reply destination of the source turn, when it has one. */
   readonly sourceRootThreadTs?: string;
   /** Authenticated Slack user whose request originated this delegation chain. */
@@ -208,6 +209,15 @@ export class AgentRouter {
         `No adapter is registered for kind ${target.adapter}`,
       );
     }
+    if (
+      request.attachments?.some((attachment) => attachment.kind === "image") === true &&
+      adapter.capabilities.imageInput !== true
+    ) {
+      throw new CoreError(
+        "ADAPTER_CAPABILITY_UNAVAILABLE",
+        `Koe ${target.id} adapter does not support image input`,
+      );
+    }
     const delegationId = context.delegationId ?? this.#idFactory();
     const releaseAgentTurn =
       context.reservedTurnRelease ?? this.#registry.reserveAgentTurn(target.id);
@@ -282,6 +292,9 @@ export class AgentRouter {
         try {
           for await (const event of adapter.sendMessage(session.adapterSession, {
             text: request.message,
+            ...(request.attachments === undefined || request.attachments.length === 0
+              ? {}
+              : { attachments: request.attachments }),
             source: {
               type: "agent",
               agentId: source.id,

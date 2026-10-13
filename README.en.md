@@ -77,7 +77,7 @@ machine does not need a public HTTP server.
 | 🤖 | **Multiple backends** | Choose Codex App Server or Claude Code (`claude-code` adapter) per Koe |
 | 🔀 | **Koe consultations** | Direct `agent.send` visits protected by allowlists, scopes, hop limits, and busy handling |
 | ✅ | **Slack-native decisions** | Clearly separated command, file-change, ordinary-choice, non-Git external-action, and exact Git-plan flows |
-| 📎 | **Images and audio** | Native multi-image input, safe audio-file ingress, origin-bound artifact replies, and inline generated-image projection |
+| 📎 | **Images and audio** | Native multi-image input, image attachments between Koe, safe audio-file ingress, origin-bound artifact replies, and inline generated-image projection |
 | ⏯️ | **Operational controls** | Status, Interrupt, approver-only Gateway restart, and durable backend-thread mappings |
 | 🎭 | **Per-Koe presentation** | Call names, roles, Slack display names and icons, and Slack-only personas |
 | 🧭 | **Management UI** | A loopback-only UI for mappings and runtime-editable model settings |

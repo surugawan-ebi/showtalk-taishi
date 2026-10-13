@@ -103,7 +103,7 @@ Claude Codeです。SlackとはSocket Modeで
 | 🤖 | **複数のバックエンド** | KoeごとにCodex App ServerまたはClaude Code（`claude-code`アダプター）を選択 |
 | 🔀 | **Koe間の相談** | allowlist、scope、hop数、busy保護付きの`agent.send`で別Koeへ直接相談 |
 | ✅ | **Slackネイティブ確認** | コマンド、ファイル変更、通常選択、非Git外部操作、exact Git planをBlock Kitで明確に分離 |
-| 📎 | **画像・音声** | 複数画像のnative入力、音声ファイルの安全な受信、要求元スレッドに束縛された返信、インライン生成画像の投影 |
+| 📎 | **画像・音声** | 複数画像のnative入力、Koe間の画像添付、音声ファイルの安全な受信、要求元スレッドに束縛された返信、インライン生成画像の投影 |
 | ⏯️ | **運用コントロール** | Status、Interrupt、approver限定Gateway restart、backend threadとmappingの永続化 |
 | 🎭 | **Koeごとの表示** | call name、role、Slack表示名・アイコン、Slack専用persona |
 | 🧭 | **管理UI** | loopback限定UIでmappingと実行時変更可能なmodel設定を管理 |

@@ -662,6 +662,16 @@ export interface QueuedDelegationOutcome {
   readonly text: string;
 }
 
+/** Immutable image captured into the private Gateway spool for a queued visit. */
+export interface QueuedDelegationAttachment {
+  readonly kind: "image";
+  readonly path: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
 /**
  * Durable accepted Koe-to-Koe work. Adapter turns may stop and resume while one
  * job waits for child consultations; the job remains the result owner.
@@ -679,6 +689,7 @@ export interface QueuedDelegationJob {
   readonly consultationScope: string;
   readonly permissionDecision: "allow" | "approval";
   readonly message: string;
+  readonly attachments?: readonly QueuedDelegationAttachment[];
   readonly metadata?: Readonly<Record<string, JsonValue>>;
   /** Causation depth for the next adapter turn of this job. */
   readonly depth: number;

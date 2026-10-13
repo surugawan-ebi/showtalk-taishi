@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -61,6 +68,36 @@ class FakeAdapter implements AgentAdapter {
 
   async interrupt(): Promise<void> {
     this.interruptCalls += 1;
+  }
+}
+
+class ImageInputFakeAdapter extends FakeAdapter {
+  override readonly capabilities: AgentCapabilities = {
+    streaming: true,
+    approval: false,
+    interrupt: true,
+    resume: true,
+    toolEvents: false,
+    imageInput: true,
+  };
+  readonly receivedImages: Array<{
+    readonly name: string;
+    readonly mimeType: string;
+    readonly contents: Buffer;
+  }> = [];
+
+  override async *sendMessage(
+    session: AdapterSession,
+    request: SendMessageRequest,
+  ): AsyncIterable<AgentEvent> {
+    for (const attachment of request.attachments ?? []) {
+      this.receivedImages.push({
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        contents: await readFile(attachment.path),
+      });
+    }
+    yield* super.sendMessage(session, request);
   }
 }
 
@@ -285,6 +322,7 @@ function setup(
     ownChannelWrite?: "allow" | "deny" | "approval";
     agentChannelWrite?: "allow" | "deny" | "approval";
     workspacePath?: string;
+    delegationAttachmentRoot?: string;
     onRestartRequested?: () => void;
     adapter?: FakeAdapter;
     allowReviewerConsultation?: boolean;
@@ -390,6 +428,9 @@ function setup(
     ...(options.onStateChanged === undefined
       ? {}
       : { onStateChanged: options.onStateChanged }),
+    ...(options.delegationAttachmentRoot === undefined
+      ? {}
+      : { delegationAttachmentRoot: options.delegationAttachmentRoot }),
   });
   const posts: unknown[][] = [];
   const projected: unknown[] = [];
@@ -654,6 +695,73 @@ test("accepts agent.send durably and continues the final result", async () => {
     String((continuations[0] as { result?: string }).result),
     /Looks good/u,
   );
+});
+
+test("captures agent.send images durably and passes native image input to the target Koe", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "taishi-koe-images-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const spool = join(root, "spool");
+  await mkdir(workspace);
+  const original = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02,
+  ]);
+  await writeFile(join(workspace, "review.png"), original);
+  const adapter = new ImageInputFakeAdapter();
+  const { service, registry } = setup({
+    adapter,
+    workspacePath: workspace,
+    delegationAttachmentRoot: spool,
+  });
+  const releaseTurn = bindActiveSource(registry);
+
+  const result = await service.agentSend(
+    context(),
+    "reviewer",
+    "Review this image",
+    [{ path: "review.png", alt_text: "Review target" }],
+  );
+  assert.equal(result.status, "queued");
+  await writeFile(join(workspace, "review.png"), Buffer.from("changed"));
+  releaseTurn();
+  await service.waitForIdle();
+
+  assert.equal(adapter.receivedImages.length, 1);
+  assert.equal(adapter.receivedImages[0]?.name, "review.png");
+  assert.equal(adapter.receivedImages[0]?.mimeType, "image/png");
+  assert.deepEqual(adapter.receivedImages[0]?.contents, original);
+  assert.deepEqual(await readdir(spool), []);
+});
+
+test("rejects non-image agent.send attachments before queue admission", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "taishi-koe-images-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await writeFile(
+    join(workspace, "voice.wav"),
+    Buffer.from("RIFF0000WAVEpayload", "ascii"),
+  );
+  const { service, registry } = setup({
+    workspacePath: workspace,
+    delegationAttachmentRoot: join(root, "spool"),
+  });
+  const releaseTurn = bindActiveSource(registry);
+  t.after(releaseTurn);
+
+  await assert.rejects(
+    service.agentSend(
+      context(),
+      "reviewer",
+      "Review this attachment",
+      [{ path: "voice.wav" }],
+    ),
+    (error) =>
+      error instanceof McpServiceError &&
+      error.code === "INVALID_ATTACHMENT" &&
+      /image attachments only/u.test(error.message),
+  );
+  assert.deepEqual(registry.listQueuedDelegations(), []);
 });
 
 test("reports a delegation depth limit before queued admission", async () => {
