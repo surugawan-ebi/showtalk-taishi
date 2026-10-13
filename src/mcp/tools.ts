@@ -127,7 +127,7 @@ export function createAgentMcpServer(
     {
       title: "Talk to Another Koe",
       description:
-        "Durably queue work for a configured consultation target through the Gateway using its canonical ID or exact call_name from agent.list. A live Koe call returns queued with a delegation_id; do not resend it. The target runs one turn at a time and the final success or failure resumes the exact originating conversation. This creates a visible visit to another persistent Koe and Slack channel; it is not a Codex internal subagent. The request must stay within consultation_scope. Never infer an unlisted name. Never use this tool to display, relay, approve, or reconstruct a Git approval owned by the caller Koe.",
+        "Durably queue work and optional workspace-relative image attachments for a configured consultation target through the Gateway using its canonical ID or exact call_name from agent.list. Images are validated and delivered as native model input. A live Koe call returns queued with a delegation_id; do not resend it. The target runs one turn at a time and the final success or failure resumes the exact originating conversation. This creates a visible visit to another persistent Koe and Slack channel; it is not a Codex internal subagent. The request must stay within consultation_scope. Never infer an unlisted name. Never use this tool to display, relay, approve, or reconstruct a Git approval owned by the caller Koe.",
       inputSchema: agentSendInputSchema,
       outputSchema: agentSendOutputSchema,
       annotations: {
@@ -137,7 +137,7 @@ export function createAgentMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ target, message }, extra) =>
+    async ({ target, message, attachments }, extra) =>
       executeTool(agentSendOutputSchema, () =>
         service.agentSend(
           context(
@@ -149,6 +149,13 @@ export function createAgentMcpServer(
           ),
           target,
           message,
+          attachments?.map((attachment) => ({
+            path: attachment.path,
+            ...(attachment.title === undefined ? {} : { title: attachment.title }),
+            ...(attachment.alt_text === undefined
+              ? {}
+              : { alt_text: attachment.alt_text }),
+          })),
         ),
       ),
   );

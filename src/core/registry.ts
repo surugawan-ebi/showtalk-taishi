@@ -905,6 +905,26 @@ function validateQueuedDelegation(
   if (!Number.isSafeInteger(job.depth) || job.depth < 1 || job.depth > 32) {
     throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation depth");
   }
+  if (
+    job.attachments !== undefined &&
+    (job.attachments.length === 0 ||
+      job.attachments.length > 10 ||
+      job.attachments.reduce((total, attachment) => total + attachment.size, 0) >
+        50 * 1024 * 1024 ||
+      job.attachments.some(
+        (attachment) =>
+          attachment.kind !== "image" ||
+          attachment.path.trim().length === 0 ||
+          attachment.name.trim().length === 0 ||
+          !attachment.mimeType.startsWith("image/") ||
+          !Number.isSafeInteger(attachment.size) ||
+          attachment.size < 1 ||
+          attachment.size > 25 * 1024 * 1024 ||
+          !/^[a-f0-9]{64}$/u.test(attachment.sha256),
+      ))
+  ) {
+    throw new CoreError("INVALID_STATE_SNAPSHOT", "Invalid delegation attachments");
+  }
   if (Number.isNaN(Date.parse(job.createdAt)) ||
       Number.isNaN(Date.parse(job.queueExpiresAt)) ||
       Number.isNaN(Date.parse(job.updatedAt))) {

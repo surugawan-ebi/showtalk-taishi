@@ -96,6 +96,7 @@ export interface SwitchboardMcpService {
     context: McpCallerContext,
     target: string,
     message: string,
+    attachments?: readonly McpSlackAttachmentInput[],
   ): MaybePromise<McpAgentSendResult>;
   gatewayRestart(
     context: McpCallerContext,

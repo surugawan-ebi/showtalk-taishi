@@ -291,8 +291,12 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
       calls.push({ method: "agent.status", caller: context.agentId, values: [target] });
       return { agent_id: target, status: "idle", session_id: "session-1" };
     },
-    agentSend: (context, target, message) => {
-      calls.push({ method: "agent.send", caller: context.agentId, values: [target, message] });
+    agentSend: (context, target, message, attachments) => {
+      calls.push({
+        method: "agent.send",
+        caller: context.agentId,
+        values: [target, message, attachments],
+      });
       return {
         target,
         status: "completed",
@@ -411,7 +415,11 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
   });
   const sent = await client.callTool({
     name: "agent.send",
-    arguments: { target: "reviewer", message: "Review this change" },
+    arguments: {
+      target: "reviewer",
+      message: "Review this change",
+      attachments: [{ path: "artifacts/review.png", alt_text: "Review image" }],
+    },
   });
   assert.equal(sent.isError, undefined);
   assert.deepEqual(sent.structuredContent, {
@@ -420,6 +428,11 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
     message: "Looks good",
     delegation_id: "delegation-1",
   });
+  assert.deepEqual(calls.at(-1)?.values, [
+    "reviewer",
+    "Review this change",
+    [{ path: "artifacts/review.png", alt_text: "Review image" }],
+  ]);
   const restarted = await client.callTool({
     name: "gateway.restart",
     arguments: {},

@@ -8,6 +8,7 @@ import {
   type Gateway,
   type GatewayAgentEvent,
   type InMemoryAgentRegistry,
+  type QueuedDelegationAttachment,
   type QueuedDelegationJob,
   type QueuedDelegationOutcome,
   type QueuedDelegationSource,
@@ -22,6 +23,11 @@ import {
   withResolvedWorkspaceAttachments,
   type RuntimeSlackAttachment,
 } from "./workspace-attachments.js";
+import {
+  captureDelegationImages,
+  removeDelegationImages,
+  restoreDelegationImages,
+} from "./delegation-attachments.js";
 import {
   McpServiceError,
   type McpAgentListResult,
@@ -49,6 +55,7 @@ export interface RuntimeMcpServiceOptions {
   readonly now?: () => Date;
   readonly idFactory?: () => string;
   readonly delegationQueueTtlMs?: number;
+  readonly delegationAttachmentRoot?: string;
 }
 
 export interface RuntimeSlackPort {
@@ -114,6 +121,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
   readonly #now: () => Date;
   readonly #idFactory: () => string;
   readonly #delegationQueueTtlMs: number;
+  readonly #delegationAttachmentRoot: string | undefined;
   readonly #idempotency = new Map<string, IdempotencyEntry>();
   readonly #queueWorkers = new Map<string, Promise<void>>();
   readonly #queueBlockedTargetIds = new Set<string>();
@@ -148,6 +156,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     this.#idFactory = options.idFactory ?? (() => randomUUID());
     this.#delegationQueueTtlMs =
       options.delegationQueueTtlMs ?? DEFAULT_DELEGATION_QUEUE_TTL_MS;
+    this.#delegationAttachmentRoot = options.delegationAttachmentRoot;
     if (
       !Number.isSafeInteger(this.#delegationQueueTtlMs) ||
       this.#delegationQueueTtlMs < 1_000
@@ -269,6 +278,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     context: McpCallerContext,
     target: string,
     message: string,
+    attachments: readonly McpSlackAttachmentInput[] = [],
   ): Promise<McpAgentSendResult> {
     context = this.#liveContext(context);
     this.#requireCaller(context);
@@ -277,8 +287,8 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       return await this.#once(
         context,
         "agent.send",
-        [targetAgentId, message],
-        () => this.#executeAgentSend(context, targetAgentId, message),
+        [targetAgentId, message, attachments],
+        () => this.#executeAgentSend(context, targetAgentId, message, attachments),
       );
     } catch (error) {
       // The queued path performs routing and durable admission before a target
@@ -423,6 +433,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     context: McpCallerContext,
     target: string,
     message: string,
+    attachments: readonly McpSlackAttachmentInput[],
   ): Promise<McpAgentSendResult> {
     const caller = this.#requireCaller(context);
     const targetAgent = this.#registry.requireAgent(target);
@@ -446,7 +457,12 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     // Tests and administrative callers without a live Gateway-owned turn keep
     // the legacy synchronous path. A real Koe call always has an exact source.
     if (source === undefined) {
-      return this.#executeAgentSendSynchronously(context, target, message);
+      return this.#executeAgentSendSynchronously(
+        context,
+        target,
+        message,
+        attachments,
+      );
     }
     const policy = this.#permissions.agentSend(caller.id, targetAgent.id);
     if (policy === "deny") {
@@ -498,9 +514,16 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       this.#activeTurnIdempotencyScope(caller.id) ?? source.turnStartedAt,
       targetAgent.id,
       message,
+      JSON.stringify(attachments),
     ]);
     const now = this.#now();
     const delegationId = this.#idFactory();
+    const capturedAttachments = await this.#captureAgentSendAttachments(
+      caller,
+      delegationId,
+      attachments,
+      context.signal,
+    );
     const workspacePath = targetAgent.metadata?.workspacePath;
     const job: QueuedDelegationJob = {
       version: 1,
@@ -515,6 +538,9 @@ export class RuntimeMcpService implements SwitchboardMcpService {
       consultationScope,
       permissionDecision: policy,
       message,
+      ...(capturedAttachments.length === 0
+        ? {}
+        : { attachments: capturedAttachments }),
       metadata: { origin: "mcp.agent.send" },
       depth: derived.context.depth,
       ...(derived.context.parentDelegationId === undefined
@@ -532,41 +558,49 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     const continuationId = derived.continuationDelegationId;
     let acceptedJob = job;
     let recordedContinuation = false;
-    await this.#mutateQueuedDelegations((jobs) => {
-      const existing = jobs.find((candidate) => candidate.requestKey === requestKey);
-      if (existing !== undefined) {
-        acceptedJob = existing;
-        return jobs;
-      }
-      if (continuationId !== undefined) {
-        if (this.#registry.hasUsedContinuationDelegation(continuationId)) {
-          throw new McpServiceError(
-            "DELEGATION_CONTINUATION_ALREADY_USED",
-            `Delayed delegation result ${continuationId} already started its next Koe step`,
-          );
+    try {
+      await this.#mutateQueuedDelegations((jobs) => {
+        const existing = jobs.find((candidate) => candidate.requestKey === requestKey);
+        if (existing !== undefined) {
+          acceptedJob = existing;
+          return jobs;
         }
-        this.#registry.recordUsedContinuationDelegation(continuationId);
-        recordedContinuation = true;
-      }
-      const parentUpdated = source.type === "job"
-        ? jobs.map((candidate) =>
-            candidate.id === source.ownerJobId
-              ? {
-                  ...candidate,
-                  pendingChildIds: [...candidate.pendingChildIds, delegationId],
-                  updatedAt: now.toISOString(),
-                }
-              : candidate,
-          )
-        : jobs;
-      const next = [...parentUpdated, job];
-      this.#registry.assertQueuedDelegationAdmission(next);
-      return next;
-    }, () => {
-      if (continuationId !== undefined && recordedContinuation) {
-        this.#registry.removeUsedContinuationDelegation(continuationId);
-      }
-    });
+        if (continuationId !== undefined) {
+          if (this.#registry.hasUsedContinuationDelegation(continuationId)) {
+            throw new McpServiceError(
+              "DELEGATION_CONTINUATION_ALREADY_USED",
+              `Delayed delegation result ${continuationId} already started its next Koe step`,
+            );
+          }
+          this.#registry.recordUsedContinuationDelegation(continuationId);
+          recordedContinuation = true;
+        }
+        const parentUpdated = source.type === "job"
+          ? jobs.map((candidate) =>
+              candidate.id === source.ownerJobId
+                ? {
+                    ...candidate,
+                    pendingChildIds: [...candidate.pendingChildIds, delegationId],
+                    updatedAt: now.toISOString(),
+                  }
+                : candidate,
+            )
+          : jobs;
+        const next = [...parentUpdated, job];
+        this.#registry.assertQueuedDelegationAdmission(next);
+        return next;
+      }, () => {
+        if (continuationId !== undefined && recordedContinuation) {
+          this.#registry.removeUsedContinuationDelegation(continuationId);
+        }
+      });
+    } catch (error) {
+      await this.#removeCapturedAttachments(capturedAttachments);
+      throw error;
+    }
+    if (acceptedJob !== job) {
+      await this.#removeCapturedAttachments(capturedAttachments);
+    }
     this.#scheduleTargetQueue(acceptedJob.targetAgentId);
     return {
       target: acceptedJob.targetAgentId,
@@ -580,6 +614,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     context: McpCallerContext,
     target: string,
     message: string,
+    attachments: readonly McpSlackAttachmentInput[],
   ): Promise<McpAgentSendResult> {
     const caller = this.#requireCaller(context);
     const targetAgentId = target;
@@ -597,6 +632,21 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     const router = this.#requireRouter();
     if (context.signal.aborted) {
       throw new McpServiceError("REQUEST_CANCELLED", "The MCP request was cancelled");
+    }
+    const capturedAttachments = await this.#captureAgentSendAttachments(
+      caller,
+      `sync-${digest([context.requestId, targetAgentId, message])}`,
+      attachments,
+      context.signal,
+    );
+    let routedAttachments;
+    try {
+      routedAttachments = await this.#restoreCapturedAttachments(
+        capturedAttachments,
+      );
+    } catch (error) {
+      await this.#removeCapturedAttachments(capturedAttachments);
+      throw error;
     }
 
     let delegationId: string | undefined;
@@ -636,6 +686,9 @@ export class RuntimeMcpService implements SwitchboardMcpService {
         sourceAgentId: context.agentId,
         targetAgentId,
         message,
+        ...(routedAttachments.length === 0
+          ? {}
+          : { attachments: routedAttachments }),
         ...(sourceTurn === undefined
           ? {}
           : {
@@ -726,6 +779,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     } finally {
       context.signal.removeEventListener("abort", abortBeforeAcceptance);
       this.#shutdown.signal.removeEventListener("abort", abortForShutdown);
+      await this.#removeCapturedAttachments(capturedAttachments);
     }
 
     const response = truncateResult(completed ?? streamed);
@@ -1118,11 +1172,17 @@ export class RuntimeMcpService implements SwitchboardMcpService {
     let response = "";
     const originSlackUserId = this.#originSlackUserId(initial);
     try {
+      const routedAttachments = await this.#restoreCapturedAttachments(
+        initial.attachments ?? [],
+      );
       for await (const activity of router.send(
         {
           sourceAgentId: initial.source.agentId,
           targetAgentId: initial.targetAgentId,
           message: initial.resumeMessage ?? initial.message,
+          ...(initial.resumeMessage !== undefined || routedAttachments.length === 0
+            ? {}
+            : { attachments: routedAttachments }),
           ...(initial.source.type === "slack"
             ? { sourceRootThreadTs: initial.source.rootThreadTs }
             : {}),
@@ -1431,6 +1491,7 @@ export class RuntimeMcpService implements SwitchboardMcpService {
           .filter((job) => job.id !== child.id)
           .map((job) => (job.id === finalParent.id ? finalParent : job));
       });
+      await this.#removeCapturedAttachments(pending.attachments);
       const settledParent = settledParentId === undefined
         ? undefined
         : this.#registry.getQueuedDelegation(settledParentId);
@@ -1519,10 +1580,65 @@ export class RuntimeMcpService implements SwitchboardMcpService {
   }
 
   async #removeDeliveredQueuedDelegation(jobId: string): Promise<void> {
+    const delivered = this.#registry.getQueuedDelegation(jobId);
     await this.#mutateQueuedDelegations((jobs) =>
       jobs.filter((job) => job.id !== jobId),
     );
+    await this.#removeCapturedAttachments(delivered?.attachments);
     this.#deliveryBlockedJobIds.delete(jobId);
+  }
+
+  async #captureAgentSendAttachments(
+    caller: { readonly metadata?: Readonly<Record<string, unknown>> },
+    delegationId: string,
+    attachments: readonly McpSlackAttachmentInput[],
+    signal: AbortSignal,
+  ): Promise<readonly QueuedDelegationAttachment[]> {
+    if (attachments.length === 0) return [];
+    if (this.#delegationAttachmentRoot === undefined) {
+      throw new McpServiceError(
+        "SERVICE_UNAVAILABLE",
+        "Koe image attachment storage is unavailable",
+      );
+    }
+    const workspacePath = caller.metadata?.workspacePath;
+    if (typeof workspacePath !== "string") {
+      throw new McpServiceError(
+        "INVALID_ATTACHMENT",
+        "The sending Koe has no configured workspace",
+      );
+    }
+    return captureDelegationImages(
+      workspacePath,
+      this.#delegationAttachmentRoot,
+      delegationId,
+      attachments,
+      signal,
+    );
+  }
+
+  async #restoreCapturedAttachments(
+    attachments: readonly QueuedDelegationAttachment[],
+  ) {
+    if (attachments.length === 0) return [];
+    if (this.#delegationAttachmentRoot === undefined) {
+      throw new McpServiceError(
+        "SERVICE_UNAVAILABLE",
+        "Koe image attachment storage is unavailable",
+      );
+    }
+    return restoreDelegationImages(this.#delegationAttachmentRoot, attachments);
+  }
+
+  async #removeCapturedAttachments(
+    attachments: readonly QueuedDelegationAttachment[] | undefined,
+  ): Promise<void> {
+    if (this.#delegationAttachmentRoot === undefined) return;
+    try {
+      await removeDelegationImages(this.#delegationAttachmentRoot, attachments);
+    } catch (error) {
+      this.#onProjectionError(error);
+    }
   }
 
   async slackPost(

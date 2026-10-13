@@ -107,6 +107,15 @@ const slackAttachmentsSchema = z
   .array(slackAttachmentInputSchema)
   .max(MAX_SLACK_ATTACHMENTS);
 
+const agentSendAttachmentsSchema = z
+  .array(
+    slackAttachmentInputSchema.describe(
+      "Workspace-relative image file to pass as native input to the target Koe",
+    ),
+  )
+  .min(1)
+  .max(MAX_SLACK_ATTACHMENTS);
+
 function requireSlackMessageOrAttachments<T extends {
   message?: string | undefined;
   attachments?: unknown[] | undefined;
@@ -151,6 +160,9 @@ export const agentSendInputSchema = z
       "Configured Koe ID or call name that should receive the direct Gateway request",
     ),
     message: messageSchema.describe("Work or question to send to the target Koe"),
+    attachments: agentSendAttachmentsSchema
+      .describe("Workspace-relative images to send to the target Koe")
+      .optional(),
   })
   .strict();
 export const slackPostInputSchema = z

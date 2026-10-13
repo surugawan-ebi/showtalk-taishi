@@ -174,6 +174,13 @@ parameters. Taishi does not upload or expose a local icon file implicitly.
 Changing a presentation changes only future Slack message rendering and cannot
 replace the Koe's canonical Codex thread or session binding.
 
+Optional `agent.send` images are resolved only from the authenticated source
+Koe's configured workspace. The Gateway rejects traversal, symlinks,
+unsupported media, mismatched file signatures, and size-limit violations,
+then stores a private hash-bound copy before durable queue admission. The
+target receives only the validated spool copy as native image input; audio is
+not accepted on this route.
+
 `adapter_session_id` is an operator-controlled canonical-session declaration.
 Gateway startup records the declaration without requiring the backend thread or
 workspace to be reachable; `taishi doctor` performs the explicit validation.

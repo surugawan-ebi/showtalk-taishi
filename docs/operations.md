@@ -212,6 +212,22 @@ target explicitly present in the source Koe's `consultations` is eligible.
 Slack shows the visit in the target channel; the Gateway—not Slack events—is
 the transport.
 
+Koe visits may include up to 10 PNG, JPEG, GIF, or WebP images from the
+sending Koe's workspace. The same 25 MiB per-file and 50 MiB combined limits
+apply. Images are validated, copied into the private Gateway spool before the
+request is accepted, and delivered to the target adapter as native image
+input. Audio is not accepted by `agent.send`:
+
+```text
+agent.send(
+  target="reviewer",
+  message="Review the attached screen against the specification.",
+  attachments=[
+    {path="artifacts/home-screen.png", alt_text="Home screen under review"}
+  ]
+)
+```
+
 For an ordered request, the controlling Koe sends one bounded step at a time
 and waits for its delayed result before formulating the next. A live
 `agent.send` call durably records the request, returns `queued` with a stable
