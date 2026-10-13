@@ -25,9 +25,9 @@
 </p>
 
 ShowTalk Taishi is a local-first, self-hosted Slack front end and switchboard
-for AI coding agents. It makes durable Codex threads available as a daily Slack
-control surface while preserving an `AgentAdapter` boundary for Claude Code, Gemini CLI, and other
-integrations.
+for AI coding agents. It makes durable Codex App Server and Claude Code sessions
+available as a daily Slack control surface while preserving an `AgentAdapter`
+boundary for Gemini CLI and other integrations.
 
 The name is inspired by Prince Shōtoku, traditionally associated in Japan with
 listening to several people at once. Taishi calls each persistent AI identity a
@@ -38,6 +38,16 @@ explicitly permitted Koe can consult one another.
 > This is runnable pre-release software. The public source is a `0.0.1`
 > preview, not a stable v0.1 or an npm release.
 > Configuration formats may still change before v0.1.
+
+## Recent updates
+
+- **2026-10-13: Durable image and audio delivery between Koe.** Consultation
+  attachments now use a bounded private spool for restart-safe delivery and
+  cleanup. [PR #57](https://github.com/surugawan-ebi/showtalk-taishi/pull/57)
+- **2026-10-12: Claude Code adapter.** Each Koe can use Codex App Server or
+  Claude Code, with durable sessions, Slack tool approvals, Gateway MCP, image
+  and audio input, Status, and Interrupt.
+  [PR #55](https://github.com/surugawan-ebi/showtalk-taishi/pull/55)
 
 ## What it does
 
@@ -56,8 +66,8 @@ explicitly permitted Koe can consult one another.
                  ▼               ▼               ▼
           Implementer Koe    Reviewer Koe     Operator Koe
                  │               │               │
-              Codex           Codex           Codex
-            App Server      App Server      App Server
+              Codex         Claude Code       Codex
+            App Server       Agent SDK      App Server
                  └── permitted agent.send consultations ──┘
 ```
 
@@ -73,7 +83,7 @@ machine does not need a public HTTP server.
 
 | | Capability | What it provides |
 | --- | --- | --- |
-| 🗣️ | **Persistent Koe** | Reuse durable Codex threads with channel-wide or Slack-thread-scoped mapping |
+| 🗣️ | **Persistent Koe** | Reuse durable backend sessions with channel-wide or Slack-thread-scoped mapping |
 | 🤖 | **Multiple backends** | Choose Codex App Server or Claude Code (`claude-code` adapter) per Koe |
 | 🔀 | **Koe consultations** | Direct `agent.send` visits protected by allowlists, scopes, hop limits, and busy handling |
 | ✅ | **Slack-native decisions** | Clearly separated command, file-change, ordinary-choice, non-Git external-action, and exact Git-plan flows |
@@ -108,7 +118,7 @@ workspace.
 
 - macOS or Linux
 - Node.js 22 or newer
-- an installed and authenticated `codex` CLI, or Claude Code authentication (for example `claude login`)
+- an installed and authenticated `codex` CLI, Claude Code authentication (for example `claude login`), or both, depending on the configured backends
 - permission to create and install a Slack App
 
 ### 1. Install
@@ -151,6 +161,11 @@ taishi doctor
 taishi start
 ```
 
+For a Claude-backed Koe, complete `claude login` on the host and add an adapter
+with `type: claude-code` to `config.yaml`. Codex and Claude can run side by side
+in one Gateway. See [Claude Code adapter](docs/configuration.md#claude-code-adapter)
+for a minimal configuration and all supported fields.
+
 See [Configuration](docs/configuration.md) for complete setup, existing Codex
 thread binding, Koe identity, personas, consultation policy, and the management
 UI. The npm package is intentionally `private` during this preview; install it
@@ -175,8 +190,8 @@ An ordinary workflow choice never authorizes an external write. See
   multi-tenant sandbox for untrusted local OS users.
 - The management UI and per-Koe MCP endpoints bind to loopback only. Do not
   expose them through a proxy or port forward.
-- Keep Slack and Codex credentials in environment variables or owner-only
-  files, never in Git.
+- Keep Slack and backend credentials (Codex/OpenAI and Claude/Anthropic) in
+  environment variables or owner-only files, never in Git.
 - Side effects routed through the Gateway are checked by the Permission Engine.
   This cannot revoke permissions independently granted to the backend, so keep
   the Codex sandbox and approval policy restrictive too.
