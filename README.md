@@ -25,8 +25,8 @@
 </p>
 
 ShowTalk Taishiは、AIコーディングエージェントのためのローカルファーストな
-Slackフロントエンド兼スイッチボードです。Codexの永続スレッドを日常的に
-Slackから操作しながら、Claude Codeにも対応し、Gemini CLIなども接続できる
+Slackフロントエンド兼スイッチボードです。Codex App ServerとClaude Codeの
+永続sessionをSlackから操作しながら、Gemini CLIなども接続できる
 `AgentAdapter`境界を保ちます。
 
 名前の由来は、複数人の声を同時に聞き分けたと伝えられる聖徳太子です。
@@ -42,6 +42,14 @@ Slackチャンネルごとに永続するAIの人格を **Koe（声）** と呼�
 Slackでの承認操作、Koe間の相談時の通知、承認結果の配送確認を改善しています。
 以下は`main`に反映済みの主な更新です。
 
+- **2026-10-13：Koe間の画像・音声添付を永続化**
+  相談先へ渡す画像・音声をprivate spoolへ安全に保存し、再起動をまたぐ配送と
+  完了後の削除を扱えるようにしました。
+  [PR #57](https://github.com/surugawan-ebi/showtalk-taishi/pull/57)
+- **2026-10-12：Claude Code adapterを追加**
+  KoeごとにCodex App ServerまたはClaude Codeを選択でき、永続session、Slack上の
+  tool承認、Gateway MCP、画像・音声入力、Status、Interruptに対応しました。
+  [PR #55](https://github.com/surugawan-ebi/showtalk-taishi/pull/55)
 - **2026-10-04：テキストによる承認・拒否**
   対応する承認カードに表示された`承認 <リクエストID>`／`拒否 <リクエストID>`を、
   同じSlackスレッドに返信できます。実際の投稿者、対象カード、期限、未処理状態を
@@ -82,8 +90,8 @@ Slackでの承認操作、Koe間の相談時の通知、承認結果の配送確
                  ▼               ▼               ▼
               実装Koe         レビューKoe       運用Koe
                  │               │               │
-              Codex           Codex           Codex
-            App Server      App Server      App Server
+              Codex         Claude Code       Codex
+            App Server       Agent SDK      App Server
                  └──── 許可された agent.send 相談 ────┘
 ```
 
@@ -99,7 +107,7 @@ Claude Codeです。SlackとはSocket Modeで
 
 | | 機能 | 内容 |
 | --- | --- | --- |
-| 🗣️ | **永続するKoe** | チャンネル単位またはSlackスレッド単位で、Codexスレッドを継続利用 |
+| 🗣️ | **永続するKoe** | チャンネル単位またはSlackスレッド単位で、backend sessionを継続利用 |
 | 🤖 | **複数のバックエンド** | KoeごとにCodex App ServerまたはClaude Code（`claude-code`アダプター）を選択 |
 | 🔀 | **Koe間の相談** | allowlist、scope、hop数、busy保護付きの`agent.send`で別Koeへ直接相談 |
 | ✅ | **Slackネイティブ確認** | コマンド、ファイル変更、通常選択、非Git外部操作、exact Git planをBlock Kitで明確に分離 |
@@ -130,7 +138,7 @@ Koeへ渡され、理解や文字起こしはworkspaceで利用できる別tool�
 
 - macOSまたはLinux
 - Node.js 22以上
-- インストール・認証済みの`codex` CLI、またはClaude Codeの認証（`claude login`など）
+- 利用するbackendに応じて、インストール・認証済みの`codex` CLI、Claude Codeの認証（`claude login`など）、またはその両方
 - Slack Appを作成・インストールできる権限
 
 ### 1. インストール
@@ -172,6 +180,11 @@ taishi doctor
 taishi start
 ```
 
+Claude Codeを使うKoeでは、先にhost上で`claude login`を完了し、`config.yaml`へ
+`type: claude-code`のadapterを追加します。CodexとClaudeは同じGateway内で併用できます。
+最小構成と各設定項目は[Claude Code adapter](docs/configuration.md#claude-code-adapter)を
+参照してください。
+
 設定全体、既存Codex threadのbinding、Koe identity、persona、consultation policy、
 management UIについては[設定ガイド](docs/configuration.md)を参照してください。
 このpreviewはnpm packageを`private`にしているため、`npm install -g`ではなく
@@ -201,7 +214,8 @@ Slackに表示される確認は、同じ強度の保証ではありません。
   分離するmulti-tenant sandboxではありません。
 - Management UIとKoeごとのMCP endpointはloopback限定です。proxyやport forwardで
   公開しないでください。
-- Slack/Codex credentialは環境変数またはowner-only fileへ保存し、Gitへ追加しません。
+- Slackとbackend（Codex/OpenAI、Claude/Anthropic）のcredentialは環境変数または
+  owner-only fileへ保存し、Gitへ追加しません。
 - Gatewayを通る副作用はPermission Engineで検査されます。ただし、backendへ別途与えた
   権限までは無効化できないため、Codex側のsandboxとapproval policyも制限してください。
 - 非Git外部操作の確認は、表示内容に対するlive requestへの回答です。後続commandを
