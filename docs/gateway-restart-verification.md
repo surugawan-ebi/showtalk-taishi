@@ -118,3 +118,39 @@ identity, returned labels, same-turn continuation, and terminal card state. If
 the live Slack interaction, Worker replacement, or exact callback origin could
 not be observed, mark that stage unverified rather than inferring success from
 unit tests or reconnect logs.
+
+## Activation evidence checklist
+
+Keep one sanitized record per requested activation. This is a reporting
+checklist, not a new runtime receipt schema or permission to restart.
+
+- Source: full revision and whether the tested tree has additional changes.
+- Distribution: build/check result and the manifest or non-secret artifact
+  digest, if available, tying the loaded distribution to that source. A build
+  alone does not prove the running process loaded it.
+- Restart: authorization, accepted request, scheduled response, old Worker
+  exit, exactly one replacement Worker, and Slack connection are separate
+  observations. Correlate acceptance and completion with that request and
+  configuration revision; an old or replayed receipt is not a new replacement.
+- Configuration: distinguish the saved revision from the effective live
+  revision. Record only sanitized revision evidence, never configuration values.
+- Client binding: identify the adapter and process owner, then confirm the
+  affected session sees the intended capability and its current contract.
+  Server-side tools/list alone does not establish a client's binding.
+- Acceptance: record the actual feature exercised, same-turn result where
+  relevant, check time, and remaining unverified stages.
+
+For each item use confirmed, inferred, or unverified with its evidence. If
+replacement or delivery is pending, follow the existing request instead of
+issuing another restart. A scheduled response, successful reconnect, or
+persisted session is not full activation evidence.
+
+Determine restart boundaries from process ownership. Gateway-managed adapter
+and MCP children are recreated through their owning runtime lifecycle; do not
+automatically demand an additional desktop client restart. An independently
+managed HTTP server or desktop client has its own lifecycle and initialization
+boundary. Confirm the actual topology before choosing an action. See
+[configuration](configuration.md) and [operations](operations.md).
+
+Implementation references: [runtime lifecycle](../src/runtime.ts) and
+[restart replay guard](../src/state/gateway-restart-replay-guard.ts).
