@@ -424,3 +424,42 @@ the live acceptance gate when a Worker restart is part of verification.
 
 See [Architecture](architecture.md) for component boundaries and
 [Security](security.md) for the trust model.
+
+## Correlated approval diagnosis
+
+Classify the request before diagnosing it: an ordinary workflow choice,
+non-Git external-action confirmation, workspace-git exact-plan approval,
+Codex-native tool approval, and a ShowTalk Permission Engine decision are
+different contracts. Use the matching adapter in
+[configuration](configuration.md); Codex wire details are not Claude rules.
+
+For one current request, retain separate sanitized observations of:
+
+1. controls attached to the intended message;
+2. expiry and whether the request was still current at callback time;
+3. authenticated callback accepted or rejected;
+4. the exact decision recorded (and Git broker decision, when applicable);
+5. answer transport delivery;
+6. backend resolution and non-empty result, when observable;
+7. the authorized operation's actual outcome and terminal card state.
+
+A transport write or an answer-applied event does not prove backend acceptance
+or execution. The delivery tracker classifies bounded failure evidence and
+requires exact correlation; missing evidence stays unknown. Displayed then
+expired is different from never displayed. Empty answers are neither approval
+nor a diagnosis of missing controls. Do not reuse a pre-restart or expired card
+or loosen binding to reproduce a failure.
+
+Before adding regressions, inspect the existing structured-input, user-input
+delivery, frontend, and restart tests for duplicate callbacks, near-expiry
+callbacks, delivery failure, restart, and displayed-then-expired sequences.
+Record uncovered cases without claiming tests were run.
+
+Keep notification origin, authenticated actor, and approval binding separate.
+Mention suppression or a dot-origin classification changes presentation only;
+it must not expand the approver allowlist or change the authenticated actor.
+Use synthetic text and blocks fixtures, not raw Slack payloads, for additional
+coverage. Unknown message structure is not evidence of a particular root cause.
+
+Implementation references: [answer delivery tracker](../src/adapters/codex/user-input-delivery.ts)
+and [App Server transport](../src/adapters/codex/app-server-client.ts).
