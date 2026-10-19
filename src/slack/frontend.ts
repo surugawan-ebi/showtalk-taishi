@@ -73,7 +73,9 @@ import {
 } from "./approval-text-command.js";
 import {
   createDotOriginDiagnosticReporter,
+  isTrustedBotSlackMessage,
   shouldSuppressDotUserMention,
+  type TrustedBotMessageSource,
 } from "./dot-origin.js";
 import { validateSlackActionSource } from "./interaction-source.js";
 import {
@@ -144,6 +146,8 @@ export interface SlackFrontendOptions {
   readonly appToken: string;
   readonly botToken: string;
   readonly approverUserIds: readonly string[];
+  /** Bot message ingress only; does not grant approval or permission authority. */
+  readonly trustedBotMessageSources?: readonly TrustedBotMessageSource[];
   readonly agentChannelIds: readonly string[];
   readonly agentIdsByChannel: Readonly<Record<string, string>>;
   readonly presentationsByChannel?: SlackPresentationsByChannel;
@@ -231,6 +235,7 @@ export class SlackFrontend {
   readonly #app: App;
   readonly #gateway: Gateway;
   readonly #approvers: ReadonlySet<string>;
+  readonly #trustedBotMessageSources: readonly TrustedBotMessageSource[];
   readonly #agentChannels: ReadonlySet<string>;
   readonly #agentIdsByChannel: ReadonlyMap<string, string>;
   readonly #deduplicator = new SlackEventDeduplicator();
@@ -282,6 +287,13 @@ export class SlackFrontend {
   constructor(gateway: Gateway, options: SlackFrontendOptions, app?: App) {
     this.#gateway = gateway;
     this.#approvers = new Set(options.approverUserIds);
+    this.#trustedBotMessageSources = Object.freeze(
+      (options.trustedBotMessageSources ?? []).map((source) => Object.freeze({
+        workspaceId: source.workspaceId,
+        userId: source.userId,
+        botId: source.botId,
+      })),
+    );
     this.#agentChannels = new Set(options.agentChannelIds);
     this.#agentIdsByChannel = new Map(Object.entries(options.agentIdsByChannel));
     this.#fileTransport = new SlackFileTransport({
@@ -1405,13 +1417,20 @@ export class SlackFrontend {
       if (this.#durableEventLedger?.has(body.event_id) === true) return;
       if (!this.#deduplicator.accept(body.event_id)) return;
       if (await this.#handleApprovalTextMessage(event, body, client, logger)) return;
-      const message = parseHumanSlackMessage(event);
+      const slackEnvelopeIdentity = parseSlackEventEnvelopeIdentity(body);
+      const message = parseHumanSlackMessage(event, {
+        workspaceId: slackEnvelopeIdentity?.teamId,
+        trustedBotMessageSources: this.#trustedBotMessageSources,
+      });
       if (message === undefined) return;
       // Keep this classification on the individual turn. It must not become a
       // sticky property of the Slack thread: a later direct human message in
       // the same thread is allowed to receive the normal notification.
-      const suppressDotUserMention = shouldSuppressDotUserMention(event);
-      const slackEnvelopeIdentity = parseSlackEventEnvelopeIdentity(body);
+      const suppressDotUserMention = shouldSuppressDotUserMention(
+        event,
+        slackEnvelopeIdentity?.teamId,
+        this.#trustedBotMessageSources,
+      );
       if (!this.#agentChannels.has(message.channel)) return;
       if (message.text.trim().length === 0 && message.fileIds.length === 0) return;
       const agentId = this.#agentIdsByChannel.get(message.channel);
@@ -2631,15 +2650,26 @@ function approvalTextHintBlock(requestId: string): KnownBlock {
 
 export function parseHumanSlackMessage(
   value: unknown,
+  options: {
+    readonly workspaceId?: string | undefined;
+    readonly trustedBotMessageSources?: readonly TrustedBotMessageSource[];
+  } = {},
 ): HumanSlackMessage | undefined {
   const message = asRecord(value);
+  const verifiedDotBot = isTrustedBotSlackMessage(
+    message,
+    options.workspaceId,
+    options.trustedBotMessageSources ?? [],
+  );
   if (
     message === undefined ||
     typeof message.channel !== "string" ||
     typeof message.ts !== "string" ||
     typeof message.text !== "string" ||
-    typeof message.bot_id === "string" ||
-    (message.subtype !== undefined && message.subtype !== "file_share")
+    (typeof message.bot_id === "string" && !verifiedDotBot) ||
+    (message.subtype !== undefined &&
+      message.subtype !== "file_share" &&
+      !verifiedDotBot)
   ) {
     return undefined;
   }

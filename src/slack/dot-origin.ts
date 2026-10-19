@@ -1,7 +1,10 @@
 import { CHATGPT_ATTRIBUTION_PROFILE } from "./approval-text-command.js";
 
-/** Slack user ID used by the standalone dot bot installation. */
-export const DOT_BOT_USER_ID = "U0C6R0F6F29";
+export interface TrustedBotMessageSource {
+  readonly workspaceId: string;
+  readonly userId: string;
+  readonly botId: string;
+}
 
 export type DotSlackMessageOrigin =
   | "dot_bot"
@@ -52,9 +55,17 @@ const DIAGNOSTIC_REPEAT_WINDOW_MS = 5 * 60 * 1_000;
  */
 export function classifyDotSlackMessage(
   event: unknown,
+  workspaceId?: string,
+  trustedBotMessageSources: readonly TrustedBotMessageSource[] = [],
 ): DotSlackMessageOrigin | undefined {
   const record = asRecord(event);
   if (record === undefined || record.type !== "message") return undefined;
+
+  if (isTrustedBotSlackMessage(
+    record,
+    workspaceId,
+    trustedBotMessageSources,
+  )) return "dot_bot";
 
   // Keep the existing human-message boundary: a typical bot_message is not
   // newly accepted merely because its user ID resembles the dot bot.
@@ -74,12 +85,37 @@ export function classifyDotSlackMessage(
   ) {
     return undefined;
   }
-
-  if (record.user === DOT_BOT_USER_ID) return "dot_bot";
   if (isVerifiedChatGptSlackAttribution(record)) {
     return "dot_chatgpt_connector";
   }
   return undefined;
+}
+
+/**
+ * Accepts only an explicitly configured bot identity in its verified workspace.
+ * The workspace value must come from the Slack event envelope, not message
+ * text, display names, or other self-reported content.
+ */
+export function isTrustedBotSlackMessage(
+  event: unknown,
+  workspaceId: string | undefined,
+  trustedBotMessageSources: readonly TrustedBotMessageSource[],
+): boolean {
+  const record = asRecord(event);
+  return record?.type === "message" &&
+    record.subtype === "bot_message" &&
+    typeof workspaceId === "string" &&
+    trustedBotMessageSources.some((source) =>
+      source.workspaceId === workspaceId &&
+      source.userId === record.user &&
+      source.botId === record.bot_id
+    ) &&
+    !hasAnyOwnProperty(record, [
+      "edited",
+      "hidden",
+      "message",
+      "previous_message",
+    ]);
 }
 
 function isVerifiedChatGptSlackAttribution(
@@ -215,8 +251,16 @@ function isCanonicalWebUrl(value: string): boolean {
   }
 }
 
-export function shouldSuppressDotUserMention(event: unknown): boolean {
-  return classifyDotSlackMessage(event) !== undefined;
+export function shouldSuppressDotUserMention(
+  event: unknown,
+  workspaceId?: string,
+  trustedBotMessageSources: readonly TrustedBotMessageSource[] = [],
+): boolean {
+  return classifyDotSlackMessage(
+    event,
+    workspaceId,
+    trustedBotMessageSources,
+  ) !== undefined;
 }
 
 /**

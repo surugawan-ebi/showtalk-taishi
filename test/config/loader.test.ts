@@ -70,6 +70,69 @@ test("loads config and expands environment references", async () => {
   assert.equal(config.agents.implementer?.consultations, undefined);
   assert.equal(config.agents.implementer?.automatic_choice_mode, "off");
   assert.deepEqual(config.gateway.admin_ui, { enabled: false, port: 4_781 });
+  assert.deepEqual(config.slack.trusted_bot_message_sources, []);
+});
+
+test("loads an explicit trusted bot message source separately from approvers", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  await writeFile(
+    path,
+    source.replace(
+      "  approver_user_ids:",
+      "  trusted_bot_message_sources:\n" +
+      "    - workspace_id: TTESTWORKSPACE\n" +
+      "      user_id: UTESTBOTUSER\n" +
+      "      bot_id: BTESTBOTID\n" +
+      "  approver_user_ids:",
+    ),
+  );
+  const config = await loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  });
+  assert.deepEqual(config.slack.trusted_bot_message_sources, [{
+    workspace_id: "TTESTWORKSPACE",
+    user_id: "UTESTBOTUSER",
+    bot_id: "BTESTBOTID",
+  }]);
+  assert.deepEqual(config.slack.approver_user_ids, ["U123"]);
+});
+
+test("rejects duplicate or malformed trusted bot message sources", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  const entry =
+    "    - workspace_id: TTESTWORKSPACE\n" +
+    "      user_id: UTESTBOTUSER\n" +
+    "      bot_id: BTESTBOTID\n";
+  await writeFile(path, source.replace(
+    "  approver_user_ids:",
+    `  trusted_bot_message_sources:\n${entry}${entry}  approver_user_ids:`,
+  ));
+  await assert.rejects(() => loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  }), /Trusted Slack bot message sources must be unique/u);
+
+  await writeFile(path, source.replace(
+    "  approver_user_ids:",
+    "  trusted_bot_message_sources:\n" +
+    "    - workspace_id: CNOTAWORKSPACE\n" +
+    "      user_id: UTESTBOTUSER\n" +
+    "      bot_id: BTESTBOTID\n" +
+    "  approver_user_ids:",
+  ));
+  await assert.rejects(() => loadConfig(path, {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  }), /Invalid Slack workspace ID/u);
 });
 
 test("loads an optional work-attention Slack channel", async () => {

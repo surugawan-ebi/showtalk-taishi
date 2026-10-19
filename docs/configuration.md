@@ -44,6 +44,36 @@ URL. Applying new scopes to an existing App may require reauthorization.
 Configured human approvers belong in `slack.approver_user_ids` or its
 environment-backed value.
 
+### Trusted bot message ingress
+
+Slack `bot_message` events are rejected by default. To accept requests from a
+specific installed bot, add its authenticated Slack identity tuple to the
+optional allowlist:
+
+```yaml
+slack:
+  trusted_bot_message_sources:
+    - workspace_id: "${SLACK_TRUSTED_BOT_WORKSPACE_ID}"
+      user_id: "${SLACK_TRUSTED_BOT_USER_ID}"
+      bot_id: "${SLACK_TRUSTED_BOT_ID}"
+```
+
+All three values must match: the workspace comes from the trusted Slack event
+envelope, while `user_id` and `bot_id` come from the Slack message event. Text,
+display names, profiles, attribution footers, and mentions never establish this
+trust. Entries apply only to ordinary request ingestion in already configured
+Koe channels. They do not add an approver, authorize approval/rejection text,
+or weaken button and permission identity checks. Edited, deleted, hidden, and
+nested message events remain rejected. Duplicate tuples and more than 32
+entries are rejected during configuration loading.
+
+If this setting is omitted or `[]`, all bot messages retain the previous
+fail-closed behavior. Existing verified ChatGPT connector attribution handling
+continues independently. Older dot notification classification that depended
+on a source-code user ID has no implicit fallback; migrate the installed dot
+bot by adding its workspace/user/bot tuple only to the private machine-local
+configuration. Restart is required after changing this startup setting.
+
 ### Work-attention notification channel
 
 To feed an existing Slack `message` event integration, configure one channel:

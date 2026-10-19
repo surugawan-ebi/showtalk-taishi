@@ -62,6 +62,12 @@ const environmentVariableNameSchema = z
 const slackUserIdSchema = z
   .string()
   .regex(/^[UW][A-Z0-9]{1,127}$/u, "Invalid Slack user ID");
+const slackWorkspaceIdSchema = z
+  .string()
+  .regex(/^T[A-Z0-9]{1,127}$/u, "Invalid Slack workspace ID");
+const slackBotIdSchema = z
+  .string()
+  .regex(/^B[A-Z0-9]{1,127}$/u, "Invalid Slack bot ID");
 const slackChannelIdSchema = z
   .string()
   .regex(/^[CDG][A-Z0-9]{1,127}$/u, "Invalid Slack channel ID");
@@ -303,6 +309,20 @@ export const taishiConfigSchema = z
             (ids) => new Set(ids).size === ids.length,
             "Slack approver user IDs must be unique",
           ),
+        trusted_bot_message_sources: z
+          .array(z.object({
+            workspace_id: slackWorkspaceIdSchema,
+            user_id: slackUserIdSchema,
+            bot_id: slackBotIdSchema,
+          }).strict())
+          .max(32)
+          .refine(
+            (sources) => new Set(sources.map((source) =>
+              `${source.workspace_id}\u0000${source.user_id}\u0000${source.bot_id}`
+            )).size === sources.length,
+            "Trusted Slack bot message sources must be unique",
+          )
+          .default([]),
         work_attention_channel_id: slackChannelIdSchema.optional(),
       })
       .strict(),
