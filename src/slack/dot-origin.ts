@@ -103,7 +103,7 @@ export function isTrustedBotSlackMessage(
 ): boolean {
   const record = asRecord(event);
   return record?.type === "message" &&
-    record.subtype === "bot_message" &&
+    (record.subtype === undefined || record.subtype === "bot_message") &&
     typeof workspaceId === "string" &&
     trustedBotMessageSources.some((source) =>
       source.workspaceId === workspaceId &&
