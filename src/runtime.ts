@@ -558,6 +558,13 @@ async function createLockedRuntime(
       appToken: config.slack.app_token,
       botToken: config.slack.bot_token,
       approverUserIds: config.slack.approver_user_ids,
+      trustedBotMessageSources: config.slack.trusted_bot_message_sources.map(
+        (source) => ({
+          workspaceId: source.workspace_id,
+          userId: source.user_id,
+          botId: source.bot_id,
+        }),
+      ),
       agentChannelIds: Object.values(config.agents).map(
         (agent) => agent.slack.channel_id,
       ),

@@ -23,6 +23,13 @@ slack:
   bot_token: "${SLACK_BOT_TOKEN}"
   approver_user_ids:
     - "${SLACK_APPROVER_USER_ID}"
+  # Optional bot-message ingress allowlist. Omitted or empty rejects every
+  # Slack bot_message as a Koe request. These identities grant no approval or
+  # permission authority and must stay separate from approver_user_ids.
+  # trusted_bot_message_sources:
+  #   - workspace_id: "${SLACK_TRUSTED_BOT_WORKSPACE_ID}"
+  #     user_id: "${SLACK_TRUSTED_BOT_USER_ID}"
+  #     bot_id: "${SLACK_TRUSTED_BOT_ID}"
   # Optional. Emits each work-attention detection/recovery as a new root
   # message for an existing downstream Slack message-event integration.
   # work_attention_channel_id: "${SLACK_WORK_ATTENTION_CHANNEL_ID}"

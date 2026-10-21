@@ -19,8 +19,9 @@ import {
   classifyDotSlackMessage,
   createDotOriginDiagnosticReporter,
   diagnoseRejectedDotSlackMessage,
-  DOT_BOT_USER_ID,
+  isTrustedBotSlackMessage,
   shouldSuppressDotUserMention,
+  type TrustedBotMessageSource,
 } from "../../src/slack/dot-origin.js";
 import { CHATGPT_ATTRIBUTION_PROFILE } from "../../src/slack/approval-text-command.js";
 import { parseChoiceActionValue } from "../../src/slack/choice-blocks.js";
@@ -34,7 +35,45 @@ type Listener = (args: Record<string, unknown>) => Promise<void>;
 
 const connectorSourceUser = "UDOTSOURCE";
 const mentionedUser = "UMENTIONTARGET";
+const trustedBotSource: TrustedBotMessageSource = {
+  workspaceId: "TTESTWORKSPACE",
+  userId: "UTESTDOTBOT",
+  botId: "BTESTDOTBOT",
+};
 const footer = `*使用して送信されました* <@${CHATGPT_ATTRIBUTION_PROFILE.userId}>`;
+
+// Safe fixture matching the fields observed from conversations.replies. The
+// `team` field is readback metadata, never the trusted envelope workspace.
+function trustedDotSlackReadMessage(text = "dot readback request"): Call {
+  return {
+    type: "message",
+    channel: "C1",
+    ts: "4.000001",
+    thread_ts: "1.000001",
+    team: trustedBotSource.workspaceId,
+    user: trustedBotSource.userId,
+    bot_id: trustedBotSource.botId,
+    app_id: "ATESTDOTAPP",
+    text,
+  };
+}
+
+// Plausible Events API message event. Its trusted workspace remains on the
+// outer envelope passed separately to SlackFrontend.
+function trustedDotEventsApiMessage(text = "dot event request"): Call {
+  return {
+    type: "message",
+    channel: "C1",
+    ts: "4.000002",
+    event_ts: "4.000002",
+    thread_ts: "1.000001",
+    user: trustedBotSource.userId,
+    bot_id: trustedBotSource.botId,
+    app_id: "ATESTDOTAPP",
+    subtype: "bot_message",
+    text,
+  };
+}
 
 function attributedDotEvent(
   text = "dot request",
@@ -111,10 +150,7 @@ function numberedListDotEvent(secret = "synthetic-list-body"): Call {
 test("classifies only explicit dot identities and rejects self-reported or envelope-only signals", () => {
   assert.equal(Object.isFrozen(CHATGPT_ATTRIBUTION_PROFILE), true);
   const attributed = attributedDotEvent();
-  const standalone = {
-    type: "message", channel: "C1", ts: "3.000001", thread_ts: "1.000001",
-    user: DOT_BOT_USER_ID, text: "dot bot request",
-  };
+  const standalone = trustedDotEventsApiMessage();
   const direct = {
     ...attributed,
     user: "U1",
@@ -122,7 +158,11 @@ test("classifies only explicit dot identities and rejects self-reported or envel
     text: `dot request ${footer}`,
   };
   assert.equal(classifyDotSlackMessage(attributed), "dot_chatgpt_connector");
-  assert.equal(classifyDotSlackMessage(standalone), "dot_bot");
+  assert.equal(classifyDotSlackMessage(
+    standalone,
+    trustedBotSource.workspaceId,
+    [trustedBotSource],
+  ), "dot_bot");
   assert.equal(shouldSuppressDotUserMention(direct), false);
   assert.equal(shouldSuppressDotUserMention({
     ...attributed, app_id: undefined, api_app_id: CHATGPT_ATTRIBUTION_PROFILE.appId,
@@ -246,14 +286,60 @@ test("rate-limits identical dot rejection diagnostics without affecting classifi
   assert.equal(classifyDotSlackMessage(event), undefined);
 });
 
-test("does not newly accept a typical bot_message as a dot turn", () => {
-  const event = {
-    type: "message", channel: "C1", ts: "4.000001", thread_ts: "1.000001",
-    user: DOT_BOT_USER_ID, bot_id: "B-DOT", subtype: "bot_message", text: "dot bot",
-  };
-  assert.equal(classifyDotSlackMessage(event), undefined);
-  assert.equal(shouldSuppressDotUserMention(event), false);
-  assert.equal(parseHumanSlackMessage(event), undefined);
+test("accepts subtype-less Slack readback and bot_message event shapes only for the verified tuple", () => {
+  for (const event of [trustedDotSlackReadMessage(), trustedDotEventsApiMessage()]) {
+    assert.equal(isTrustedBotSlackMessage(
+      event,
+      trustedBotSource.workspaceId,
+      [trustedBotSource],
+    ), true);
+    assert.equal(classifyDotSlackMessage(
+      event,
+      trustedBotSource.workspaceId,
+      [trustedBotSource],
+    ), "dot_bot");
+    assert.equal(shouldSuppressDotUserMention(
+      event,
+      trustedBotSource.workspaceId,
+      [trustedBotSource],
+    ), true);
+    assert.equal(parseHumanSlackMessage(event), undefined);
+    assert.equal(parseHumanSlackMessage(event, {
+      workspaceId: trustedBotSource.workspaceId,
+      trustedBotMessageSources: [trustedBotSource],
+    })?.user, trustedBotSource.userId);
+  }
+
+  // Readback `team` is never a substitute for the authenticated envelope.
+  assert.equal(isTrustedBotSlackMessage(
+    trustedDotSlackReadMessage(),
+    undefined,
+    [trustedBotSource],
+  ), false);
+
+  const event = trustedDotEventsApiMessage();
+  for (const rejected of [
+    [{ ...event, user: "UOTHER" }, trustedBotSource.workspaceId],
+    [{ ...event, bot_id: "BOTHER" }, trustedBotSource.workspaceId],
+    [event, "TOTHER"],
+    [{ ...event, subtype: "message_changed" }, trustedBotSource.workspaceId],
+    [{ ...event, subtype: "message_deleted" }, trustedBotSource.workspaceId],
+    [{ ...event, edited: { user: trustedBotSource.userId, ts: "4.000002" } }, trustedBotSource.workspaceId],
+    [{ ...event, hidden: true }, trustedBotSource.workspaceId],
+    [{ ...event, message: { text: "nested" } }, trustedBotSource.workspaceId],
+    [{ ...event, previous_message: { text: "previous" } }, trustedBotSource.workspaceId],
+    [{ ...event, user: "USHOWTALK", bot_id: "BSHOWTALK" }, trustedBotSource.workspaceId],
+  ] as const) {
+    assert.equal(isTrustedBotSlackMessage(
+      rejected[0],
+      rejected[1],
+      [trustedBotSource],
+    ), false);
+    assert.equal(parseHumanSlackMessage(rejected[0], {
+      workspaceId: rejected[1],
+      trustedBotMessageSources: [trustedBotSource],
+    }), undefined);
+  }
 });
 
 function recordingClient(): { client: WebClient; posts: Call[]; updates: Call[] } {
@@ -324,12 +410,17 @@ class FakeApp {
 
 class FakeGateway {
   nextEvent: AgentEvent = { type: "message.completed", text: "answer" };
-  async *handleHumanMessage(): AsyncIterable<{ sessionId: string; event: AgentEvent }> {
+  readonly messages: unknown[] = [];
+  async *handleHumanMessage(input: unknown): AsyncIterable<{ sessionId: string; event: AgentEvent }> {
+    this.messages.push(input);
     yield { sessionId: "session-dot-fixture", event: this.nextEvent };
   }
 }
 
-function frontendFixture(audit: string[]) {
+function frontendFixture(
+  audit: string[],
+  trustedBotMessageSources: readonly TrustedBotMessageSource[] = [trustedBotSource],
+) {
   const app = new FakeApp();
   const gateway = new FakeGateway();
   const dotDiagnostics: string[] = [];
@@ -337,6 +428,7 @@ function frontendFixture(audit: string[]) {
     appToken: "xapp-test",
     botToken: "xoxb-test",
     approverUserIds: ["U1"],
+    trustedBotMessageSources,
     agentChannelIds: ["C1"],
     agentIdsByChannel: { C1: "test-koe" },
     attachmentRoot: "/tmp",
@@ -355,16 +447,116 @@ async function sendMessage(
   fixture: ReturnType<typeof frontendFixture>,
   event: Call,
   eventId: string,
+  teamId = "T1",
 ): Promise<void> {
   const listener = fixture.app.events.get("message");
   assert.ok(listener);
   await listener({
     event,
-    body: { event_id: eventId, team_id: "T1", api_app_id: "AENVELOPE" },
+    body: { event_id: eventId, team_id: teamId, api_app_id: "AENVELOPE" },
     client: fixture.app.client,
     logger: { error: () => undefined },
   });
 }
+
+test("SlackFrontend accepts the verified dot bot once and rejects nearby identities", async () => {
+  const fixture = frontendFixture([]);
+  const verified = trustedDotSlackReadMessage("verified subtype-less dot request");
+
+  await sendMessage(
+    fixture,
+    verified,
+    "event-verified-dot",
+    trustedBotSource.workspaceId,
+  );
+  assert.equal(fixture.gateway.messages.length, 1);
+  assertNoDisplayedMention(
+    [...fixture.app.posts, ...fixture.app.updates],
+    trustedBotSource.userId,
+  );
+
+  // The existing event ledger/deduplicator remains ahead of classification.
+  await sendMessage(
+    fixture,
+    verified,
+    "event-verified-dot",
+    trustedBotSource.workspaceId,
+  );
+  assert.equal(fixture.gateway.messages.length, 1);
+
+  for (const [event, teamId, eventId] of [
+    [{ ...verified, user: "UOTHER" }, trustedBotSource.workspaceId, "event-wrong-user"],
+    [{ ...verified, bot_id: "BOTHER" }, trustedBotSource.workspaceId, "event-wrong-bot"],
+    [verified, "TOTHER", "event-wrong-workspace"],
+  ] as const) {
+    await sendMessage(fixture, event, eventId, teamId);
+  }
+  assert.equal(fixture.gateway.messages.length, 1);
+
+  // Reserved approval/rejection text stays on the human-only command path and
+  // never becomes either an approval or a new agent turn from dot.
+  await sendMessage(fixture, {
+    ...verified,
+    ts: "4.000003",
+    text: "承認 codex:11111111-1111-4111-8111-111111111111",
+  }, "event-dot-approval-command", trustedBotSource.workspaceId);
+  assert.equal(fixture.gateway.messages.length, 1);
+});
+
+test("SlackFrontend also accepts the verified bot_message Events API fixture", async () => {
+  const fixture = frontendFixture([]);
+  await sendMessage(
+    fixture,
+    trustedDotEventsApiMessage(),
+    "event-verified-dot-bot-message",
+    trustedBotSource.workspaceId,
+  );
+  assert.equal(fixture.gateway.messages.length, 1);
+});
+
+test("SlackFrontend rejects bot messages when the allowlist is unset or empty", async () => {
+  const fixture = frontendFixture([], []);
+  await sendMessage(
+    fixture,
+    trustedDotSlackReadMessage("unconfigured subtype-less bot request"),
+    "event-unconfigured-subtype-less-bot",
+    trustedBotSource.workspaceId,
+  );
+  await sendMessage(
+    fixture,
+    trustedDotEventsApiMessage("unconfigured bot_message request"),
+    "event-unconfigured-bot-message",
+    trustedBotSource.workspaceId,
+  );
+  assert.equal(fixture.gateway.messages.length, 0);
+});
+
+test("SlackFrontend keeps configured-channel and top-level routing for verified dot", async () => {
+  const fixture = frontendFixture([]);
+  const topLevel = {
+    type: "message",
+    channel: "C1",
+    ts: "4.100001",
+    user: trustedBotSource.userId,
+    bot_id: trustedBotSource.botId,
+    subtype: "bot_message",
+    text: "top-level dot request",
+  };
+  await sendMessage(
+    fixture,
+    topLevel,
+    "event-dot-top-level",
+    trustedBotSource.workspaceId,
+  );
+  assert.equal(fixture.gateway.messages.length, 1);
+
+  await sendMessage(fixture, {
+    ...topLevel,
+    channel: "COUTSIDE",
+    ts: "4.100002",
+  }, "event-dot-outside", trustedBotSource.workspaceId);
+  assert.equal(fixture.gateway.messages.length, 1);
+});
 
 test("SlackFrontend passes dot suppression per message while preserving choice notification and responder/audit", async () => {
   const audit: string[] = [];
