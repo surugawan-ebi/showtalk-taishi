@@ -56,6 +56,7 @@ slack:
     - workspace_id: "${SLACK_TRUSTED_BOT_WORKSPACE_ID}"
       user_id: "${SLACK_TRUSTED_BOT_USER_ID}"
       bot_id: "${SLACK_TRUSTED_BOT_ID}"
+      external_action_responder_user_id: "${SLACK_TRUSTED_BOT_EXTERNAL_ACTION_RESPONDER_USER_ID}"
 ```
 
 All three values must match: the workspace comes from the trusted Slack event
@@ -66,6 +67,15 @@ Koe channels. They do not add an approver, authorize approval/rejection text,
 or weaken button and permission identity checks. Edited, deleted, hidden, and
 nested message events remain rejected. Duplicate tuples and more than 32
 entries are rejected during configuration loading.
+
+`external_action_responder_user_id` is optional for request ingestion, but is
+required before a trusted bot request may display a non-Git external-action
+confirmation. It identifies the one human who may answer that card and must be
+a distinct member of `slack.approver_user_ids`. The bot remains the audited
+request origin and never becomes an approver. Missing, same-as-bot, or
+non-approver mappings fail closed; ShowTalk does not fall back to another
+approver or infer a human from message text or display names. This mapping does
+not affect Git, native permission, or ordinary-choice cards.
 
 If this setting is omitted or `[]`, all bot messages retain the previous
 fail-closed behavior. Existing verified ChatGPT connector attribution handling

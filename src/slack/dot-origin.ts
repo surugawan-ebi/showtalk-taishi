@@ -4,6 +4,8 @@ export interface TrustedBotMessageSource {
   readonly workspaceId: string;
   readonly userId: string;
   readonly botId: string;
+  /** Explicit human responder for non-Git external-action confirmations. */
+  readonly externalActionResponderUserId?: string;
 }
 
 export type DotSlackMessageOrigin =
@@ -101,21 +103,34 @@ export function isTrustedBotSlackMessage(
   workspaceId: string | undefined,
   trustedBotMessageSources: readonly TrustedBotMessageSource[],
 ): boolean {
+  return trustedBotSlackMessageSource(
+    event,
+    workspaceId,
+    trustedBotMessageSources,
+  ) !== undefined;
+}
+
+/** Returns only an exact configured tuple match; message text never selects it. */
+export function trustedBotSlackMessageSource(
+  event: unknown,
+  workspaceId: string | undefined,
+  trustedBotMessageSources: readonly TrustedBotMessageSource[],
+): TrustedBotMessageSource | undefined {
   const record = asRecord(event);
-  return record?.type === "message" &&
+  if (!(record?.type === "message" &&
     (record.subtype === undefined || record.subtype === "bot_message") &&
     typeof workspaceId === "string" &&
-    trustedBotMessageSources.some((source) =>
-      source.workspaceId === workspaceId &&
-      source.userId === record.user &&
-      source.botId === record.bot_id
-    ) &&
     !hasAnyOwnProperty(record, [
       "edited",
       "hidden",
       "message",
       "previous_message",
-    ]);
+    ]))) return undefined;
+  return trustedBotMessageSources.find((source) =>
+    source.workspaceId === workspaceId &&
+    source.userId === record.user &&
+    source.botId === record.bot_id
+  );
 }
 
 function isVerifiedChatGptSlackAttribution(

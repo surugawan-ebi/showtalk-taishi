@@ -72,6 +72,14 @@ type AttachmentUploader = (
 export interface SlackThreadProjectorOptions {
   readonly sourceUserId?: string;
   /**
+   * Authenticated human allowed to answer a non-Git external-action card.
+   * Defaults to sourceUserId for direct human turns. A trusted bot turn passes
+   * its separately configured responder instead of treating the bot as human.
+   */
+  readonly externalActionResponderUserId?: string;
+  /** Fail before displaying an external-action card when no responder exists. */
+  readonly requireExternalActionResponder?: boolean;
+  /**
    * Whether ordinary turn messages should notify the source user. Structured
    * requests keep using sourceUserId for binding; their display mention is
    * controlled separately by mentionSourceUserInActionableMessages.
@@ -100,6 +108,8 @@ export class SlackThreadProjector {
   readonly #channelId: string;
   readonly #rootThreadTs: string;
   readonly #sourceUserId: string | undefined;
+  readonly #externalActionResponderUserId: string | undefined;
+  readonly #requireExternalActionResponder: boolean;
   readonly #sourceUserMention: string | undefined;
   readonly #mentionSourceUserInTurnMessages: boolean;
   readonly #mentionSourceUserInActionableMessages: boolean;
@@ -162,6 +172,11 @@ export class SlackThreadProjector {
     this.#channelId = channelId;
     this.#rootThreadTs = rootThreadTs;
     this.#sourceUserId = options.sourceUserId;
+    this.#requireExternalActionResponder =
+      options.requireExternalActionResponder ?? false;
+    this.#externalActionResponderUserId =
+      options.externalActionResponderUserId ??
+      (this.#requireExternalActionResponder ? undefined : options.sourceUserId);
     this.#sourceUserMention = options.sourceUserId === undefined
       ? undefined
       : formatSlackUserMention(options.sourceUserId);
@@ -1382,6 +1397,15 @@ export class SlackThreadProjector {
       rootThreadTs: this.#rootThreadTs,
       ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
     });
+    if (
+      event.question.purpose === "external_action_confirmation" &&
+      this.#requireExternalActionResponder &&
+      this.#externalActionResponderUserId === undefined
+    ) {
+      throw new Error(
+        "Trusted bot external-action responder is not configured",
+      );
+    }
     const fallback = this.#formatActionableMessage(
       event.question.purpose === "external_action_confirmation"
         ? `外部操作の確認（Git承認ではありません）: ${event.question.header}`
@@ -1416,9 +1440,16 @@ export class SlackThreadProjector {
       channelId: this.#channelId,
       rootThreadTs: this.#rootThreadTs,
       messageTs: posted.ts,
-      ...(this.#sourceUserId === undefined
+      ...((event.question.purpose === "external_action_confirmation"
+          ? this.#externalActionResponderUserId
+          : this.#sourceUserId) === undefined
         ? {}
-        : { responderUserId: this.#sourceUserId }),
+        : {
+            responderUserId:
+              event.question.purpose === "external_action_confirmation"
+                ? this.#externalActionResponderUserId!
+                : this.#sourceUserId!,
+          }),
     };
     const expiresAt = parseApprovalExpiry(event.expiresAt);
     const externalApprovalSupported = isSupportedExternalApprovalQuestion(
@@ -1463,9 +1494,16 @@ export class SlackThreadProjector {
         channelId: this.#channelId,
         rootThreadTs: this.#rootThreadTs,
         messageTs: posted.ts,
-        ...(this.#sourceUserId === undefined
+        ...((event.question.purpose === "external_action_confirmation"
+            ? this.#externalActionResponderUserId
+            : this.#sourceUserId) === undefined
           ? {}
-          : { responderUserId: this.#sourceUserId }),
+          : {
+              responderUserId:
+                event.question.purpose === "external_action_confirmation"
+                  ? this.#externalActionResponderUserId!
+                  : this.#sourceUserId!,
+            }),
         expiresAt: Date.parse(event.expiresAt),
       });
     }
