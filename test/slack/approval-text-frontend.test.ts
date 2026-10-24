@@ -29,6 +29,9 @@ const gitId = `codex-input:${uuid}`;
 const choiceId = `codex-choice:${uuid}`;
 const attributionProfile = { appId: "ACHATGPT", userId: "UCHATGPT" };
 const dotConnectorSourceUser = "UDOTSOURCE";
+const trustedBotUser = "UTRUSTEDBOT";
+const trustedBotId = "BTRUSTEDBOT";
+const trustedBotWorkspace = "TTEST";
 
 type RecordValue = Record<string, unknown>;
 type Listener = (args: RecordValue) => Promise<void>;
@@ -528,6 +531,150 @@ async function projectChoice(h: ReturnType<typeof harness>, sourceUser = user, o
   await Promise.race([h.gateway.projected.promise, turn.then(() => { throw new Error("Projection failed before yielding"); })]);
   return { finish: async () => { h.gateway.finishTurn.resolve(); await turn; } };
 }
+
+async function projectTrustedBotExternalChoice(
+  h: ReturnType<typeof harness>,
+) {
+  h.gateway.pending.add(choiceId);
+  h.gateway.eventToProject = {
+    type: "choice.requested",
+    requestId: choiceId,
+    expiresAt: new Date(expiresAt).toISOString(),
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "Trusted bot action",
+      prompt: "Target: synthetic target\nScope: no-op test\nImpact: no external writes",
+      allowsOther: false,
+      options: [
+        { id: "option_1", label: "外部操作を承認（Git承認ではありません）", description: "Confirm" },
+        { id: "option_2", label: "外部操作を拒否・保留", description: "Reject" },
+      ],
+    },
+  };
+  const turn = h.app.message("Trusted bot request", {
+    user: trustedBotUser,
+    bot_id: trustedBotId,
+    subtype: "bot_message",
+  }, { team_id: trustedBotWorkspace });
+  await Promise.race([
+    h.gateway.projected.promise,
+    turn.then(() => { throw new Error("Projection failed before yielding"); }),
+  ]);
+  return { finish: async () => { h.gateway.finishTurn.resolve(); await turn; } };
+}
+
+function trustedBotHarness() {
+  return harness({
+    trustedBotMessageSources: [{
+      workspaceId: trustedBotWorkspace,
+      userId: trustedBotUser,
+      botId: trustedBotId,
+      externalActionResponderUserId: user,
+    }],
+  });
+}
+
+function buttonRouteFor(entry: { readonly messageTs: string }) {
+  return {
+    message: { ts: entry.messageTs, thread_ts: rootTs },
+    container: {
+      type: "message",
+      channel_id: channel,
+      message_ts: entry.messageTs,
+    },
+  };
+}
+
+test("trusted bot external confirmation binds button and text to its explicit human responder", async () => {
+  for (const response of ["button", "text"] as const) {
+    const h = trustedBotHarness();
+    const projection = await projectTrustedBotExternalChoice(h);
+    try {
+      const entry = h.store.get(choiceId);
+      assert.ok(entry?.kind === "external");
+      assert.equal(entry.routing.responderUserId, user);
+      const buttonRoute = buttonRouteFor(entry);
+
+      if (response === "button") {
+        await h.app.button(
+          "taishi.choice.select.option_1",
+          { ...entry.routing, optionId: "option_1" },
+          { ...buttonRoute, user: { id: user } },
+        );
+      } else {
+        await h.app.message(`承認 ${choiceId}`, { user });
+      }
+      assert.deepEqual(h.gateway.answers, [{
+        requestId: choiceId,
+        answer: { questionId: "question_1", optionId: "option_1" },
+      }]);
+
+      if (response === "button") {
+        await h.app.message(`拒否 ${choiceId}`, { user });
+      } else {
+        await h.app.button(
+          "taishi.choice.select.option_2",
+          { ...entry.routing, optionId: "option_2" },
+          { ...buttonRoute, user: { id: user } },
+        );
+      }
+      assert.equal(h.gateway.answers.length, 1);
+    } finally {
+      await projection.finish();
+    }
+  }
+});
+
+test("trusted bot and other people cannot answer its mapped-human external confirmation", async () => {
+  for (const attempt of ["bot_button", "other_button", "bot_text", "other_text"] as const) {
+    const h = trustedBotHarness();
+    const projection = await projectTrustedBotExternalChoice(h);
+    try {
+      const entry = h.store.get(choiceId);
+      assert.ok(entry?.kind === "external");
+      const buttonRoute = buttonRouteFor(entry);
+      if (attempt === "bot_button" || attempt === "other_button") {
+        await h.app.button(
+          "taishi.choice.select.option_1",
+          { ...entry.routing, optionId: "option_1" },
+          {
+            ...buttonRoute,
+            user: {
+              id: attempt === "bot_button" ? trustedBotUser : secondUser,
+            },
+          },
+        );
+      } else if (attempt === "bot_text") {
+        await h.app.message(`承認 ${choiceId}`, {
+          user: trustedBotUser,
+          bot_id: trustedBotId,
+          subtype: "bot_message",
+        });
+      } else {
+        await h.app.message(`承認 ${choiceId}`, { user: secondUser });
+      }
+      assert.equal(h.gateway.answers.length, 0);
+      assert.equal(h.gateway.humanTurns, 1);
+    } finally {
+      await projection.finish();
+    }
+  }
+});
+
+test("trusted bot external confirmation rejects an expired mapped-human answer", async () => {
+  const h = trustedBotHarness();
+  const projection = await projectTrustedBotExternalChoice(h);
+  try {
+    h.clock.now = expiresAt + 1;
+    await h.app.message(`承認 ${choiceId}`, { user });
+    assert.equal(h.gateway.answers.length, 0);
+    assert.equal(h.store.get(choiceId), undefined);
+  } finally {
+    await projection.finish();
+  }
+});
 
 test("external confirmation text requires both original responder and configured approver", async () => {
   for (const attributed of [false, true]) {

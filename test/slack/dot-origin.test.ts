@@ -21,6 +21,7 @@ import {
   diagnoseRejectedDotSlackMessage,
   isTrustedBotSlackMessage,
   shouldSuppressDotUserMention,
+  trustedBotSlackMessageSource,
   type TrustedBotMessageSource,
 } from "../../src/slack/dot-origin.js";
 import { CHATGPT_ATTRIBUTION_PROFILE } from "../../src/slack/approval-text-command.js";
@@ -39,6 +40,10 @@ const trustedBotSource: TrustedBotMessageSource = {
   workspaceId: "TTESTWORKSPACE",
   userId: "UTESTDOTBOT",
   botId: "BTESTDOTBOT",
+};
+const trustedBotSourceWithResponder: TrustedBotMessageSource = {
+  ...trustedBotSource,
+  externalActionResponderUserId: "U1",
 };
 const footer = `*使用して送信されました* <@${CHATGPT_ATTRIBUTION_PROFILE.userId}>`;
 
@@ -318,6 +323,11 @@ test("accepts subtype-less Slack readback and bot_message event shapes only for 
   ), false);
 
   const event = trustedDotEventsApiMessage();
+  assert.equal(trustedBotSlackMessageSource(
+    event,
+    trustedBotSource.workspaceId,
+    [trustedBotSourceWithResponder],
+  ), trustedBotSourceWithResponder);
   for (const rejected of [
     [{ ...event, user: "UOTHER" }, trustedBotSource.workspaceId],
     [{ ...event, bot_id: "BOTHER" }, trustedBotSource.workspaceId],
@@ -529,6 +539,94 @@ test("SlackFrontend rejects bot messages when the allowlist is unset or empty", 
     trustedBotSource.workspaceId,
   );
   assert.equal(fixture.gateway.messages.length, 0);
+});
+
+test("SlackFrontend validates trusted-bot external-action responder configuration", () => {
+  assert.throws(
+    () => frontendFixture([], [{
+      ...trustedBotSource,
+      externalActionResponderUserId: trustedBotSource.userId,
+    }]),
+    /must be a different configured approver/u,
+  );
+  assert.throws(
+    () => frontendFixture([], [{
+      ...trustedBotSource,
+      externalActionResponderUserId: "UNOTAPPROVER",
+    }]),
+    /must be a different configured approver/u,
+  );
+});
+
+test("trusted bot external action fails closed without a mapped human responder", async () => {
+  const fixture = frontendFixture([]);
+  fixture.gateway.nextEvent = {
+    type: "choice.requested",
+    requestId: "codex-choice:55555555-5555-4555-8555-555555555555",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "Synthetic external action",
+      prompt: "Target: synthetic\nScope: no-op\nImpact: none",
+      allowsOther: false,
+      options: [
+        { id: "option_1", label: "外部操作を承認（Git承認ではありません）", description: "Confirm" },
+        { id: "option_2", label: "外部操作を拒否・保留", description: "Reject" },
+      ],
+    },
+  };
+  await sendMessage(
+    fixture,
+    trustedDotEventsApiMessage("external action request"),
+    "event-unmapped-external-action",
+    trustedBotSource.workspaceId,
+  );
+  assert.equal(fixture.gateway.messages.length, 1);
+  assert.ok([...fixture.app.posts, ...fixture.app.updates].every((call) =>
+    !JSON.stringify(call.blocks ?? []).includes("taishi.choice."),
+  ));
+});
+
+test("subtype-less trusted bot external action routes only to its mapped human responder", async () => {
+  const fixture = frontendFixture([], [trustedBotSourceWithResponder]);
+  fixture.gateway.nextEvent = {
+    type: "choice.requested",
+    requestId: "codex-choice:66666666-6666-4666-8666-666666666666",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    completedAnswers: [],
+    question: {
+      id: "question_1",
+      purpose: "external_action_confirmation",
+      header: "Synthetic external action",
+      prompt: "Target: synthetic\nScope: no-op\nImpact: none",
+      allowsOther: false,
+      options: [
+        { id: "option_1", label: "外部操作を承認（Git承認ではありません）", description: "Confirm" },
+        { id: "option_2", label: "外部操作を拒否・保留", description: "Reject" },
+      ],
+    },
+  };
+  await sendMessage(
+    fixture,
+    { ...trustedDotSlackReadMessage("external action request"), ts: "4.080001" },
+    "event-mapped-external-action",
+    trustedBotSource.workspaceId,
+  );
+  const choiceUpdate = fixture.app.updates.find((call) =>
+    Array.isArray(call.blocks) && JSON.stringify(call.blocks).includes("taishi.choice."),
+  );
+  assert.ok(choiceUpdate);
+  const actionsBlock = (choiceUpdate.blocks as unknown[]).find((block) =>
+    typeof block === "object" && block !== null &&
+    (block as Call).type === "actions",
+  ) as Call | undefined;
+  assert.ok(actionsBlock);
+  const firstButton = (actionsBlock.elements as unknown[])[0] as Call;
+  const decoded = parseChoiceActionValue(String(firstButton.value));
+  assert.equal(decoded.responderUserId, "U1");
+  assert.notEqual(decoded.responderUserId, trustedBotSource.userId);
 });
 
 test("SlackFrontend keeps configured-channel and top-level routing for verified dot", async () => {

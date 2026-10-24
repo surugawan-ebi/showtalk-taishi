@@ -30,6 +30,9 @@ slack:
   #   - workspace_id: "${SLACK_TRUSTED_BOT_WORKSPACE_ID}"
   #     user_id: "${SLACK_TRUSTED_BOT_USER_ID}"
   #     bot_id: "${SLACK_TRUSTED_BOT_ID}"
+  #     # Optional, non-secret human Slack ID. Required only when this trusted
+  #     # bot may originate a non-Git external-action confirmation.
+  #     external_action_responder_user_id: "${SLACK_TRUSTED_BOT_EXTERNAL_ACTION_RESPONDER_USER_ID}"
   # Optional. Emits each work-attention detection/recovery as a new root
   # message for an existing downstream Slack message-event integration.
   # work_attention_channel_id: "${SLACK_WORK_ATTENTION_CHANNEL_ID}"

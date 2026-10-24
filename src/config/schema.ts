@@ -314,6 +314,7 @@ export const taishiConfigSchema = z
             workspace_id: slackWorkspaceIdSchema,
             user_id: slackUserIdSchema,
             bot_id: slackBotIdSchema,
+            external_action_responder_user_id: slackUserIdSchema.optional(),
           }).strict())
           .max(32)
           .refine(
@@ -325,7 +326,29 @@ export const taishiConfigSchema = z
           .default([]),
         work_attention_channel_id: slackChannelIdSchema.optional(),
       })
-      .strict(),
+      .strict()
+      .superRefine((slack, context) => {
+        slack.trusted_bot_message_sources.forEach((source, index) => {
+          const responder = source.external_action_responder_user_id;
+          if (responder === undefined) return;
+          if (responder === source.user_id) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["trusted_bot_message_sources", index,
+                "external_action_responder_user_id"],
+              message: "Trusted bot external-action responder must differ from the bot user",
+            });
+          }
+          if (!slack.approver_user_ids.includes(responder)) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["trusted_bot_message_sources", index,
+                "external_action_responder_user_id"],
+              message: "Trusted bot external-action responder must be a configured Slack approver",
+            });
+          }
+        });
+      }),
     adapters: z
       .record(
         z.string().min(1),

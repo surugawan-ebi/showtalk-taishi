@@ -75,6 +75,7 @@ import {
   createDotOriginDiagnosticReporter,
   isTrustedBotSlackMessage,
   shouldSuppressDotUserMention,
+  trustedBotSlackMessageSource,
   type TrustedBotMessageSource,
 } from "./dot-origin.js";
 import { validateSlackActionSource } from "./interaction-source.js";
@@ -292,8 +293,23 @@ export class SlackFrontend {
         workspaceId: source.workspaceId,
         userId: source.userId,
         botId: source.botId,
+        ...(source.externalActionResponderUserId === undefined
+          ? {}
+          : {
+              externalActionResponderUserId:
+                source.externalActionResponderUserId,
+            }),
       })),
     );
+    for (const source of this.#trustedBotMessageSources) {
+      const responder = source.externalActionResponderUserId;
+      if (responder === undefined) continue;
+      if (responder === source.userId || !this.#approvers.has(responder)) {
+        throw new Error(
+          "Trusted bot external-action responder must be a different configured approver",
+        );
+      }
+    }
     this.#agentChannels = new Set(options.agentChannelIds);
     this.#agentIdsByChannel = new Map(Object.entries(options.agentIdsByChannel));
     this.#fileTransport = new SlackFileTransport({
@@ -1431,6 +1447,11 @@ export class SlackFrontend {
         slackEnvelopeIdentity?.teamId,
         this.#trustedBotMessageSources,
       );
+      const trustedBotSource = trustedBotSlackMessageSource(
+        event,
+        slackEnvelopeIdentity?.teamId,
+        this.#trustedBotMessageSources,
+      );
       if (!this.#agentChannels.has(message.channel)) return;
       if (message.text.trim().length === 0 && message.fileIds.length === 0) return;
       const agentId = this.#agentIdsByChannel.get(message.channel);
@@ -1462,19 +1483,30 @@ export class SlackFrontend {
           message.channel,
           rootThreadTs,
           {
-              ...(typeof message.user === "string"
+            ...(typeof message.user === "string"
               ? { sourceUserId: message.user }
               : {}),
-              mentionSourceUserInTurnMessages: !suppressDotUserMention,
-              // Keep the notification policy separate from authenticated
-              // responder binding; dot turns suppress both ordinary and card
-              // mentions, while direct human turns retain the prior behavior.
-              mentionSourceUserInActionableMessages: !suppressDotUserMention,
-              presentation: this.#presentation(message.channel),
-              gitApprovalDetailsStore: this.#gitApprovalDetails,
-              choiceContinuationStore: this.#choiceContinuations,
-          approvalTextStore: this.#approvalTextStore,
-              interactionAudit: this.#interactionAudit,
+            ...(trustedBotSource === undefined
+              ? {}
+              : {
+                  ...(trustedBotSource.externalActionResponderUserId === undefined
+                    ? {}
+                    : {
+                        externalActionResponderUserId:
+                          trustedBotSource.externalActionResponderUserId,
+                      }),
+                  requireExternalActionResponder: true,
+                }),
+            mentionSourceUserInTurnMessages: !suppressDotUserMention,
+            // Keep the notification policy separate from authenticated
+            // responder binding; dot turns suppress both ordinary and card
+            // mentions, while direct human turns retain the prior behavior.
+            mentionSourceUserInActionableMessages: !suppressDotUserMention,
+            presentation: this.#presentation(message.channel),
+            gitApprovalDetailsStore: this.#gitApprovalDetails,
+            choiceContinuationStore: this.#choiceContinuations,
+            approvalTextStore: this.#approvalTextStore,
+            interactionAudit: this.#interactionAudit,
           },
         );
         let projectionStarted = false;
