@@ -662,6 +662,7 @@ function notifyExistingBaseSyncPlan(server: FakeAppServer): void {
     expected_base_sha: "b".repeat(40),
     expected_merge_commit_sha: "d".repeat(40),
     expected_commit_shas: ["b".repeat(40), "d".repeat(40)],
+    expected_pull_request_base_sha: "c".repeat(40),
   };
   server.notify("item/started", {
     threadId: "thr_1",

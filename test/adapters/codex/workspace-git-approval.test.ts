@@ -129,6 +129,24 @@ test("bot evidence rejects unknown fields, malformed file hashes, duplicate path
   }
 });
 
+test("Dependabot Ready plans preserve their exact scope without merge evidence", () => {
+  const notification = dependencyMergeNotification();
+  notification.item.arguments.action = "mark_ready_for_review";
+  Reflect.deleteProperty(notification.item.arguments, "merge_method");
+  for (const location of ["scope", "approval_scope"] as const) {
+    const scope = notification.item.result.structuredContent[location];
+    scope.action = "mark_ready_for_review";
+    scope.expected_is_draft = true;
+    Reflect.deleteProperty(scope, "merge_method");
+    Reflect.deleteProperty(scope, "dependabot_merge");
+  }
+
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "pull_request_ready");
+  assert.equal(capture?.plan.dependabotMerge, undefined);
+  assert.deepEqual(capture?.plan.approvalScope, notification.item.result.structuredContent.approval_scope);
+});
+
 test("bot evidence cannot extend Ready, stacked, auto-merge or altered expected-head input", () => {
   for (const mutation of ["ready", "stacked", "auto", "head-input", "missing-evidence"] as const) {
     const notification = dependencyMergeNotification();

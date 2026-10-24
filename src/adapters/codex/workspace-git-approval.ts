@@ -1114,7 +1114,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       hasParent: parent !== undefined,
     })
     : undefined;
-  if (branch.startsWith("dependabot/") && dependabotMerge === undefined) {
+  if (action === "merge" && branch.startsWith("dependabot/") && dependabotMerge === undefined) {
     throw new Error("workspace-git Dependabot merge requires exact typed evidence");
   }
   return {
