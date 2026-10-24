@@ -4,7 +4,58 @@ import test from "node:test";
 import type { WorkspaceGitApprovalPlan } from "../../../src/core/index.js";
 import {
   WorkspaceGitApprovalLifecycle,
+  sameExactWorkspaceGitApprovalPlan,
 } from "../../../src/adapters/codex/workspace-git-approval-lifecycle.js";
+
+function botMergePlan(): WorkspaceGitApprovalPlan {
+  return {
+    operationId: "88888888-8888-4888-8888-888888888888", planHash: "8".repeat(64), approvalTarget: "pr_42",
+    operation: "pull_request_merge", repoId: "fixture", mode: "merge", branch: "dependabot/npm_and_yarn/zod-4.6.7",
+    paths: ["package.json"], expectedHead: "a".repeat(40), pullRequestNumber: 42,
+    pullRequestUrl: "https://github.com/fixture-owner/fixture-repo/pull/42", targetPullRequestTitle: "Bump fixture dependency",
+    baseBranch: "main", basePolicy: "catalog_publication_branch", baseSha: "b".repeat(40), autoMergeEnabled: false,
+    headRepositoryOwner: "fixture-owner", expectedIsDraft: false, mergeMethod: "merge", expiresAt: "2026-10-23T00:00:00Z",
+    // Deliberately keep the same public scope in substitution tests: normalized
+    // fields must be compared too, independently of approvalScope equality.
+    approvalScope: { kind: "pull_request", fixture: "unchanged" },
+    dependabotMerge: { version: 1, kind: "dependabot_merge", repository: "fixture-owner/fixture-repo", pull_request_number: 42,
+      pull_request_url: "https://github.com/fixture-owner/fixture-repo/pull/42", head_ref_name: "dependabot/npm_and_yarn/zod-4.6.7",
+      head_sha: "a".repeat(40), base_ref_name: "main", pr_read_base_sha: "b".repeat(40), current_base_tip_sha: "c".repeat(40),
+      author_login: "dependabot[bot]", author_id: 12345, author_type: "Bot", ecosystem: "npm_and_yarn",
+      files: [{ path: "package.json", before_blob_sha: "d".repeat(40), after_blob_sha: "e".repeat(40), before_sha256: "1".repeat(64), after_sha256: "2".repeat(64) }],
+      source_fingerprint: "3".repeat(64) },
+  };
+}
+
+test("normalized PR-read B changes never reuse an existing base-merge binding", () => {
+  const original = existingBaseSyncPlan();
+  assert.equal(sameExactWorkspaceGitApprovalPlan(original, existingBaseSyncPlan()), true);
+  assert.equal(sameExactWorkspaceGitApprovalPlan(original, existingBaseSyncPlan({ expectedPullRequestBaseSha: "9".repeat(40) })), false);
+  const lifecycle = new WorkspaceGitApprovalLifecycle(); lifecycle.rememberPlan("session", "turn", original);
+  lifecycle.rememberPlan("session", "turn", existingBaseSyncPlan({ expectedPullRequestBaseSha: "9".repeat(40) }));
+  assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), { kind: "ambiguous" });
+});
+
+test("normalized bot evidence changes reject even when operation hash and approval scope are unchanged", () => {
+  const original = botMergePlan();
+  assert.equal(sameExactWorkspaceGitApprovalPlan(original, botMergePlan()), true);
+  if (original.operation !== "pull_request_merge" || original.dependabotMerge === undefined) return;
+  for (const evidence of [
+    undefined,
+    { ...original.dependabotMerge, current_base_tip_sha: "f".repeat(40) },
+    { ...original.dependabotMerge, author_id: 99999 },
+    { ...original.dependabotMerge, source_fingerprint: "f".repeat(64) },
+    { ...original.dependabotMerge, files: [{ ...original.dependabotMerge.files[0]!, after_sha256: "f".repeat(64) }] },
+  ]) {
+    const changed: WorkspaceGitApprovalPlan = evidence === undefined
+      ? (({ dependabotMerge: _removed, ...withoutEvidence }) => withoutEvidence)(original)
+      : { ...original, dependabotMerge: evidence };
+    assert.equal(sameExactWorkspaceGitApprovalPlan(original, changed), false);
+    const lifecycle = new WorkspaceGitApprovalLifecycle(); lifecycle.rememberPlan("session", "turn", original);
+    lifecycle.rememberPlan("session", "turn", changed);
+    assert.deepEqual(lifecycle.inspectPlanBinding("session", "turn"), { kind: "ambiguous" });
+  }
+});
 
 function plan(overrides: Partial<WorkspaceGitApprovalPlan> = {}): WorkspaceGitApprovalPlan {
   return {
@@ -130,6 +181,7 @@ function existingBaseSyncPlan(
     updateMode: "push_base_merge",
     expectedBaseSyncReceiptId: `sync_${"6".repeat(64)}`,
     expectedBaseSha: "b".repeat(40),
+    expectedPullRequestBaseSha: "c".repeat(40),
     expectedMergeCommitSha: "d".repeat(40),
     expectedCommitShas: ["b".repeat(40), "d".repeat(40)],
     expiresAt: "2026-10-08T12:00:00.000Z",
@@ -296,6 +348,7 @@ test("treats a changed base-sync commit set or fetched base as ambiguous", () =>
       expectedBaseSyncReceiptId: `sync_${"7".repeat(64)}`,
     }),
     existingBaseSyncPlan({ expectedBaseSha: "9".repeat(40) }),
+    existingBaseSyncPlan({ expectedPullRequestBaseSha: "9".repeat(40) }),
     existingBaseSyncPlan({
       expectedCommitShas: ["b".repeat(40), "8".repeat(40)],
     }),

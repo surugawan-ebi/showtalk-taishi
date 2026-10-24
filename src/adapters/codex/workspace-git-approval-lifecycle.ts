@@ -488,6 +488,7 @@ export function sameExactWorkspaceGitApprovalPlan(
       left.targetPullRequestTitle === right.targetPullRequestTitle &&
       left.basePolicy === right.basePolicy &&
       left.baseSha === right.baseSha &&
+      isDeepStrictEqual(left.dependabotMerge, right.dependabotMerge) &&
       left.autoMergeEnabled === right.autoMergeEnabled &&
       left.headRepositoryOwner === right.headRepositoryOwner &&
       left.expectedIsDraft === right.expectedIsDraft &&
@@ -568,6 +569,7 @@ function sameExistingPullRequestUpdatePlan(
     left.updateMode === right.updateMode &&
     left.expectedBaseSyncReceiptId === right.expectedBaseSyncReceiptId &&
     left.expectedBaseSha === right.expectedBaseSha &&
+    left.expectedPullRequestBaseSha === right.expectedPullRequestBaseSha &&
     left.expectedMergeCommitSha === right.expectedMergeCommitSha &&
     isDeepStrictEqual(left.expectedCommitShas, right.expectedCommitShas) &&
     left.expiresAt === right.expiresAt;

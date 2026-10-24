@@ -185,6 +185,32 @@ type WorkspaceGitEstablishedPublicationApprovalPlan =
     readonly expectedHead: string;
   };
 
+/** Exact immutable public evidence bound by the workspace-git v3 merge plan. */
+export interface WorkspaceGitDependabotMergeEvidence {
+  readonly version: 1;
+  readonly kind: "dependabot_merge";
+  readonly repository: string;
+  readonly pull_request_number: number;
+  readonly pull_request_url: string;
+  readonly head_ref_name: string;
+  readonly head_sha: string;
+  readonly base_ref_name: string;
+  readonly pr_read_base_sha: string;
+  readonly current_base_tip_sha: string;
+  readonly author_login: "dependabot[bot]";
+  readonly author_id: number;
+  readonly author_type: "Bot";
+  readonly ecosystem: "npm_and_yarn" | "github_actions";
+  readonly files: readonly Readonly<{
+    path: string;
+    before_blob_sha: string;
+    after_blob_sha: string;
+    before_sha256: string;
+    after_sha256: string;
+  }>[];
+  readonly source_fingerprint: string;
+}
+
 interface WorkspaceGitPullRequestApprovalPlan extends WorkspaceGitApprovalPlanBase {
   readonly operation: "pull_request_ready" | "pull_request_merge";
   readonly mode: "mark_ready_for_review" | "merge";
@@ -216,6 +242,7 @@ interface WorkspaceGitPullRequestApprovalPlan extends WorkspaceGitApprovalPlanBa
   readonly parentIsDraft?: boolean;
   readonly parentAutoMergeEnabled?: boolean;
   readonly mergeMethod?: "merge" | "squash" | "rebase";
+  readonly dependabotMerge?: WorkspaceGitDependabotMergeEvidence;
 }
 
 interface WorkspaceGitExistingPullRequestUpdateApprovalPlan
@@ -246,7 +273,10 @@ interface WorkspaceGitExistingPullRequestUpdateApprovalPlan
   readonly pushRef: string;
   readonly updateMode: "commit_paths" | "push_base_merge";
   readonly expectedBaseSyncReceiptId?: string;
+  /** Receipt fetched base T. */
   readonly expectedBaseSha?: string;
+  /** Independently observed PR-read base B. */
+  readonly expectedPullRequestBaseSha?: string;
   readonly expectedMergeCommitSha?: string;
   readonly expectedCommitShas?: readonly string[];
 }

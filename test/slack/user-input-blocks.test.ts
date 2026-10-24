@@ -14,6 +14,91 @@ import {
   parseUserInputPathVisibility,
 } from "../../src/slack/user-input-blocks.js";
 
+test("shows complete bot merge author, B/T, file hashes and fingerprint without leaking them into action values", () => {
+  const evidence = { version: 1 as const, kind: "dependabot_merge" as const, repository: "fixture-owner/fixture-repo", pull_request_number: 42,
+    pull_request_url: "https://github.com/fixture-owner/fixture-repo/pull/42", head_ref_name: "dependabot/npm_and_yarn/zod-4.6.7",
+    head_sha: "a".repeat(40), base_ref_name: "main", pr_read_base_sha: "b".repeat(40), current_base_tip_sha: "c".repeat(40),
+    author_login: "dependabot[bot]" as const, author_id: 12345, author_type: "Bot" as const, ecosystem: "npm_and_yarn" as const,
+    files: [{ path: "package.json", before_blob_sha: "d".repeat(40), after_blob_sha: "e".repeat(40), before_sha256: "1".repeat(64), after_sha256: "2".repeat(64) }],
+    source_fingerprint: "3".repeat(64) };
+  const botPlan: WorkspaceGitApprovalPlan = {
+    operationId: "88888888-8888-4888-8888-888888888888", planHash: "8".repeat(64), approvalTarget: "pr_42",
+    operation: "pull_request_merge", repoId: "fixture", mode: "merge", branch: evidence.head_ref_name,
+    paths: evidence.files.map(file => file.path), expectedHead: evidence.head_sha, pullRequestNumber: 42,
+    pullRequestUrl: evidence.pull_request_url, targetPullRequestTitle: "Bump fixture dependency", baseBranch: "main",
+    basePolicy: "catalog_publication_branch", baseSha: evidence.pr_read_base_sha, autoMergeEnabled: false,
+    headRepositoryOwner: "fixture-owner", expectedIsDraft: false, mergeMethod: "merge", dependabotMerge: evidence,
+    expiresAt: "2026-10-23T00:00:00Z",
+  };
+  const blocks = buildWorkspaceGitApprovalBlocks("Review bot merge", botPlan, routing);
+  const text = JSON.stringify(blocks);
+  assert.match(text, /Dependabot merge根拠/u); assert.match(text, /dependabot\[bot\]/u);
+  assert.match(text, /author_id/u); assert.match(text, /12345/u); assert.match(text, /source_fingerprint/u);
+  assert.match(text, /pr_read_base_sha/u); assert.match(text, /current_base_tip_sha/u);
+  assert.match(text, /package\.json/u); assert.match(text, /before_sha256/u); assert.match(text, /after_sha256/u);
+  assert.match(text, /b{40}/u); assert.match(text, /c{40}/u); assert.match(text, /3{64}/u);
+  const summary = blocks[1];
+  assert.equal(summary?.type, "section");
+  if (summary?.type === "section") assert.ok((summary.fields?.length ?? 0) <= 10);
+  const actions = blocks.at(-1); assert.equal(actions?.type, "actions");
+  if (actions?.type !== "actions") return;
+  for (const action of actions.elements) {
+    if ("value" in action) {
+      assert.doesNotMatch(String(action.value), /dependabot|source_fingerprint|"author_id":12345|package\.json|3{64}/u);
+    }
+  }
+});
+
+test("base merge summary keeps B and T visible within the ten-field Slack limit", () => {
+  const blocks = buildWorkspaceGitApprovalBlocks("Review B/T", baseSyncPlan, routing);
+  const summary = blocks[1]; assert.equal(summary?.type, "section");
+  if (summary?.type !== "section") return;
+  assert.equal(summary.fields?.length, 10);
+  const rendered = JSON.stringify(summary);
+  assert.match(rendered, /PR読取base SHA \(B\)/u); assert.match(rendered, /取得base SHA \(T\)/u);
+  assert.match(rendered, /b{40}/u); assert.match(rendered, /c{40}/u);
+});
+
+function wideBotRenderPlan(width: number): WorkspaceGitApprovalPlan {
+  const files = Array.from({ length: 100 }, (_, index) => ({ path: `.github/workflows/${String(index).padStart(3, "0")}${"x".repeat(width)}.yml`,
+    before_blob_sha: "d".repeat(40), after_blob_sha: "e".repeat(40), before_sha256: "1".repeat(64), after_sha256: "2".repeat(64) }));
+  return {
+    operationId: "88888888-8888-4888-8888-888888888888", planHash: "8".repeat(64), approvalTarget: "pr_42",
+    operation: "pull_request_merge", repoId: "fixture", mode: "merge", branch: "dependabot/github_actions/actions/setup-node-7.1.0",
+    paths: files.map(file => file.path), expectedHead: "a".repeat(40), pullRequestNumber: 42,
+    pullRequestUrl: "https://github.com/fixture-owner/fixture-repo/pull/42", targetPullRequestTitle: "Bump fixture actions",
+    baseBranch: "main", basePolicy: "catalog_publication_branch", baseSha: "b".repeat(40), autoMergeEnabled: false,
+    headRepositoryOwner: "fixture-owner", expectedIsDraft: false, mergeMethod: "merge", expiresAt: "2026-10-23T00:00:00Z",
+    dependabotMerge: { version: 1, kind: "dependabot_merge", repository: "fixture-owner/fixture-repo", pull_request_number: 42,
+      pull_request_url: "https://github.com/fixture-owner/fixture-repo/pull/42", head_ref_name: "dependabot/github_actions/actions/setup-node-7.1.0",
+      head_sha: "a".repeat(40), base_ref_name: "main", pr_read_base_sha: "b".repeat(40), current_base_tip_sha: "c".repeat(40),
+      author_login: "dependabot[bot]", author_id: 12345, author_type: "Bot", ecosystem: "github_actions", files, source_fingerprint: "3".repeat(64) },
+  };
+}
+
+test("complete bounded bot evidence stays within Slack section and block limits", () => {
+  const candidate = wideBotRenderPlan(100);
+  const blocks = buildWorkspaceGitApprovalBlocks("Review all immutable evidence", candidate, routing);
+  assert.ok(blocks.length <= 50);
+  for (const block of blocks) {
+    if (block.type !== "section") continue;
+    if (block.text !== undefined) assert.ok(block.text.text.length <= 3000);
+    assert.ok((block.fields?.length ?? 0) <= 10);
+  }
+  if (candidate.operation !== "pull_request_merge") return;
+  const rendered = JSON.stringify(blocks);
+  assert.match(rendered, /099x+/u); assert.match(rendered, /3{64}/u);
+  assert.match(rendered, /before_blob_sha/u); assert.match(rendered, /after_sha256/u);
+});
+
+test("oversize bot evidence fails closed rather than hiding exact hashes or author fields", () => {
+  const candidate = wideBotRenderPlan(1000);
+  for (const pathsExpanded of [true, false]) assert.throws(
+    () => buildWorkspaceGitApprovalBlocks("Review complete oversized evidence", candidate, routing, { pathsExpanded }),
+    /too large for Slack Block Kit/u,
+  );
+});
+
 const plan = {
   operationId: "11111111-1111-4111-8111-111111111111",
   planHash: "a".repeat(64),
@@ -112,6 +197,7 @@ const baseSyncPlan = {
   updateMode: "push_base_merge",
   expectedBaseSyncReceiptId: `sync_${"6".repeat(64)}`,
   expectedBaseSha: "b".repeat(40),
+  expectedPullRequestBaseSha: "c".repeat(40),
   expectedMergeCommitSha: "d".repeat(40),
   expectedCommitShas: ["b".repeat(40), "d".repeat(40)],
   expiresAt: "2026-10-08T12:00:00.000Z",
@@ -205,7 +291,9 @@ test("renders a base-sync push with fixed base, merge, commit set, and total dif
   assert.match(rendered, /旧remote HEAD/u);
   assert.match(rendered, /同期receipt/u);
   assert.match(rendered, new RegExp(`sync_${"6".repeat(64)}`, "u"));
-  assert.match(rendered, /取得base SHA/u);
+  assert.match(rendered, /取得base SHA \(T\)/u);
+  assert.match(rendered, /PR読取base SHA \(B\)/u);
+  assert.match(rendered, new RegExp("c{40}", "u"));
   assert.match(rendered, /二親merge SHA/u);
   assert.match(rendered, /全commit集合/u);
   assert.match(rendered, /全commit SHAs/u);

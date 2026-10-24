@@ -1,10 +1,181 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
   captureWorkspaceGitPlan,
   validateWorkspaceGitPlanQuestion,
 } from "../../../src/adapters/codex/workspace-git-approval.js";
+
+function canonicalDependencyEvidence(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalDependencyEvidence).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalDependencyEvidence((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function fingerprintDependencyEvidence(evidence: Record<string, unknown>): void {
+  const source = Object.fromEntries(Object.entries(evidence).filter(([key]) => key !== "source_fingerprint"));
+  evidence.source_fingerprint = createHash("sha256").update(canonicalDependencyEvidence(source)).digest("hex");
+}
+
+function dependencyMergeNotification() {
+  const evidence: Record<string, unknown> = {
+    version: 1, kind: "dependabot_merge", repository: "fixture-owner/fixture-repo", pull_request_number: 42,
+    pull_request_url: "https://github.com/fixture-owner/fixture-repo/pull/42",
+    head_ref_name: "dependabot/npm_and_yarn/zod-4.6.7", head_sha: "a".repeat(40), base_ref_name: "main",
+    pr_read_base_sha: "b".repeat(40), current_base_tip_sha: "c".repeat(40),
+    author_login: "dependabot[bot]", author_id: 12345, author_type: "Bot", ecosystem: "npm_and_yarn",
+    files: [{ path: "package.json", before_blob_sha: "d".repeat(40), after_blob_sha: "e".repeat(40),
+      before_sha256: "1".repeat(64), after_sha256: "2".repeat(64) }],
+  };
+  fingerprintDependencyEvidence(evidence);
+  const scope = {
+    repo_id: "fixture", action: "merge", pull_request_number: 42,
+    pull_request_url: "https://github.com/fixture-owner/fixture-repo/pull/42", title: "Bump fixture dependency",
+    base_ref_name: "main", base_policy: "catalog_publication_branch", base_sha: "b".repeat(40),
+    head_ref_name: "dependabot/npm_and_yarn/zod-4.6.7", head_repository_owner: "fixture-owner",
+    expected_head_sha: "a".repeat(40), expected_is_draft: false, auto_merge_enabled: false, merge_method: "merge",
+    dependabot_merge: evidence,
+  };
+  return { turnId: "turn_dependency", item: { type: "mcpToolCall", id: "mcp_dependency", server: "workspace-git",
+    tool: "prepare_pull_request_operation", status: "completed",
+    arguments: { repo_id: "fixture", pull_request_number: 42, action: "merge", merge_method: "merge", expected_head_sha: "a".repeat(40) },
+    result: { structuredContent: { status: "awaiting_human_approval", operation_id: "22222222-2222-4222-8222-222222222222",
+      approval_target: "pr_42", approval_expires_at: "2026-10-23T00:00:00Z", scope,
+      approval_scope: { kind: "pull_request", ...structuredClone(scope) }, plan_hash: "9".repeat(64),
+      execute_tool: "execute_approved_pull_request_operation", external_write: false } } } };
+}
+
+test("keeps PR-read B distinct from receipt T and reverses both exact approval fields", () => {
+  const notification = existingPullRequestBaseSyncNotification();
+  for (const key of ["scope", "approval_scope"] as const) Reflect.set(notification.item.result.structuredContent[key], "expected_pull_request_base_sha", "8".repeat(40));
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "existing_pull_request_update");
+  if (capture?.plan.operation !== "existing_pull_request_update") return;
+  assert.equal(capture.plan.expectedBaseSha, "7".repeat(40));
+  assert.equal(capture.plan.expectedPullRequestBaseSha, "8".repeat(40));
+  assert.equal(capture.plan.approvalScope?.expected_base_sha, "7".repeat(40));
+  assert.equal(capture.plan.approvalScope?.expected_pull_request_base_sha, "8".repeat(40));
+  assert.equal(Object.hasOwn(notification.item.arguments, "expected_pull_request_base_sha"), false);
+});
+
+test("base-merge compatibility rejects missing, malformed, substituted or unknown B fields", () => {
+  for (const location of ["scope", "approval_scope"] as const) {
+    const missing = existingPullRequestBaseSyncNotification(); Reflect.deleteProperty(missing.item.result.structuredContent[location], "expected_pull_request_base_sha");
+    assert.throws(() => captureWorkspaceGitPlan(missing));
+    const substituted = existingPullRequestBaseSyncNotification(); Reflect.set(substituted.item.result.structuredContent[location], "expected_pull_request_base_sha", "8".repeat(40));
+    assert.throws(() => captureWorkspaceGitPlan(substituted));
+  }
+  const malformed = existingPullRequestBaseSyncNotification();
+  for (const location of ["scope", "approval_scope"] as const) Reflect.set(malformed.item.result.structuredContent[location], "expected_pull_request_base_sha", "z".repeat(40));
+  assert.throws(() => captureWorkspaceGitPlan(malformed));
+  const injectedInput = existingPullRequestBaseSyncNotification(); Reflect.set(injectedInput.item.arguments, "expected_pull_request_base_sha", "8".repeat(40));
+  assert.throws(() => captureWorkspaceGitPlan(injectedInput), /input is invalid/u);
+  const unknown = existingPullRequestBaseSyncNotification();
+  for (const location of ["scope", "approval_scope"] as const) Reflect.set(unknown.item.result.structuredContent[location], "unknown_base_binding", "8".repeat(40));
+  assert.throws(() => captureWorkspaceGitPlan(unknown));
+});
+
+test("captures exact immutable bot evidence and regenerates identical approval scope", () => {
+  const notification = dependencyMergeNotification(); const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "pull_request_merge");
+  if (capture?.plan.operation !== "pull_request_merge") return;
+  assert.deepEqual(capture.plan.dependabotMerge, notification.item.result.structuredContent.scope.dependabot_merge);
+  assert.deepEqual(capture.plan.approvalScope, notification.item.result.structuredContent.approval_scope);
+  assert.equal(capture.plan.dependabotMerge?.pr_read_base_sha, "b".repeat(40));
+  assert.equal(capture.plan.dependabotMerge?.current_base_tip_sha, "c".repeat(40));
+  assert.ok(Object.isFrozen(capture.plan.dependabotMerge)); assert.ok(Object.isFrozen(capture.plan.dependabotMerge?.files));
+  assert.ok(Object.isFrozen(capture.plan.dependabotMerge?.files[0]));
+  notification.item.result.structuredContent.scope.dependabot_merge.author_id = 99999;
+  assert.equal(capture.plan.dependabotMerge?.author_id, 12345);
+});
+
+test("bot evidence recomputes source fingerprint and rejects consistent-looking identity substitution", () => {
+  for (const [key, value] of [
+    ["repository", "other-owner/fixture-repo"], ["pull_request_number", 43],
+    ["pull_request_url", "https://github.com/fixture-owner/fixture-repo/pull/43"],
+    ["head_ref_name", "dependabot/npm_and_yarn/other-1.0.0"], ["head_sha", "f".repeat(40)],
+    ["base_ref_name", "release"], ["pr_read_base_sha", "f".repeat(40)],
+    ["author_login", "other[bot]"], ["author_type", "User"], ["ecosystem", "github_actions"],
+  ] as const) {
+    const notification = dependencyMergeNotification();
+    for (const location of ["scope", "approval_scope"] as const) {
+      const evidence = notification.item.result.structuredContent[location].dependabot_merge;
+      Reflect.set(evidence, key, value); fingerprintDependencyEvidence(evidence);
+    }
+    assert.throws(() => captureWorkspaceGitPlan(notification), Error, key);
+  }
+  const forged = dependencyMergeNotification();
+  for (const location of ["scope", "approval_scope"] as const) forged.item.result.structuredContent[location].dependabot_merge.source_fingerprint = "0".repeat(64);
+  assert.throws(() => captureWorkspaceGitPlan(forged), /fingerprint/u);
+});
+
+test("bot evidence rejects unknown fields, malformed file hashes, duplicate paths and scope drift", () => {
+  for (const mutation of ["extra", "file-extra", "hash", "duplicate", "path", "missing", "approval-drift"] as const) {
+    const notification = dependencyMergeNotification();
+    for (const location of ["scope", "approval_scope"] as const) {
+      const evidence = notification.item.result.structuredContent[location].dependabot_merge;
+      const files = evidence.files as Array<Record<string, unknown>>;
+      if (mutation === "extra") evidence.unrecognized = true;
+      if (mutation === "file-extra") files[0]!.unrecognized = true;
+      if (mutation === "hash") files[0]!.after_sha256 = "z".repeat(64);
+      if (mutation === "duplicate") files.push(structuredClone(files[0]!));
+      if (mutation === "path") files[0]!.path = "src/arbitrary.ts";
+      if (mutation === "missing") Reflect.deleteProperty(evidence, "current_base_tip_sha");
+      if (mutation === "approval-drift" && location === "approval_scope") evidence.current_base_tip_sha = "f".repeat(40);
+      fingerprintDependencyEvidence(evidence);
+    }
+    assert.throws(() => captureWorkspaceGitPlan(notification), Error, mutation);
+  }
+});
+
+test("Dependabot Ready plans preserve their exact scope without merge evidence", () => {
+  const notification = dependencyMergeNotification();
+  notification.item.arguments.action = "mark_ready_for_review";
+  Reflect.deleteProperty(notification.item.arguments, "merge_method");
+  for (const location of ["scope", "approval_scope"] as const) {
+    const scope = notification.item.result.structuredContent[location];
+    scope.action = "mark_ready_for_review";
+    scope.expected_is_draft = true;
+    Reflect.deleteProperty(scope, "merge_method");
+    Reflect.deleteProperty(scope, "dependabot_merge");
+  }
+
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "pull_request_ready");
+  assert.equal(capture?.plan.dependabotMerge, undefined);
+  assert.deepEqual(capture?.plan.approvalScope, notification.item.result.structuredContent.approval_scope);
+});
+
+test("bot evidence cannot extend Ready, stacked, auto-merge or altered expected-head input", () => {
+  for (const mutation of ["ready", "stacked", "auto", "head-input", "missing-evidence"] as const) {
+    const notification = dependencyMergeNotification();
+    if (mutation === "head-input") notification.item.arguments.expected_head_sha = "f".repeat(40);
+    if (mutation === "ready") { notification.item.arguments.action = "mark_ready_for_review"; Reflect.deleteProperty(notification.item.arguments, "merge_method"); }
+    for (const location of ["scope", "approval_scope"] as const) {
+      const scope = notification.item.result.structuredContent[location];
+      if (mutation === "ready") { scope.action = "mark_ready_for_review"; scope.expected_is_draft = true; Reflect.deleteProperty(scope, "merge_method"); }
+      if (mutation === "stacked") scope.base_policy = "same_repo_stacked_pr";
+      if (mutation === "auto") scope.auto_merge_enabled = true;
+      if (mutation === "missing-evidence") Reflect.deleteProperty(scope, "dependabot_merge");
+    }
+    assert.throws(() => captureWorkspaceGitPlan(notification), Error, mutation);
+  }
+});
+
+test("bot evidence derived file paths retain the existing total review-path budget", () => {
+  const notification = dependencyMergeNotification();
+  for (const location of ["scope", "approval_scope"] as const) {
+    const scope = notification.item.result.structuredContent[location];
+    scope.head_ref_name = "dependabot/github_actions/actions/setup-node-7.1.0";
+    const evidence = scope.dependabot_merge;
+    evidence.head_ref_name = scope.head_ref_name; evidence.ecosystem = "github_actions";
+    evidence.files = Array.from({ length: 100 }, (_, index) => ({ path: `.github/workflows/${String(index).padStart(3, "0")}${"x".repeat(300)}.yml`,
+      before_blob_sha: "d".repeat(40), after_blob_sha: "e".repeat(40), before_sha256: "1".repeat(64), after_sha256: "2".repeat(64) }));
+    fingerprintDependencyEvidence(evidence);
+  }
+  assert.throws(() => captureWorkspaceGitPlan(notification), /paths exceed the Slack review limit/u);
+});
 
 function publicationNotification() {
   return {
@@ -356,6 +527,7 @@ function existingPullRequestBaseSyncNotification() {
   scope.update_mode = "push_base_merge";
   scope.expected_base_sync_receipt_id = receiptId;
   scope.expected_base_sha = baseSha;
+  scope.expected_pull_request_base_sha = baseSha;
   scope.expected_merge_commit_sha = mergeSha;
   scope.expected_commit_shas = [baseSha, mergeSha];
   const approvalScope = notification.item.result.structuredContent
@@ -363,6 +535,7 @@ function existingPullRequestBaseSyncNotification() {
   approvalScope.update_mode = "push_base_merge";
   approvalScope.expected_base_sync_receipt_id = receiptId;
   approvalScope.expected_base_sha = baseSha;
+  approvalScope.expected_pull_request_base_sha = baseSha;
   approvalScope.expected_merge_commit_sha = mergeSha;
   approvalScope.expected_commit_shas = [baseSha, mergeSha];
   return notification;
@@ -624,6 +797,7 @@ test("captures and fixes every base-sync commit and total-diff boundary", () => 
   assert.equal(capture.plan.updateMode, "push_base_merge");
   assert.equal(capture.plan.expectedBaseSyncReceiptId, `sync_${"6".repeat(64)}`);
   assert.equal(capture.plan.expectedBaseSha, "7".repeat(40));
+  assert.equal(capture.plan.expectedPullRequestBaseSha, "7".repeat(40));
   assert.equal(capture.plan.expectedMergeCommitSha, "c".repeat(40));
   assert.deepEqual(capture.plan.expectedCommitShas, [
     "7".repeat(40),
