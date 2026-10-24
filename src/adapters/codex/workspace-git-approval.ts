@@ -1,5 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
+import { validatedDependabotMergeEvidence } from "./workspace-git-dependabot-evidence.js";
+
 import type {
   WorkspaceGitApprovalPlan,
   WorkspaceGitDependabotSecurityUpdateState,
@@ -449,6 +451,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       "update_mode",
       "expected_base_sync_receipt_id",
       "expected_base_sha",
+      "expected_pull_request_base_sha",
       "expected_merge_commit_sha",
       "expected_commit_shas",
     ];
@@ -550,6 +553,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
     }
     let expectedBaseSyncReceiptId: string | undefined;
     let expectedBaseSha: string | undefined;
+    let expectedPullRequestBaseSha: string | undefined;
     let expectedMergeCommitSha: string | undefined;
     let expectedCommitShas: readonly string[] | undefined;
     if (updateMode === "push_base_merge") {
@@ -558,7 +562,8 @@ export function normalizeWorkspaceGitPrepareCompletion(
         69,
         "base synchronization receipt ID",
       );
-      expectedBaseSha = boundedString(scope.expected_base_sha, 40, "expected base SHA");
+      expectedBaseSha = boundedString(scope.expected_base_sha, 40, "expected fetched base SHA");
+      expectedPullRequestBaseSha = boundedString(scope.expected_pull_request_base_sha, 40, "expected PR-read base SHA");
       expectedMergeCommitSha = boundedString(
         scope.expected_merge_commit_sha,
         40,
@@ -577,6 +582,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
           "base synchronization receipt input",
         ) ||
         !GIT_SHA.test(expectedBaseSha) ||
+        !GIT_SHA.test(expectedPullRequestBaseSha) ||
         expectedBaseSha !== boundedString(
           argumentsRecord.expected_base_sha,
           40,
@@ -669,6 +675,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
           ? {}
           : { expectedBaseSyncReceiptId }),
         ...(expectedBaseSha === undefined ? {} : { expectedBaseSha }),
+        ...(expectedPullRequestBaseSha === undefined ? {} : { expectedPullRequestBaseSha }),
         ...(expectedMergeCommitSha === undefined
           ? {}
           : { expectedMergeCommitSha }),
@@ -975,6 +982,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
     "parent_is_draft",
     "parent_auto_merge_enabled",
     "merge_method",
+    "dependabot_merge",
   ])) {
     throw new Error("workspace-git Pull Request scope is invalid");
   }
@@ -1078,6 +1086,8 @@ export function normalizeWorkspaceGitPrepareCompletion(
     action !== argumentsRecord.action ||
     pullRequestNumber !== argumentsRecord.pull_request_number ||
     !GIT_SHA.test(expectedHead) ||
+    (argumentsRecord.expected_head_sha !== undefined &&
+      expectedHead !== boundedString(argumentsRecord.expected_head_sha, 40, "expected Pull Request HEAD input")) ||
     (action === "mark_ready_for_review"
       ? scope.expected_is_draft !== true
       : scope.expected_is_draft !== false)
@@ -1095,6 +1105,18 @@ export function normalizeWorkspaceGitPrepareCompletion(
   if (mergeMethod !== inputMergeMethod) {
     throw new Error("workspace-git merge method does not match its input");
   }
+  const dependabotMerge = Object.hasOwn(scope, "dependabot_merge")
+    ? validatedDependabotMergeEvidence(scope.dependabot_merge, {
+      action, branch, expectedHead, pullRequestNumber, pullRequestUrl,
+      headRepositoryOwner, baseBranch, basePolicy, baseSha,
+      autoMergeEnabled: scope.auto_merge_enabled,
+      expectedIsDraft: scope.expected_is_draft,
+      hasParent: parent !== undefined,
+    })
+    : undefined;
+  if (branch.startsWith("dependabot/") && dependabotMerge === undefined) {
+    throw new Error("workspace-git Dependabot merge requires exact typed evidence");
+  }
   return {
     turnId,
     plan: bindApprovalScope({
@@ -1106,7 +1128,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       repoId,
       mode: action,
       branch,
-      paths: [],
+      paths: dependabotMerge === undefined ? [] : validatedPaths(dependabotMerge.files.map(file => file.path)),
       expectedHead,
       pullRequestNumber,
       pullRequestUrl,
@@ -1114,6 +1136,7 @@ export function normalizeWorkspaceGitPrepareCompletion(
       baseBranch,
       basePolicy,
       ...(baseSha === undefined ? {} : { baseSha }),
+      ...(dependabotMerge === undefined ? {} : { dependabotMerge }),
       autoMergeEnabled: scope.auto_merge_enabled,
       headRepositoryOwner,
       expectedIsDraft: scope.expected_is_draft,
@@ -1243,6 +1266,7 @@ function approvalScopeForPlan(
         expected_head_sha: plan.expectedHead,
         expected_is_draft: plan.expectedIsDraft,
         auto_merge_enabled: plan.autoMergeEnabled,
+        ...(plan.dependabotMerge === undefined ? {} : { dependabot_merge: plan.dependabotMerge }),
         ...(plan.parentPullRequestNumber === undefined
           ? {}
           : {
@@ -1284,6 +1308,7 @@ function approvalScopeForPlan(
               update_mode: plan.updateMode,
               expected_base_sync_receipt_id: plan.expectedBaseSyncReceiptId,
               expected_base_sha: plan.expectedBaseSha,
+              expected_pull_request_base_sha: plan.expectedPullRequestBaseSha,
               expected_merge_commit_sha: plan.expectedMergeCommitSha,
               expected_commit_shas: [...plan.expectedCommitShas!],
             }
