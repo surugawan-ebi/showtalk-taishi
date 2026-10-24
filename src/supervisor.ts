@@ -7,9 +7,11 @@ export interface GatewaySupervisorOptions {
   readonly spawnWorker?: () => ChildProcess;
   readonly processRef?: Pick<
     NodeJS.Process,
-    "once" | "off" | "execPath" | "execArgv" | "argv" | "env"
+    "on" | "off" | "execPath" | "execArgv" | "argv" | "env"
   >;
   readonly onRestart?: () => void;
+  /** Fixture seam; production holds the failed stop without allowing launchd to respawn it. */
+  readonly holdAfterStopFailure?: (error: Error) => Promise<never>;
 }
 
 interface WorkerExit {
@@ -29,21 +31,46 @@ export async function superviseGatewayWorker(
   const spawnWorker = options.spawnWorker ?? (() => spawnCurrentWorker(processRef));
   let child: ChildProcess | undefined;
   let stopping = false;
+  let stopSignalFailure: Error | undefined;
 
   const requestStop = () => {
     if (stopping) return;
     stopping = true;
-    child?.kill("SIGTERM");
+    try {
+      if (child !== undefined && !child.kill("SIGTERM")) {
+        stopSignalFailure = new Error("Gateway worker did not accept the graceful stop signal");
+      }
+    } catch (error) {
+      stopSignalFailure = new Error("Gateway worker graceful stop signal failed", { cause: error });
+    }
+    if (stopSignalFailure !== undefined) console.error(stopSignalFailure.message);
   };
-  processRef.once("SIGINT", requestStop);
-  processRef.once("SIGTERM", requestStop);
+  processRef.on("SIGINT", requestStop);
+  processRef.on("SIGTERM", requestStop);
 
   try {
     while (!stopping) {
       child = spawnWorker();
-      const exited = await waitForWorkerExit(child);
+      let exited: WorkerExit;
+      try {
+        exited = await waitForWorkerExit(child);
+      } catch (error) {
+        if (!stopping) throw error;
+        return await (options.holdAfterStopFailure ?? holdFailedStop)(
+          new Error("Gateway stop could not confirm worker termination", { cause: error }),
+        );
+      }
       child = undefined;
-      if (stopping) return;
+      if (stopping) {
+        if (stopSignalFailure !== undefined) {
+          return await (options.holdAfterStopFailure ?? holdFailedStop)(stopSignalFailure);
+        }
+        if (exited.signal === null &&
+            (exited.code === 0 || exited.code === GATEWAY_RESTART_EXIT_CODE)) return;
+        return await (options.holdAfterStopFailure ?? holdFailedStop)(
+          new Error(`Gateway stop failed: worker exit=${String(exited.code)}, signal=${String(exited.signal)}`),
+        );
+      }
       if (exited.signal !== null) {
         throw new Error(`Gateway worker stopped by ${exited.signal}`);
       }
@@ -63,6 +90,16 @@ export async function superviseGatewayWorker(
       child.kill("SIGTERM");
     }
   }
+}
+
+async function holdFailedStop(error: Error): Promise<never> {
+  const report = () => console.error(
+    `${error.message}; Supervisor remains stopped from replacement; maintenance stop is NOT confirmed.`,
+  );
+  report();
+  // Keep the registered Supervisor alive: a nonzero exit would let launchd's
+  // SuccessfulExit=false policy start a new worker. No retry or force follows.
+  return new Promise<never>(() => { setInterval(report, 30_000); });
 }
 
 export function isGatewayWorker(

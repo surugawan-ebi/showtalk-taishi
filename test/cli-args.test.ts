@@ -110,6 +110,8 @@ test("parses macOS service lifecycle commands strictly", () => {
     parseCliArguments(["service", "status"], {}).serviceAction,
     "status",
   );
+  assert.equal(parseCliArguments(["service", "start"], {}).serviceAction, "start");
+  assert.equal(parseCliArguments(["service", "stop"], {}).serviceAction, "stop");
   assert.equal(parseCliArguments(["service"], {}).help, true);
   assert.throws(
     () => parseCliArguments(["service", "restart"], {}),
@@ -117,6 +119,14 @@ test("parses macOS service lifecycle commands strictly", () => {
   );
   assert.throws(
     () => parseCliArguments(["service", "status", "--config", "x.yaml"], {}),
+    /available only for service install/,
+  );
+  assert.throws(
+    () => parseCliArguments(["service", "stop", "--env-file", "private.env"], {}),
+    /available only for service install/,
+  );
+  assert.throws(
+    () => parseCliArguments(["service", "start", "--config", "x.yaml"], {}),
     /available only for service install/,
   );
 });

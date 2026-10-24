@@ -369,6 +369,54 @@ the same state file. To remove the service without deleting its logs:
 node dist/cli.js service uninstall
 ```
 
+### Maintenance stop of an already-updated service
+
+`taishi service stop` requests a graceful stop of the existing registered
+LaunchAgent. The Supervisor forwards one SIGTERM; the Worker closes admission
+synchronously, waits for accepted turns, Slack handlers and MCP work to become
+idle, then performs normal shutdown. The Supervisor does not replace the Worker.
+Repeated stop signals do not interrupt the drain. This affects every Koe sharing
+the Gateway. It requires a separately approved maintenance window and the
+existing per-user launchd permissions; it grants no Git or deployment authority.
+
+The command performs at most 40 polls with 250ms waits (ten seconds of requested
+waiting). This is not a wall-clock deadline: each launchctl operation also has
+to return, and the existing launchctl runner has no command timeout. A hung
+command leaves the result unconfirmed, never successfully stopped. Exhausting
+the polls means **pending**, not stopped: the Worker continues draining, and no stronger signal, bootout, plist
+rewrite or retry is performed. The normal five-minute drain checkpoint only
+reports progress. Do not use uninstall/install, a forced signal or a second
+Worker to accelerate it. If the Worker exits uncleanly during a requested stop,
+the Supervisor remains alive, reports that stop is unconfirmed, and prevents
+launchd's failure policy from silently starting another Worker. Investigate that
+fault; `service start` refuses a still-running Supervisor.
+
+After a clean stop, the job remains registered without a running Supervisor.
+`taishi service start` explicitly kickstarts that existing job without `-k` or
+changing its plist, config or environment. A failed registration/status read,
+unknown state or nonzero exit is not accepted as a clean stop. The result reports
+the registered process state; it does not prove Slack readiness or that all
+descendants have exited.
+
+**First activation:** these guarantees require both the running Supervisor and
+Worker to contain this implementation. Running a newer CLI against an old Worker
+still sends SIGTERM to the old immediate-shutdown implementation. Neither
+`service stop` nor `gateway.restart` installs this fix or updates the Supervisor.
+Establish and approve the initial service-update method separately; these
+commands do not resolve that bootstrap problem.
+
+For a later artifact update, first confirm the supported running generation,
+the accepted-work drain, clean Supervisor/Worker exit and absence of relevant
+remaining child processes. Hold the service stopped and exclude concurrent
+writers while validating and replacing `dist` and `node_modules` as one
+generation. Check the complete before/after manifests and backup immediately
+before use; two directory renames alone are not a transaction. Unknown entries,
+partial or mixed generations stop the procedure. Resume only after both trees
+match the approved target. Rollback requires the exact complete target generation
+and revalidated original backup; do not automatically overwrite an uncertain
+partial state. Source, package/lock, config, credentials, runtime state and Git
+metadata are outside that artifact replacement.
+
 ## State and continuity
 
 ShowTalk requires no external database. Runtime state is versioned and written
