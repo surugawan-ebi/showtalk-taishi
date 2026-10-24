@@ -25,6 +25,8 @@ import { validateSlackWorkspace } from "./slack/doctor.js";
 import {
   getMacOSLaunchAgentStatus,
   installMacOSLaunchAgent,
+  startMacOSLaunchAgent,
+  stopMacOSLaunchAgent,
   uninstallMacOSLaunchAgent,
   type MacOSLaunchAgentStatus,
 } from "./service/macos-launch-agent.js";
@@ -207,6 +209,18 @@ async function service(
     console.log("Gateway logs were preserved.");
     return;
   }
+  if (action === "stop") {
+    const status = await stopMacOSLaunchAgent();
+    printServiceStatus(status);
+    console.log("LaunchAgent stopped cleanly.");
+    return;
+  }
+  if (action === "start") {
+    const status = await startMacOSLaunchAgent();
+    printServiceStatus(status);
+    console.log(`LaunchAgent started (pid=${String(status.pid)}).`);
+    return;
+  }
   printServiceStatus(await getMacOSLaunchAgentStatus());
 }
 
@@ -246,6 +260,8 @@ Use --replace only to select a different or ambiguous existing task.
 
 Usage:
   taishi service install [--config path] [--env-file path]
+  taishi service start
+  taishi service stop
   taishi service status
   taishi service uninstall
 
@@ -262,6 +278,8 @@ Usage:
   taishi bind --channel ID --codex-thread ID [--replace] [--config path]
   taishi start [--config path]
   taishi service install [--config path] [--env-file path]
+  taishi service start
+  taishi service stop
   taishi service status
   taishi service uninstall
 `);

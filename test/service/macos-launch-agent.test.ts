@@ -9,6 +9,8 @@ import {
   installMacOSLaunchAgent,
   macOSLaunchAgentPaths,
   renderMacOSLaunchAgentPlist,
+  startMacOSLaunchAgent,
+  stopMacOSLaunchAgent,
   uninstallMacOSLaunchAgent,
   type LaunchctlResult,
   type MacOSLaunchAgentContext,
@@ -200,6 +202,147 @@ test("restores the previous plist and reports a failed rollback bootstrap", asyn
   );
   assert.equal(await readFile(plistPath, "utf8"), previous);
 });
+
+test("stop is idempotent for a loaded clean job and sends no signal", async () => {
+  const calls: string[][] = [];
+  const context = launchAgentContext(async (arguments_) => {
+    calls.push([...arguments_]);
+    return {
+      code: 0,
+      stdout: "state = waiting\nlast exit code = 0\n",
+      stderr: "",
+    };
+  });
+
+  const status = await stopMacOSLaunchAgent(context);
+  assert.equal(status.loaded, true);
+  assert.equal(status.pid, undefined);
+  assert.equal(status.lastExitCode, 0);
+  assert.deepEqual(calls, [["print", `gui/${context.userId}/${status.label}`]]);
+});
+
+test("stop sends one SIGTERM and waits for a clean exit without unloading", async () => {
+  const calls: string[][] = [];
+  let running = true;
+  const context = launchAgentContext(async (arguments_) => {
+    calls.push([...arguments_]);
+    if (arguments_[0] === "kill") {
+      running = false;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return running
+      ? { code: 0, stdout: "state = running\npid = 4242\nlast exit code = 0\n", stderr: "" }
+      : { code: 0, stdout: "state = waiting\nlast exit code = 0\n", stderr: "" };
+  });
+
+  const status = await stopMacOSLaunchAgent(context);
+  assert.equal(status.pid, undefined);
+  assert.equal(status.lastExitCode, 0);
+  assert.deepEqual(calls[1], ["kill", "SIGTERM", `gui/${context.userId}/${status.label}`]);
+  assert.equal(calls.filter((call) => call[0] === "kill").length, 1);
+  assert.equal(calls.some((call) => call[0] === "bootout" || call[0] === "disable"), false);
+  assert.equal(calls.flat().some((argument) => argument.includes("--env-file") || argument === "--config"), false);
+});
+
+test("stop reports pending after the bound poll and never escalates or unloads", async () => {
+  const calls: string[][] = [];
+  const context = launchAgentContext(async (arguments_) => {
+    calls.push([...arguments_]);
+    return arguments_[0] === "kill"
+      ? { code: 0, stdout: "", stderr: "" }
+      : { code: 0, stdout: "state = running\npid = 4242\nlast exit code = 0\n", stderr: "" };
+  });
+
+  await assert.rejects(() => stopMacOSLaunchAgent(context), /still pending/u);
+  assert.equal(calls.filter((call) => call[0] === "kill").length, 1);
+  assert.equal(calls.some((call) => call[0] === "bootout" || call[0] === "disable"), false);
+});
+
+test("strict stop and start status reads reject denied, missing, and unknown results", async () => {
+  for (const code of [1, 113, null]) {
+    const context = launchAgentContext(async () => ({
+      code,
+      stdout: "",
+      stderr: code === 113 ? "Could not find service" : "permission denied",
+    }));
+    await assert.rejects(() => stopMacOSLaunchAgent(context));
+    await assert.rejects(() => startMacOSLaunchAgent(context));
+  }
+});
+
+test("start rejects running or unclean jobs and kickstarts only a clean loaded job", async () => {
+  let calls: string[][] = [];
+  const runningContext = launchAgentContext(async (arguments_) => {
+    calls.push([...arguments_]);
+    return { code: 0, stdout: "state = running\npid = 4242\nlast exit code = 0\n", stderr: "" };
+  });
+  await assert.rejects(() => startMacOSLaunchAgent(runningContext), /already running/u);
+  assert.equal(calls.some((call) => call[0] === "kickstart"), false);
+
+  calls = [];
+  let started = false;
+  const stoppedContext = launchAgentContext(async (arguments_) => {
+    calls.push([...arguments_]);
+    if (arguments_[0] === "kickstart") {
+      started = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return started
+      ? { code: 0, stdout: "state = running\npid = 4343\nlast exit code = 0\n", stderr: "" }
+      : { code: 0, stdout: "state = waiting\nlast exit code = 0\n", stderr: "" };
+  });
+  const result = await startMacOSLaunchAgent(stoppedContext);
+  assert.equal(result.pid, 4343);
+  assert.deepEqual(calls[1], ["kickstart", `gui/${stoppedContext.userId}/${result.label}`]);
+  assert.equal(calls.some((call) => call[0] === "kickstart" && call.includes("-k")), false);
+  assert.equal(calls.flat().some((argument) => argument.includes("--env-file") || argument === "--config"), false);
+
+  const pendingContext = launchAgentContext(async () => ({
+    code: 0,
+    stdout: "state = waiting\n",
+    stderr: "",
+  }));
+  await assert.rejects(() => startMacOSLaunchAgent(pendingContext), /not cleanly stopped/u);
+});
+
+test("start reports an unconfirmed kickstart when no process appears", async () => {
+  const calls: string[][] = [];
+  const context = launchAgentContext(async (arguments_) => {
+    calls.push([...arguments_]);
+    return { code: 0, stdout: "state = waiting\nlast exit code = 0\n", stderr: "" };
+  });
+  await assert.rejects(() => startMacOSLaunchAgent(context), /start was not confirmed/u);
+  assert.equal(calls.filter((call) => call[0] === "kickstart").length, 1);
+});
+
+test("unknown or starting no-PID states are not a stopped service even with an old clean exit", async () => {
+  for (const state of ["", "state = starting\n", "state = unknown\n"]) {
+    const calls: string[][] = [];
+    const context = launchAgentContext(async (args) => {
+      calls.push([...args]);
+      return { code: 0, stdout: `${state}last exit code = 0\n`, stderr: "" };
+    });
+    await assert.rejects(() => stopMacOSLaunchAgent(context), /pending or unclean/u);
+    await assert.rejects(() => startMacOSLaunchAgent(context), /not cleanly stopped/u);
+    assert.equal(calls.every((args) => args[0] === "print"), true);
+  }
+});
+
+function launchAgentContext(
+  runLaunchctl: MacOSLaunchAgentContext["runLaunchctl"],
+): MacOSLaunchAgentContext {
+  return {
+    platform: "darwin",
+    homeDirectory: "/Users/fixture",
+    userId: 501,
+    nodePath: "/usr/bin/node",
+    nodeArguments: [],
+    cliEntrypoint: "/fixture/cli.js",
+    pathEnvironment: "/usr/bin:/bin",
+    runLaunchctl,
+    wait: async () => undefined,
+  };
+}
 
 async function writePrivate(path: string, contents: string): Promise<void> {
   await writeFile(path, contents, { encoding: "utf8", mode: 0o600 });

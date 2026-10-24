@@ -5,7 +5,12 @@ export type CliCommand =
   | "start"
   | "service"
   | "help";
-export type ServiceAction = "install" | "status" | "uninstall";
+export type ServiceAction =
+  | "install"
+  | "start"
+  | "stop"
+  | "status"
+  | "uninstall";
 
 export interface ParsedCliArguments {
   readonly command: CliCommand;
@@ -169,5 +174,11 @@ function result(
 }
 
 function isServiceAction(value: string): value is ServiceAction {
-  return value === "install" || value === "status" || value === "uninstall";
+  return (
+    value === "install" ||
+    value === "start" ||
+    value === "stop" ||
+    value === "status" ||
+    value === "uninstall"
+  );
 }
