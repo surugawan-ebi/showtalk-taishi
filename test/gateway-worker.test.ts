@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createGatewayStopController,
   finishGatewayRestart,
+  runGatewayWorkerLifecycle,
   waitForGatewayDrain,
   workspaceGitRuntimeOptionsFromComposition,
 } from "../src/gateway-worker.js";
@@ -127,21 +129,182 @@ test("restart shutdown failure cannot request worker replacement", async () => {
   );
 });
 
-test("supervisor stop request exits without scheduling a replacement", async () => {
-  const pending = new Promise<void>(() => undefined);
-  let requestStop!: () => void;
-  const stopRequested = new Promise<void>((resolve) => { requestStop = resolve; });
+test("stop request exits cleanly after the runtime reaches idle", async () => {
+  let beginRestartCalls = 0;
+  const controller = createGatewayStopController(() => { beginRestartCalls += 1; });
+  let releaseIdle!: () => void;
+  const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+  let stops = 0;
   const exiting = finishGatewayRestart(
     {
-      waitForIdle: () => pending,
+      waitForIdle: () => idle,
       idleComponents: () => ({ gateway: false, slack: true, mcpService: true, mcpServer: true }),
     },
-    async () => undefined,
-    stopRequested,
+    async () => { stops += 1; },
+    controller.stopRequested,
     { timeoutMs: 1_000, log: () => undefined, warn: () => undefined },
   );
-  requestStop();
+  controller.requestStop();
+  await Promise.resolve();
+  assert.equal(stops, 0);
+  releaseIdle();
   assert.equal(await exiting, 0);
+  assert.equal(beginRestartCalls, 1);
+  assert.equal(stops, 1);
+});
+
+test("stop request closes admission synchronously and duplicate signals are idempotent", async () => {
+  let accepting = true;
+  let accepted = 0;
+  let admissionClosed = false;
+  const controller = createGatewayStopController(() => {
+    accepting = false;
+    admissionClosed = true;
+  });
+  const acceptWork = () => {
+    if (!accepting) return false;
+    accepted += 1;
+    return true;
+  };
+
+  assert.equal(acceptWork(), true);
+  controller.requestStop();
+  assert.equal(admissionClosed, true);
+  assert.equal(acceptWork(), false);
+  controller.requestStop();
+  assert.equal(accepted, 1);
+});
+
+test("stop during restart drain waits for accepted work and timeouts never force shutdown", async () => {
+  let releaseIdle!: () => void;
+  const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+  let beginRestartCalls = 0;
+  let stops = 0;
+  let sawTimeout!: () => void;
+  const timedOut = new Promise<void>((resolve) => { sawTimeout = resolve; });
+  const controller = createGatewayStopController(() => { beginRestartCalls += 1; });
+  const finishing = finishGatewayRestart(
+    {
+      waitForIdle: () => idle,
+      idleComponents: () => ({ gateway: false, slack: true, mcpService: true, mcpServer: true }),
+    },
+    async () => { stops += 1; },
+    controller.stopRequested,
+    {
+      timeoutMs: 20,
+      progressIntervalMs: 1_000,
+      log: () => undefined,
+      warn: () => sawTimeout(),
+    },
+  );
+  controller.requestStop();
+  await timedOut;
+  assert.equal(stops, 0);
+  assert.equal(beginRestartCalls, 1);
+  releaseIdle();
+  assert.equal(await finishing, 0);
+  assert.equal(stops, 1);
+});
+
+test("worker lifecycle awaits the drain before its finally cleanup stops the runtime", async () => {
+  let releaseIdle!: () => void;
+  const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+  let beginRestartCalls = 0;
+  let runtimeStopped = false;
+  let compositionStopped = false;
+  const controller = createGatewayStopController(() => { beginRestartCalls += 1; });
+  const previousLog = console.log;
+  console.log = () => undefined;
+  try {
+    const lifecycle = runGatewayWorkerLifecycle(
+      {
+        beginRestart: () => { beginRestartCalls += 1; },
+        waitForIdle: () => idle,
+        idleComponents: () => ({ gateway: false, slack: true, mcpService: true, mcpServer: true }),
+      },
+      async () => undefined,
+      async () => undefined,
+      async () => { runtimeStopped = true; },
+      async () => { compositionStopped = true; },
+      controller.stopRequested,
+      new Promise<void>(() => undefined),
+    );
+    controller.requestStop();
+    await Promise.resolve();
+    assert.equal(runtimeStopped, false);
+    assert.equal(compositionStopped, false);
+    assert.equal(beginRestartCalls, 1);
+    releaseIdle();
+    assert.equal(await lifecycle, 0);
+    assert.equal(runtimeStopped, true);
+    assert.equal(compositionStopped, true);
+  } finally {
+    console.log = previousLog;
+  }
+});
+
+test("stop during composition cleanup overrides restart after cleanup completes", async () => {
+  let releaseComposition!: () => void;
+  const compositionRelease = new Promise<void>((resolve) => { releaseComposition = resolve; });
+  let compositionStarted!: () => void;
+  const compositionStart = new Promise<void>((resolve) => { compositionStarted = resolve; });
+  let handlersAttached = true;
+  let runtimeStopCalls = 0;
+  let runtimeStopped = false;
+  const controller = createGatewayStopController(() => undefined);
+  const previousLog = console.log;
+  console.log = () => undefined;
+  try {
+    const lifecycle = runGatewayWorkerLifecycle(
+      {
+        beginRestart: () => undefined,
+        waitForIdle: async () => undefined,
+        idleComponents: () => ({ gateway: true, slack: true, mcpService: true, mcpServer: true }),
+      },
+      async () => undefined,
+      async () => undefined,
+      async () => {
+        if (runtimeStopped) return;
+        runtimeStopped = true;
+        runtimeStopCalls += 1;
+      },
+      async () => { compositionStarted(); await compositionRelease; },
+      controller.stopRequested,
+      Promise.resolve(),
+      () => { handlersAttached = false; },
+    );
+
+    await compositionStart;
+    controller.requestStop();
+    assert.equal(handlersAttached, true);
+    releaseComposition();
+    assert.equal(await lifecycle, 0);
+    assert.equal(handlersAttached, false);
+    assert.equal(runtimeStopCalls, 1);
+  } finally {
+    console.log = previousLog;
+  }
+});
+
+test("stop arriving during shutdown overrides a clean restart exit code", async () => {
+  let releaseShutdown!: () => void;
+  let shutdownStarted!: () => void;
+  const shutdown = new Promise<void>((resolve) => { releaseShutdown = resolve; });
+  const started = new Promise<void>((resolve) => { shutdownStarted = resolve; });
+  const controller = createGatewayStopController(() => undefined);
+  const finishing = finishGatewayRestart(
+    {
+      waitForIdle: async () => undefined,
+      idleComponents: () => ({ gateway: true, slack: true, mcpService: true, mcpServer: true }),
+    },
+    async () => { shutdownStarted(); await shutdown; },
+    controller.stopRequested,
+    { log: () => undefined, warn: () => undefined },
+  );
+  await started;
+  controller.requestStop();
+  releaseShutdown();
+  assert.equal(await finishing, 0);
 });
 
 test("adapts the manual human-decision composition without exposing authority", async () => {

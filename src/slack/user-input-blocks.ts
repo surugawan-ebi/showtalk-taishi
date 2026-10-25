@@ -458,16 +458,15 @@ function planFields(
     plan.updateMode === "push_base_merge"
   ) {
     return [
-      field("操作", operation),
+      field("操作", `${operation} / base同期済みmerge commitをpush`),
       field("Repository", plan.repoId),
       field("Pull Request", `#${plan.pullRequestNumber}`),
-      field("Update mode", "base同期済みmerge commitをpush"),
       field("Branch", plan.branch),
       field("旧remote HEAD", plan.expectedRemoteHead),
       field("同期receipt", plan.expectedBaseSyncReceiptId!),
-      field("取得base SHA", plan.expectedBaseSha!),
+      field("PR読取base SHA (B)", plan.expectedPullRequestBaseSha!),
+      field("取得base SHA (T)", plan.expectedBaseSha!),
       field("二親merge SHA", plan.expectedMergeCommitSha!),
-      field("全commit集合", `${plan.expectedCommitShas!.length}件`),
       field("総diff", `${plan.paths.length} paths`),
     ];
   }
@@ -698,7 +697,7 @@ function exactPlanTexts(
     ...(plan.operation === "existing_pull_request_update" &&
     plan.updateMode === "push_base_merge"
       ? [
-          ["全commit SHAs", JSON.stringify(plan.expectedCommitShas)] as const,
+          ["全commit集合・全commit SHAs", JSON.stringify(plan.expectedCommitShas)] as const,
           ["同期receipt", plan.expectedBaseSyncReceiptId!] as const,
           ["隔離clone・snapshot", JSON.stringify({
             temporary_workspace_id: plan.temporaryWorkspaceId,
@@ -708,9 +707,14 @@ function exactPlanTexts(
             push_target: plan.pushTarget,
             push_ref: plan.pushRef,
             base_branch: plan.baseBranch,
+            pr_read_base_sha: plan.expectedPullRequestBaseSha,
+            fetched_base_sha: plan.expectedBaseSha,
             environment: plan.environment,
           })] as const,
         ]
+      : []),
+    ...(plan.operation === "pull_request_merge" && plan.dependabotMerge !== undefined
+      ? [["Dependabot merge根拠（author・B/T・files・fingerprint）", JSON.stringify(plan.dependabotMerge)] as const]
       : []),
     ...(plan.commitMessage === undefined
       ? []

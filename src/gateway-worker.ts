@@ -72,24 +72,23 @@ export async function finishGatewayRestart(
     log(`ShowTalk Taishi restart drain status: ${JSON.stringify(runtime.idleComponents())}`);
   }, options.progressIntervalMs ?? GATEWAY_RESTART_PROGRESS_INTERVAL_MS);
   progressTimer.unref();
-  let drainOutcome: "idle" | "stop";
+  let stopWasRequested = false;
+  void stopRequested.then(() => { stopWasRequested = true; });
   const idle = runtime.waitForIdle();
   try {
     while (true) {
       const outcome = await waitForGatewayDrain(
         () => idle,
-        stopRequested,
+        new Promise<void>(() => undefined),
         options.timeoutMs,
       );
       if (outcome !== "timeout") {
-        drainOutcome = outcome;
         break;
       }
       const components = runtime.idleComponents();
       warn(`ShowTalk Taishi restart is still draining: ${JSON.stringify(components)}`);
       if (Object.values(components).every(Boolean)) {
         // No work remains; recover if an idle waiter missed its final wakeup.
-        drainOutcome = "idle";
         break;
       }
     }
@@ -99,7 +98,71 @@ export async function finishGatewayRestart(
   log("ShowTalk Taishi is stopping the runtime for restart.");
   await stopRuntime();
   log("ShowTalk Taishi runtime stopped; Gateway worker is exiting.");
-  return drainOutcome === "stop" ? 0 : GATEWAY_RESTART_EXIT_CODE;
+  // A stop request can arrive at any point, including during shutdown. The
+  // listener remains active until the caller's cleanup finally block.
+  return stopWasRequested ? 0 : GATEWAY_RESTART_EXIT_CODE;
+}
+
+/** Close admission before publishing a process stop request; duplicate signals are harmless. */
+export function createGatewayStopController(beginRestart: () => void): {
+  readonly stopRequested: Promise<void>;
+  requestStop(): void;
+} {
+  let resolveStop!: () => void;
+  const stopRequested = new Promise<void>((resolve) => { resolveStop = resolve; });
+  let requested = false;
+  return {
+    stopRequested,
+    requestStop: () => {
+      if (requested) return;
+      requested = true;
+      beginRestart();
+      resolveStop();
+    },
+  };
+}
+
+/** Shared signal/restart lifecycle seam used by the worker and fixture tests. */
+export async function runGatewayWorkerLifecycle(
+  runtime: Pick<
+    Awaited<ReturnType<typeof createRuntime>>,
+    "beginRestart" | "waitForIdle" | "idleComponents"
+  >,
+  start: () => Promise<void>,
+  stopAdmin: () => Promise<void>,
+  stopRuntime: () => Promise<void>,
+  stopComposition: () => Promise<void>,
+  stopRequested: Promise<void>,
+  restartRequested: Promise<void>,
+  removeSignalHandlers: () => void = () => undefined,
+): Promise<number> {
+  let stopWasRequested = false;
+  void stopRequested.then(() => { stopWasRequested = true; });
+  let exitCode = GATEWAY_RESTART_EXIT_CODE;
+  try {
+    await start();
+    const outcome = await Promise.race([
+      stopRequested.then(() => "stop" as const),
+      restartRequested.then(() => "restart" as const),
+    ]);
+    if (outcome === "restart") runtime.beginRestart();
+    await stopAdmin();
+    console.log(
+      outcome === "stop"
+        ? "ShowTalk Taishi is draining active work before stopping."
+        : "ShowTalk Taishi is draining active work before restart.",
+    );
+    exitCode = await finishGatewayRestart(runtime, stopRuntime, stopRequested);
+  } finally {
+    try {
+      await stopAdmin();
+      await stopRuntime();
+      await stopComposition();
+    } finally {
+      removeSignalHandlers();
+    }
+  }
+  return stopWasRequested ? 0 : exitCode;
 }
 
 export {
@@ -225,15 +288,11 @@ export async function runGatewayWorker(
           );
         },
       });
-  let resolveStop: (() => void) | undefined;
-  const stopRequested = new Promise<void>((resolve) => {
-    resolveStop = resolve;
-  });
-  const requestStopSignal = () => {
-    resolveStop?.();
-  };
-  process.once("SIGINT", requestStopSignal);
-  process.once("SIGTERM", requestStopSignal);
+  const stopController = createGatewayStopController(() => runtime.beginRestart());
+  const { stopRequested } = stopController;
+  const requestStopSignal = () => stopController.requestStop();
+  process.on("SIGINT", requestStopSignal);
+  process.on("SIGTERM", requestStopSignal);
 
   let runtimeStopped = false;
   let adminStopped = false;
@@ -248,36 +307,28 @@ export async function runGatewayWorker(
     await runtime.stop();
   };
 
-  try {
-    await runtime.start();
-    console.log("ShowTalk Taishi is connected to Slack via Socket Mode.");
-    if (adminServer !== undefined) {
-      const adminUrl = await adminServer.start();
-      console.log(
-        `ShowTalk Taishi admin UI: ${adminUiUrlForLog(adminUrl)}`,
-      );
-    }
-    const outcome = await Promise.race([
-      stopRequested.then(() => "stop" as const),
-      restartRequested.then(() => "restart" as const),
-    ]);
-    if (outcome === "stop") {
-      await stopAdmin();
-      await stopRuntime();
-      return 0;
-    }
-
-    runtime.beginRestart();
-    await stopAdmin();
-    console.log("ShowTalk Taishi is draining active work before restart.");
-    return finishGatewayRestart(runtime, stopRuntime, stopRequested);
-  } finally {
-    process.off("SIGINT", requestStopSignal);
-    process.off("SIGTERM", requestStopSignal);
-    await stopAdmin();
-    await stopRuntime();
-    await stopComposition();
-  }
+  return runGatewayWorkerLifecycle(
+    runtime,
+    async () => {
+      await runtime.start();
+      console.log("ShowTalk Taishi is connected to Slack via Socket Mode.");
+      if (adminServer !== undefined) {
+        const adminUrl = await adminServer.start();
+        console.log(
+          `ShowTalk Taishi admin UI: ${adminUiUrlForLog(adminUrl)}`,
+        );
+      }
+    },
+    stopAdmin,
+    stopRuntime,
+    stopComposition,
+    stopRequested,
+    restartRequested,
+    () => {
+      process.off("SIGINT", requestStopSignal);
+      process.off("SIGTERM", requestStopSignal);
+    },
+  );
 }
 
 export function workspaceGitRuntimeOptionsFromComposition(

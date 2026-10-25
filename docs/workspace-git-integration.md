@@ -54,3 +54,26 @@ operation, recomputing its plan hash under its private lock, recording the
 authenticated human decision, and revalidating before execution. ShowTalk
 retains only the minimum public binding required to connect that decision to
 the originating Slack turn.
+
+## Exact public plan compatibility
+
+For a `push_base_merge` update, the base synchronization request uses the
+PR-read base SHA (B), while the publication preparation input
+`expected_base_sha` uses the receipt's fetched base tip (T). The prepared public
+scope and approval scope carry B separately as
+`expected_pull_request_base_sha`. ShowTalk validates and retains both values,
+displays them separately, and rejects a missing or substituted binding instead
+of assuming B equals T. The backend remains responsible for ancestry, receipt,
+lease, remote-state, and execution-time checks.
+
+Dependabot merge evidence is bound to the same PR, head, base, author, and exact
+file hashes. ShowTalk validates the evidence fingerprint, retains immutable
+evidence, and presents it for review; the backend still revalidates GitHub and
+CI before execution. Neither evidence nor an ordinary choice replaces the
+exact human approval boundary.
+
+When a file contains unrelated local hunks, a path list alone is not evidence
+that publication commits only staged hunks. Use a documented partial-index
+contract or isolate the intended patch through the normal supported workspace
+workflow before preparing its plan. A safety rejection must be resolved through
+the rejecting service rather than retried through another Git path.

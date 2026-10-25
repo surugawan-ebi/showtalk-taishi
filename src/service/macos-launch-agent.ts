@@ -56,6 +56,9 @@ export interface MacOSLaunchAgentStatus extends MacOSLaunchAgentPaths {
   readonly lastExitCode?: number;
 }
 
+const STOP_POLL_INTERVAL_MS = 250;
+const STOP_TIMEOUT_MS = 10_000;
+
 export function createMacOSLaunchAgentContext(): MacOSLaunchAgentContext {
   const userId = process.getuid?.();
   const cliEntrypoint = process.argv[1];
@@ -216,6 +219,77 @@ export async function getMacOSLaunchAgentStatus(
   };
 }
 
+/** Stop the loaded per-user job and confirm its clean process exit. */
+export async function stopMacOSLaunchAgent(
+  context: MacOSLaunchAgentContext = createMacOSLaunchAgentContext(),
+): Promise<MacOSLaunchAgentStatus> {
+  assertSupportedContext(context);
+  let status = await readLoadedLaunchAgentStatus(
+    context,
+    "read the LaunchAgent before stopping it",
+  );
+  if (isCleanlyStopped(status)) return status;
+  if (status.pid === undefined) {
+    throw new Error(
+      `LaunchAgent stop is pending or unclean (state=${status.state ?? "unknown"}, last_exit=${status.lastExitCode ?? "unknown"})`,
+    );
+  }
+
+  await requireLaunchctlSuccess(
+    context.runLaunchctl(["kill", "SIGTERM", serviceTarget(context)]),
+    "send SIGTERM to the LaunchAgent",
+  );
+  const attempts = Math.ceil(STOP_TIMEOUT_MS / STOP_POLL_INTERVAL_MS);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await context.wait(STOP_POLL_INTERVAL_MS);
+    status = await readLoadedLaunchAgentStatus(
+      context,
+      "read the LaunchAgent while stopping it",
+    );
+    if (isCleanlyStopped(status)) return status;
+    if (status.pid === undefined && status.lastExitCode !== undefined && status.lastExitCode !== 0) {
+      throw new Error(
+        `LaunchAgent exited with an unclean status (last_exit=${status.lastExitCode})`,
+      );
+    }
+  }
+  throw new Error(
+    `LaunchAgent stop is still pending after ${attempts} polls; the job remains loaded and no further signal was sent`,
+  );
+}
+
+/** Start an already-loaded, cleanly stopped job without changing its registration. */
+export async function startMacOSLaunchAgent(
+  context: MacOSLaunchAgentContext = createMacOSLaunchAgentContext(),
+): Promise<MacOSLaunchAgentStatus> {
+  assertSupportedContext(context);
+  const status = await readLoadedLaunchAgentStatus(context, "read the LaunchAgent before starting it");
+  if (status.pid !== undefined || status.state === "running") {
+    throw new Error(
+      `LaunchAgent is already running${status.pid === undefined ? "" : ` (pid=${status.pid})`}`,
+    );
+  }
+  if (!isCleanlyStopped(status)) {
+    throw new Error(
+      `LaunchAgent is not cleanly stopped (state=${status.state ?? "unknown"}, last_exit=${status.lastExitCode ?? "unknown"})`,
+    );
+  }
+  await requireLaunchctlSuccess(
+    context.runLaunchctl(["kickstart", serviceTarget(context)]),
+    "start the LaunchAgent",
+  );
+  const started = await readLoadedLaunchAgentStatus(
+    context,
+    "confirm the started LaunchAgent",
+  );
+  if (started.pid === undefined || started.pid < 1 || started.state !== "running") {
+    throw new Error(
+      `LaunchAgent start was not confirmed (state=${started.state ?? "unknown"}, last_exit=${started.lastExitCode ?? "unknown"})`,
+    );
+  }
+  return started;
+}
+
 export async function uninstallMacOSLaunchAgent(
   context: MacOSLaunchAgentContext = createMacOSLaunchAgentContext(),
 ): Promise<MacOSLaunchAgentStatus> {
@@ -250,6 +324,28 @@ export function macOSLaunchAgentPaths(
     stdoutPath: join(logDirectory, "gateway.log"),
     stderrPath: join(logDirectory, "gateway.error.log"),
   };
+}
+
+async function readLoadedLaunchAgentStatus(
+  context: MacOSLaunchAgentContext,
+  description: string,
+): Promise<MacOSLaunchAgentStatus> {
+  const result = await context.runLaunchctl(["print", serviceTarget(context)]);
+  if (result.code !== 0) throw launchctlError(description, result);
+  return {
+    label: MACOS_LAUNCH_AGENT_LABEL,
+    loaded: true,
+    ...parseLaunchctlPrint(result.stdout),
+    ...macOSLaunchAgentPaths(context.homeDirectory),
+  };
+}
+
+function isCleanlyStopped(status: MacOSLaunchAgentStatus): boolean {
+  return (
+    status.pid === undefined &&
+    (status.state === "waiting" || status.state === "not running") &&
+    status.lastExitCode === 0
+  );
 }
 
 export function renderMacOSLaunchAgentPlist(input: {
