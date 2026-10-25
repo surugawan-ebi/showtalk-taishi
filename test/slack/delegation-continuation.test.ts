@@ -245,7 +245,7 @@ test("settles an externally resolved delayed Git request even when terminal Slac
         return { ok: true, ts: `${100 + posts.length}.1` };
       },
       update: async (input: Record<string, unknown>) => {
-        if (String(input.text).includes("別のCodexクライアント")) {
+        if (String(input.text).includes("App Server側で終了しました")) {
           throw new Error("terminal Slack update failed");
         }
         return { ok: true };
@@ -329,9 +329,9 @@ test("terminalizes an externally resolved delayed Git card even when private set
   );
 
   const terminalUpdate = updates.find((update) =>
-    String(update.text).includes("別のCodexクライアント"),
+    String(update.text).includes("App Server側で終了しました"),
   );
-  assert.match(String(terminalUpdate?.text), /別のCodexクライアント/u);
+  assert.match(String(terminalUpdate?.text), /App Server側で終了しました/u);
   assert.doesNotMatch(
     JSON.stringify(terminalUpdate?.blocks),
     /承認して実行|拒否・保留|"type":"button"/u,

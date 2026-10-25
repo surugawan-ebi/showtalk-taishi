@@ -20,7 +20,7 @@ async function resolveForTest(
   );
 }
 
-test("resolves supported workspace-relative image and audio files", async (context) => {
+test("resolves supported workspace-relative image, audio, and Markdown files", async (context) => {
   const workspace = await temporaryDirectory(context, "resolve");
   await writeFile(
     join(workspace, "image.png"),
@@ -30,10 +30,12 @@ test("resolves supported workspace-relative image and audio files", async (conte
     join(workspace, "voice.m4a"),
     Buffer.from([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]),
   );
+  await writeFile(join(workspace, "notes.md"), "# Result\n\n完了しました。\n");
 
   const resolved = await resolveForTest(workspace, [
     { path: "image.png", alt_text: "Result preview" },
     { path: "voice.m4a", title: "Voice result" },
+    { path: "notes.md", title: "Result notes" },
   ]);
 
   assert.deepEqual(
@@ -41,10 +43,12 @@ test("resolves supported workspace-relative image and audio files", async (conte
     [
       { name: "image.png", kind: "image", size: 8 },
       { name: "voice.m4a", kind: "audio", size: 8 },
+      { name: "notes.md", kind: "markdown", size: 32 },
     ],
   );
   assert.equal(resolved[0]?.altText, "Result preview");
   assert.equal(resolved[1]?.title, "Voice result");
+  assert.equal(resolved[2]?.title, "Result notes");
   assert.deepEqual(
     [...new Uint8Array(await (resolved[0]?.payload ?? new Blob()).arrayBuffer())],
     [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
@@ -76,6 +80,7 @@ test("rejects traversal, workspace-external symlinks, and unsupported files", as
   await writeFile(join(outside, "secret.png"), Buffer.from([1]));
   await writeFile(join(workspace, "notes.txt"), "not media");
   await writeFile(join(workspace, "fake.png"), "not really an image");
+  await writeFile(join(workspace, "binary.md"), Buffer.from([0xff, 0xfe, 0x00]));
   await symlink(join(outside, "secret.png"), join(workspace, "linked.png"));
 
   await assert.rejects(
@@ -88,10 +93,14 @@ test("rejects traversal, workspace-external symlinks, and unsupported files", as
   );
   await assert.rejects(
     resolveForTest(workspace, [{ path: "notes.txt" }]),
-    /Only supported image and audio/u,
+    /Only supported image, audio, and Markdown/u,
   );
   await assert.rejects(
     resolveForTest(workspace, [{ path: "fake.png" }]),
+    /does not match its file type/u,
+  );
+  await assert.rejects(
+    resolveForTest(workspace, [{ path: "binary.md" }]),
     /does not match its file type/u,
   );
 });

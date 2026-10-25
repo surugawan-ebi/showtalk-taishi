@@ -33,11 +33,22 @@ export interface ApprovalTextCommand {
   readonly userId: string;
   readonly messageTs: string;
   readonly attribution?: {
-    readonly kind: "chatgpt_slack_footer_v1";
+    readonly kind: "chatgpt_slack_footer_v1" | "chatgpt_slack_footer_v2";
     readonly appId: string;
     readonly userId: string;
   };
 }
+
+export type ApprovalTextCommandRejectionReason =
+  | "attribution_format_mismatch"
+  | "attribution_identity_mismatch"
+  | "command_format_mismatch"
+  | "message_envelope_unsupported"
+  | "route_fields_invalid";
+
+export type ApprovalTextCommandClassification =
+  | { readonly kind: "accepted"; readonly command: ApprovalTextCommand }
+  | { readonly kind: "rejected"; readonly reason: ApprovalTextCommandRejectionReason };
 
 /**
  * Parse an exact approval command from a raw Slack `message` event.
@@ -51,8 +62,22 @@ export function parseApprovalTextCommand(
   event: unknown,
   attributionProfile: ApprovalTextAttributionProfile = CHATGPT_ATTRIBUTION_PROFILE,
 ): ApprovalTextCommand | undefined {
+  const classified = classifyApprovalTextCommand(event, attributionProfile);
+  return classified.kind === "accepted" ? classified.command : undefined;
+}
+
+/**
+ * Classify an approval-shaped message without retaining its text. Rejection
+ * reasons are fixed diagnostic buckets and must never contain payload data.
+ */
+export function classifyApprovalTextCommand(
+  event: unknown,
+  attributionProfile: ApprovalTextAttributionProfile = CHATGPT_ATTRIBUTION_PROFILE,
+): ApprovalTextCommandClassification {
   const record = asRecord(event);
-  if (record === undefined || record.type !== "message") return undefined;
+  if (record === undefined || record.type !== "message") {
+    return { kind: "rejected", reason: "message_envelope_unsupported" };
+  }
   if (
     hasAnyOwnProperty(record, [
       "subtype",
@@ -67,7 +92,7 @@ export function parseApprovalTextCommand(
       "previous_message",
     ])
   ) {
-    return undefined;
+    return { kind: "rejected", reason: "message_envelope_unsupported" };
   }
 
   const channelId = record.channel;
@@ -88,33 +113,52 @@ export function parseApprovalTextCommand(
     compareSlackTimestamps(messageTs, rootThreadTs) <= 0 ||
     typeof text !== "string"
   ) {
-    return undefined;
+    return { kind: "rejected", reason: "route_fields_invalid" };
   }
 
   const plain = parseCommandText(text);
   const attributed = plain === undefined
     ? parseAttributedCommand(record, text, attributionProfile)
     : undefined;
-  const parsedText = plain ?? attributed;
-  if (parsedText === undefined) return undefined;
+  const parsedText = plain ?? attributed?.parsed;
+  if (parsedText === undefined) {
+    const exactApp = record.app_id === attributionProfile.appId;
+    const attributionShaped = typeof record.app_id === "string" ||
+      text.includes("使用して送信されました");
+    return {
+      kind: "rejected",
+      reason: exactApp
+        ? "attribution_format_mismatch"
+        : attributionShaped
+          ? "attribution_identity_mismatch"
+          : "command_format_mismatch",
+    };
+  }
   if (plain !== undefined &&
-      (Object.hasOwn(record, "app_id") || !validateBlocks(record, text))) return undefined;
-  if (attributed !== undefined && userId === attributionProfile.userId) return undefined;
+      (Object.hasOwn(record, "app_id") || !validateBlocks(record, text))) {
+    return { kind: "rejected", reason: "command_format_mismatch" };
+  }
+  if (attributed !== undefined && userId === attributionProfile.userId) {
+    return { kind: "rejected", reason: "attribution_identity_mismatch" };
+  }
 
   return {
-    decision: parsedText.decision,
-    requestId: parsedText.requestId,
-    channelId,
-    rootThreadTs,
-    userId,
-    messageTs,
-    ...(attributed === undefined ? {} : {
-      attribution: {
-        kind: "chatgpt_slack_footer_v1" as const,
-        appId: attributionProfile.appId,
-        userId: attributionProfile.userId,
-      },
-    }),
+    kind: "accepted",
+    command: {
+      decision: parsedText.decision,
+      requestId: parsedText.requestId,
+      channelId,
+      rootThreadTs,
+      userId,
+      messageTs,
+      ...(attributed === undefined ? {} : {
+        attribution: {
+          kind: attributed.attributionKind,
+          appId: attributionProfile.appId,
+          userId: attributionProfile.userId,
+        },
+      }),
+    },
   };
 }
 
@@ -122,19 +166,38 @@ function parseAttributedCommand(
   record: Readonly<Record<string, unknown>>,
   text: string,
   profile: ApprovalTextAttributionProfile,
-): ReturnType<typeof parseCommandText> {
+): {
+  readonly parsed: NonNullable<ReturnType<typeof parseCommandText>>;
+  readonly attributionKind: "chatgpt_slack_footer_v1" | "chatgpt_slack_footer_v2";
+} | undefined {
   if (!matchesPattern(profile.appId, /^A[A-Z0-9]{1,127}$/u) ||
       !matchesPattern(profile.userId, USER_ID_PATTERN) ||
       record.app_id !== profile.appId) return undefined;
-  const footer = `*使用して送信されました* <@${profile.userId}>`;
-  const suffix = ` ${footer}`;
-  if (!text.endsWith(suffix)) return undefined;
+  const formats = [
+    {
+      attributionKind: "chatgpt_slack_footer_v1" as const,
+      footer: `*使用して送信されました* <@${profile.userId}>`,
+      separator: " ",
+    },
+    {
+      attributionKind: "chatgpt_slack_footer_v2" as const,
+      footer: `*使用して送信されました* <@${profile.userId}|ChatGPT>`,
+      separator: "\n",
+    },
+  ];
+  const format = formats.find(({ footer, separator }) =>
+    text.endsWith(`${separator}${footer}`)
+  );
+  if (format === undefined) return undefined;
+  const { attributionKind, footer, separator } = format;
+  const suffix = `${separator}${footer}`;
   const commandText = text.slice(0, -suffix.length);
   const parsed = parseCommandText(commandText);
   if (parsed === undefined) return undefined;
 
-  // Slack's fallback text uses a space; the visible line break comes from a
-  // separate context block. Require both observed representations, unchanged.
+  // Require the fallback separator/footer and both observed blocks to agree
+  // with one pinned representation. No trimming or Slack mention rewriting is
+  // performed here.
   const blocks = record.blocks;
   if (!Array.isArray(blocks) || blocks.length !== 2) return undefined;
   if (!validateBlocks({ blocks: [blocks[0]] }, commandText)) return undefined;
@@ -151,7 +214,7 @@ function parseAttributedCommand(
   if (element === undefined || element.type !== "mrkdwn" ||
       element.text !== footer || element.verbatim !== false ||
       !hasOnlyKeys(element, ["type", "text", "verbatim"])) return undefined;
-  return parsed;
+  return { parsed, attributionKind };
 }
 
 /**

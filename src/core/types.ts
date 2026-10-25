@@ -550,6 +550,20 @@ export type AgentEvent =
       readonly systemRejectionRecorded?: true;
     }
   | {
+      /** The App Server ended a Git approval request after its answer was dispatched. */
+      readonly type: "git_approval.server_request_resolved";
+      readonly requestId: string;
+    }
+  | {
+      /** A fixed, sanitized Git approval delivery failure was correlated. */
+      readonly type: "git_approval.delivery_failed";
+      readonly requestId: string;
+      readonly reason:
+        | "client_error"
+        | "response_receiver_dropped"
+        | "response_deserialize_failed";
+    }
+  | {
       /**
        * Ordinary, non-secret model question or non-Git external action
        * confirmation. It never grants workspace-git approval authority.

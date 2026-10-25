@@ -279,6 +279,31 @@ export class SlackThreadProjector {
       case "git_approval.resolved_externally":
         await this.#resolveGitApprovalExternally(event.requestId);
         break;
+      case "git_approval.server_request_resolved":
+        this.#interactionAudit?.({
+          event: "structured_input.request_terminalized",
+          requestId: event.requestId,
+          channelId: this.#channelId,
+          rootThreadTs: this.#rootThreadTs,
+          ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+          outcome: "resolved_after_dispatch",
+        });
+        break;
+      case "git_approval.delivery_failed":
+        this.#interactionAudit?.({
+          event: "git_approval.delivery_failed",
+          requestId: event.requestId,
+          channelId: this.#channelId,
+          rootThreadTs: this.#rootThreadTs,
+          ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+          outcome: event.reason,
+        });
+        await this.#post(
+          "Git承認の回答配送に失敗しました。実行結果は不明のため、自動再送せず停止しています。新しいexact planから再試行してください。",
+          undefined,
+          true,
+        );
+        break;
       case "choice.requested":
         this.#turnActivityStarted = true;
         await this.#upsertAgentMessage();
@@ -1041,7 +1066,7 @@ export class SlackThreadProjector {
       );
       if (details === undefined) return;
       const fallback =
-        "このGit承認は別のCodexクライアントで解決されました。Slackからは実行できません。";
+        "このGit承認要求はApp Server側で終了しました。終了理由は確認できないため、Slackからは実行できません。";
       const blocks = buildUnavailableWorkspaceGitApprovalBlocks();
       const updated = await retryTerminalSlackUpdate(() =>
         this.#client.chat.update({

@@ -106,6 +106,46 @@ export interface ModelListResponse {
   readonly nextCursor?: string | null;
 }
 
+/** Experimental Codex 0.153.4 mcpServerStatus/list request shape. */
+export interface ListMcpServerStatusParams {
+  readonly cursor?: string | null;
+  readonly limit?: number | null;
+  readonly detail?: "full" | "toolsAndAuthOnly" | null;
+  readonly threadId?: string | null;
+}
+
+export type McpServerConnectionStatus =
+  | "notStarted"
+  | "starting"
+  | "connected"
+  | "authenticationRequired"
+  | "failed"
+  | "cancelled"
+  | "disabled";
+
+export type McpAuthStatus =
+  | "unknown"
+  | "unsupported"
+  | "notLoggedIn"
+  | "bearerToken"
+  | "oAuth";
+
+export interface McpServerStatus {
+  readonly name: string;
+  readonly runtimeStatus: McpServerConnectionStatus | null;
+  readonly pluginId: string | null;
+  readonly serverInfo: unknown | null;
+  readonly tools: Readonly<Record<string, unknown>>;
+  readonly resources: readonly unknown[];
+  readonly resourceTemplates: readonly unknown[];
+  readonly authStatus: McpAuthStatus;
+}
+
+export interface ListMcpServerStatusResponse {
+  readonly data: readonly McpServerStatus[];
+  readonly nextCursor: string | null;
+}
+
 export type ApprovalsReviewer = "user" | "auto_review" | "guardian_subagent";
 
 /**

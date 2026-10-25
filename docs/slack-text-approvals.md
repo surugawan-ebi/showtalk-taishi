@@ -33,18 +33,21 @@ conjunctive connector format below. Other proxy formats must use the buttons.
 ### Verified connector format
 
 The Slack-layer installation profile pins the observed publisher app ID and
-the ChatGPT attribution user ID. It accepts only their exact combination with:
+the ChatGPT attribution user ID. It accepts only their exact combination in
+either of the two observed connector serializations:
 
-- fallback `text`: one command, one ASCII space, then
-  `*使用して送信されました* <@UCHATGPT>` (synthetic attribution ID shown here);
+- legacy fallback `text`: one command, one ASCII space, then
+  `*使用して送信されました* <@UCHATGPT>`; or
+- current automatic fallback `text`: one command, one newline, then
+  `*使用して送信されました* <@UCHATGPT|ChatGPT>`
+  (synthetic attribution ID shown here);
 - exactly one `rich_text` block containing one plain command leaf;
 - exactly one following `context` block containing one `mrkdwn` element with
-  that exact footer and `verbatim: false`.
+  the footer belonging to that fallback variant and `verbatim: false`.
 
-The visible line break is produced by the separate context block. A newline
-in fallback text, `|ChatGPT` alias, different mention/app ID, extra text or
+Other separator/alias combinations, a different mention/app ID, extra text or
 block, quote, styled command, duplicate command, or missing publisher app ID
-is rejected. Plain commands continue to reject publisher `app_id`. All
+are rejected. Plain commands continue to reject publisher `app_id`. All
 formats still reject `bot_id`, `bot_profile`, subtypes, edits, and attachments.
 
 This is a deliberately installation-specific syntax profile, not evidence
@@ -55,12 +58,21 @@ reviewed source-profile update. No new Slack scope or persistent runtime
 setting is needed. The original Slack post and attribution are left intact.
 
 The interaction audit records `approval_text.binding_validated` with fixed
-`plain` or `chatgpt_slack_footer_v1` classification and hashed actor,
+`plain`, `chatgpt_slack_footer_v1`, or `chatgpt_slack_footer_v2`
+classification and hashed actor,
 attribution-app/user, command-message, card-message, request, and thread
 references. Raw text and IDs are not logged. This event records a validated
 candidate, **not successful settlement**; existing backend delivery/settlement
-events establish that outcome. Failures use `approval_text.failed`. This also
-distinguishes a text-path attempt from a button-only round trip.
+events establish that outcome. Rejected syntax and request binding use
+`approval_text.classification_rejected` and `approval_text.binding_rejected`
+with fixed payload-free reasons. After a Git binding succeeds,
+`approval_text.broker_result` records only `decision_context_missing`,
+`broker_transport_failed`, `broker_status_conflict`, `broker_persist_failed`, `broker_applied`, or
+`broker_result_unknown`. The applied event is written after the private broker
+returns successfully and before the App Server answer is dispatched.
+Unclassified failures use `approval_text.failed`. This also distinguishes a
+text-path attempt from a button-only round trip without logging command text
+or plan data.
 
 The process-local registry is populated only after the card is displayed
 successfully. It binds the request type, request ID, session where applicable,

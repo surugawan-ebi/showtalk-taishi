@@ -38,7 +38,7 @@ export const MCP_SERVER_INSTRUCTIONS =
   "agent.send durably accepts work from a live Koe turn and normally returns queued immediately; do not resend that delegation ID. The final success or failure resumes the exact originating conversation. For a user-requested sequence, delegate one bounded step at a time and use the delayed results to continue; review/fix retries must be bounded. " +
   "Slack makes the channel visit visible but is never the Koe-to-Koe transport. " +
   "Git approval UI belongs to the Koe that prepared the operation and its originating Slack turn; never use agent.send or Slack write tools to relay, recreate, or move an approval to another Koe or channel. " +
-  "slack.post and slack.reply can upload workspace-relative images and audio files from the authenticated Koe's workspace. " +
+  "slack.post and slack.reply can upload workspace-relative images, audio files, and Markdown files from the authenticated Koe's workspace. " +
   "When the current Slack user asks to receive a screenshot or other workspace file, use slack.reply with attachments and omit channel and thread_ts so the Gateway binds the upload to the current originating thread. " +
   "That explicit artifact request authorizes an attachment-only call bound to the originating thread, so omit message too and do not request a separate attachment approval. " +
   "gateway.restart is the only safe way to restart the Gateway; never use kill or signal commands, and call it only when a human explicitly requests a restart. " +
@@ -246,7 +246,7 @@ export function createAgentMcpServer(
     {
       title: "Post to Slack",
       description:
-        "Post a message and/or upload workspace-relative image or audio files through the Gateway permission boundary.",
+        "Post a message and/or upload workspace-relative image, audio, or Markdown files through the Gateway permission boundary.",
       inputSchema: slackPostInputSchema,
       outputSchema: slackWriteOutputSchema,
       annotations: {
@@ -278,7 +278,7 @@ export function createAgentMcpServer(
     {
       title: "Reply in Slack",
       description:
-        "Reply in a Slack thread with a message and/or workspace-relative image or audio files through the Gateway permission boundary. Omit channel and thread_ts to bind the reply to the current originating Slack thread.",
+        "Reply in a Slack thread with a message and/or workspace-relative image, audio, or Markdown files through the Gateway permission boundary. Omit channel and thread_ts to bind the reply to the current originating Slack thread.",
       inputSchema: slackReplyInputSchema,
       outputSchema: slackWriteOutputSchema,
       annotations: {

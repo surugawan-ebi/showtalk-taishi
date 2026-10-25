@@ -51,7 +51,7 @@ const CLAUDE_DISALLOWED_TOOLS = ["AskUserQuestion"] as const;
 
 export type ClaudePermissionMode = Extract<
   PermissionMode,
-  "default" | "acceptEdits" | "plan"
+  "default" | "acceptEdits" | "auto" | "plan"
 >;
 
 export type ClaudeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";

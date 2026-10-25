@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   type ApprovalTextAttributionProfile,
   buildApprovalTextCommandHint,
+  classifyApprovalTextCommand,
   parseApprovalTextCommand,
 } from "../../src/slack/approval-text-command.js";
 
@@ -53,6 +54,19 @@ function attributedEvent(
     text: `${command} ${chatGptFooter}`,
     app_id: chatGptProfile.appId,
     blocks: [commandBlock(command), attributionBlock()],
+    ...overrides,
+  });
+}
+
+function autoAttributedEvent(
+  command: string = baseEvent.text,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const footer = `*使用して送信されました* <@${chatGptProfile.userId}|ChatGPT>`;
+  return eventWith({
+    text: `${command}\n${footer}`,
+    app_id: chatGptProfile.appId,
+    blocks: [commandBlock(command), attributionBlock(footer)],
     ...overrides,
   });
 }
@@ -232,6 +246,42 @@ test("accepts the exact observed ChatGPT footer only with the matching profile",
     );
   }
   assert.equal(parseApprovalTextCommand(attributedEvent()), undefined);
+});
+
+test("accepts the ChatGPT integration automatic newline and display alias", () => {
+  assert.deepEqual(
+    parseApprovalTextCommand(autoAttributedEvent(), chatGptProfile),
+    {
+      decision: "approve",
+      requestId: "req_ABC-123:xyz",
+      channelId: baseEvent.channel,
+      rootThreadTs: baseEvent.thread_ts,
+      userId: baseEvent.user,
+      messageTs: baseEvent.ts,
+      attribution: {
+        kind: "chatgpt_slack_footer_v2",
+        appId: "ACHATGPT",
+        userId: "UCHATGPT",
+      },
+    },
+  );
+  assert.equal(
+    parseApprovalTextCommand(autoAttributedEvent("拒否 req_ABC-123:xyz"), chatGptProfile)
+      ?.decision,
+    "reject",
+  );
+});
+
+test("classifies invalid automatic attribution without returning command content", () => {
+  const invalid = autoAttributedEvent(baseEvent.text, {
+    text: `${baseEvent.text} *使用して送信されました* <@UCHATGPT|ChatGPT>`,
+  });
+  assert.deepEqual(classifyApprovalTextCommand(invalid, chatGptProfile), {
+    kind: "rejected",
+    reason: "attribution_format_mismatch",
+  });
+  assert.equal(JSON.stringify(classifyApprovalTextCommand(invalid, chatGptProfile))
+    .includes(baseEvent.text), false);
 });
 
 test("preserves the actual author and leaves plain commands unattributed", () => {

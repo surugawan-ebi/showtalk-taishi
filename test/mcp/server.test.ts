@@ -367,11 +367,11 @@ test("serves stateless MCP with the internal hook endpoint and public switchboar
   assert.match(client.getInstructions() ?? "", /workspace.*images.*audio/iu);
   assert.match(
     tools.tools.find((tool) => tool.name === "slack.post")?.description ?? "",
-    /workspace-relative image or audio/u,
+    /workspace-relative image, audio, or Markdown/u,
   );
   assert.match(
     tools.tools.find((tool) => tool.name === "slack.reply")?.description ?? "",
-    /workspace-relative image or audio.*current originating Slack thread/u,
+    /workspace-relative image, audio, or Markdown.*current originating Slack thread/u,
   );
   assert.match(
     tools.tools.find((tool) => tool.name === "diagnostics.approval-probe")

@@ -180,6 +180,24 @@ function attributedCommand(command: string) {
   };
 }
 
+function autoAttributedCommand(command: string) {
+  const footer = `*使用して送信されました* <@${attributionProfile.userId}|ChatGPT>`;
+  return {
+    text: `${command}\n${footer}`,
+    fields: {
+      app_id: attributionProfile.appId,
+      blocks: [
+        { type: "rich_text", block_id: "synthetic-command", elements: [
+          { type: "rich_text_section", elements: [{ type: "text", text: command }] },
+        ] },
+        { type: "context", block_id: "synthetic-footer", elements: [
+          { type: "mrkdwn", text: footer, verbatim: false },
+        ] },
+      ],
+    },
+  };
+}
+
 function dotConnectorMessageFields(prompt: string): RecordValue {
   const footer = `*使用して送信されました* <@${CHATGPT_ATTRIBUTION_PROFILE.userId}>`;
   return {
@@ -263,6 +281,32 @@ test("work attention recovery preserves the incident ID and omits unavailable so
   const text = String(h.app.posts[0]?.text);
   assert.match(text, /^SHOWTALK_WORK_ATTENTION_V1\nincident_id: fedcba9876543210\nstatus: recovered\n/u);
   assert.match(text, /\nsource_thread: unavailable\n/u);
+});
+
+test("work attention does not post normal visible approval waits to Slack", async () => {
+  const h = harness({ workAttentionChannelId: "CATTENTION" });
+  for (const event of ["attention_required", "recovered"] as const) {
+    await h.frontend.presentWorkAttention({
+      component: "showtalk.work_attention",
+      version: 1,
+      event,
+      incidentRef: "0123456789abcdef",
+      occurrence: 1,
+      agentId: "test-koe",
+      sourceChannelId: "CSOURCE",
+      sourceRootThreadTs: "1791221976.640199",
+      state: event === "attention_required" ? "waiting_for_input" : "running",
+      reason: "visible_approval_wait",
+      lastProgressAt: "2026-10-06T00:00:00.000Z",
+      detectedAt: "2026-10-06T00:00:30.000Z",
+      nextAction: event === "attention_required"
+        ? "respond_in_slack"
+        : "no_action_recovered",
+    });
+  }
+
+  assert.deepEqual(h.app.posts, []);
+  assert.equal(h.frontend.isIdle(), true);
 });
 
 test("Gateway drain waits for an in-flight work-attention Slack post", async () => {
@@ -376,7 +420,68 @@ test("attribution is preserved and audited as syntax without changing the authen
   await h.app.message(input.text, input.fields);
   assert.equal(h.gateway.approvals.length, 1);
   assert.equal(lines.filter((line) => JSON.parse(line).event === "approval_text.binding_validated").length, 1);
-  assert.equal(JSON.parse(lines.at(-1)!).event, "approval_text.failed");
+  assert.equal(JSON.parse(lines.at(-1)!).event, "approval_text.binding_rejected");
+  assert.equal(JSON.parse(lines.at(-1)!).outcome, "request_unavailable");
+});
+
+test("ChatGPT automatic attribution settles the canonical command through the existing binding", async () => {
+  const lines: string[] = [];
+  const h = harness({ interactionAudit: createInteractionAudit((line) => lines.push(line), () => now) });
+  registerNative(h);
+  const input = autoAttributedCommand(`承認 ${nativeId}`);
+  await h.app.message(input.text, input.fields);
+  assert.equal(h.gateway.approvals.length, 1);
+  const validated = lines.map((line) => JSON.parse(line) as RecordValue)
+    .find((record) => record.event === "approval_text.binding_validated");
+  assert.equal(validated?.approvalTextFormat, "chatgpt_slack_footer_v2");
+});
+
+test("sanitized audit distinguishes format, expiry, and binding rejection", async () => {
+  const invalidLines: string[] = [];
+  const invalid = harness({
+    interactionAudit: createInteractionAudit((line) => invalidLines.push(line), () => now),
+  });
+  registerNative(invalid);
+  const malformed = autoAttributedCommand(`承認 ${nativeId}`);
+  await invalid.app.message(malformed.text.replace("\n", " "), malformed.fields);
+
+  const expiredLines: string[] = [];
+  const expired = harness({
+    interactionAudit: createInteractionAudit((line) => expiredLines.push(line), () => expiresAt),
+  });
+  registerNative(expired);
+  expired.clock.now = expiresAt;
+  await expired.app.message(`承認 ${nativeId}`);
+
+  const bindingLines: string[] = [];
+  const mismatched = harness({
+    interactionAudit: createInteractionAudit((line) => bindingLines.push(line), () => now),
+  });
+  registerNative(mismatched);
+  await mismatched.app.message(`承認 ${nativeId}`, {
+    thread_ts: `${baseSeconds - 1}.000000`,
+  });
+
+  const onlyEventAndOutcome = (lines: readonly string[]) => lines.map((line) => {
+    const record = JSON.parse(line) as RecordValue;
+    return [record.event, record.outcome];
+  });
+  assert.deepEqual(onlyEventAndOutcome(invalidLines), [[
+    "approval_text.classification_rejected", "attribution_format_mismatch",
+  ]]);
+  assert.deepEqual(onlyEventAndOutcome(expiredLines), [[
+    "approval_text.binding_rejected", "expired",
+  ]]);
+  assert.deepEqual(onlyEventAndOutcome(bindingLines), [[
+    "approval_text.binding_rejected", "route_mismatch",
+  ]]);
+  assert.equal(invalid.gateway.approvals.length, 0);
+  assert.equal(expired.gateway.approvals.length, 0);
+  assert.equal(mismatched.gateway.approvals.length, 0);
+  const auditText = [...invalidLines, ...expiredLines, ...bindingLines].join("\n");
+  for (const sensitive of [nativeId, malformed.text, attributionProfile.appId, attributionProfile.userId]) {
+    assert.equal(auditText.includes(sensitive), false);
+  }
 });
 
 test("attributed malformed or unauthorized messages never settle or become model prompts", async () => {
@@ -834,6 +939,133 @@ test("Git text and button races share private-broker-before-resume ordering and 
     assert.deepEqual(recorded[0]?.plan, gitPlan);
     assert.equal(h.gateway.answers.length, 1);
     assert.equal(h.gateway.humanTurns, 0);
+  }
+  }
+});
+
+test("Git text broker lifecycle is classified before expiry for both footer formats", async () => {
+  for (const attributed of [attributedCommand, autoAttributedCommand]) {
+    const lines: string[] = [];
+    let h!: ReturnType<typeof harness>;
+    h = harness({
+      interactionAudit: createInteractionAudit((line) => {
+        lines.push(line);
+        const record = JSON.parse(line) as RecordValue;
+        if (record.event === "approval_text.broker_result") {
+          h.gateway.order.push(`audit:${String(record.outcome)}`);
+        }
+      }, () => h?.clock.now ?? now),
+      workspaceGitDecisionBroker: {
+        contract_version: 1,
+        recordDecision: async () => { h.gateway.order.push("broker"); },
+      },
+    });
+    registerGit(h);
+    const input = attributed(`承認 ${gitId}`);
+
+    await h.app.message(input.text, input.fields);
+
+    assert.deepEqual(h.gateway.order, ["broker", "audit:broker_applied", "resume"]);
+    assert.equal(h.gateway.answers.length, 1);
+    assert.equal(h.store.get(gitId), undefined);
+    const audit = lines.map((line) => JSON.parse(line) as RecordValue);
+    const bindingIndex = audit.findIndex((record) =>
+      record.event === "approval_text.binding_validated"
+    );
+    const brokerIndex = audit.findIndex((record) =>
+      record.event === "approval_text.broker_result" && record.outcome === "broker_applied"
+    );
+    assert.ok(bindingIndex >= 0);
+    assert.ok(brokerIndex > bindingIndex);
+    assert.ok(Date.parse(String(audit[brokerIndex]?.timestamp)) < expiresAt);
+    assert.equal(audit[brokerIndex]?.approvalTextFormat,
+      attributed === attributedCommand
+        ? "chatgpt_slack_footer_v1"
+        : "chatgpt_slack_footer_v2");
+  }
+});
+
+test("Git text broker failures are fixed-classified and fail closed before expiry", async () => {
+  const cases: readonly {
+    readonly expected: "decision_context_missing" | "broker_transport_failed" |
+      "broker_status_conflict" | "broker_persist_failed" | "broker_result_unknown";
+    readonly configure?: Partial<SlackFrontendOptions>;
+    readonly omitSession?: boolean;
+  }[] = [
+    { expected: "decision_context_missing", omitSession: true },
+    { expected: "broker_transport_failed" },
+    {
+      expected: "broker_status_conflict",
+      configure: { workspaceGitDecisionBroker: { contract_version: 1, recordDecision: async () => {
+        throw new WorkspaceGitHumanDecisionBrokerError("status_conflict");
+      } } },
+    },
+    {
+      expected: "broker_persist_failed",
+      configure: { workspaceGitDecisionBroker: { contract_version: 1, recordDecision: async () => {
+        throw new WorkspaceGitHumanDecisionBrokerError("state_write_failed");
+      } } },
+    },
+    {
+      expected: "broker_result_unknown",
+      configure: { workspaceGitDecisionBroker: { contract_version: 1, recordDecision: async () => {
+        throw new WorkspaceGitHumanDecisionBrokerError("decision_outcome_unknown");
+      } } },
+    },
+  ];
+
+  for (const item of cases) {
+  for (const attributed of [attributedCommand, autoAttributedCommand]) {
+    const lines: string[] = [];
+    const h = harness({
+      interactionAudit: createInteractionAudit((line) => lines.push(line), () => now),
+      ...item.configure,
+    });
+    const routing = {
+      version: 1 as const,
+      requestId: gitId,
+      channelId: channel,
+      rootThreadTs: rootTs,
+      messageTs: cardTs,
+    };
+    h.store.remember({ kind: "git", ...routing, routing, expiresAt });
+    h.gitDetails.remember({
+      routing,
+      plan: gitPlan,
+      ...(item.omitSession ? {} : { sessionId }),
+      expiresAt,
+      prompt: "Synthetic plan",
+      fallbackText: "Synthetic plan",
+      display: { pathsExpanded: true, bodyExpanded: true },
+    });
+    h.gateway.pending.add(gitId);
+    const input = attributed(`承認 ${gitId}`);
+
+    await h.app.message(input.text, input.fields);
+
+    assert.equal(h.gateway.answers.length, 0, item.expected);
+    assert.ok(h.gateway.pending.has(gitId), item.expected);
+    assert.ok(h.store.get(gitId), item.expected);
+    const audit = lines.map((line) => JSON.parse(line) as RecordValue);
+    const bindingIndex = audit.findIndex((record) =>
+      record.event === "approval_text.binding_validated"
+    );
+    const brokerIndex = audit.findIndex((record) =>
+      record.event === "approval_text.broker_result" && record.outcome === item.expected
+    );
+    assert.ok(bindingIndex >= 0, item.expected);
+    assert.ok(brokerIndex > bindingIndex, item.expected);
+    assert.ok(Date.parse(String(audit[brokerIndex]?.timestamp)) < expiresAt, item.expected);
+    assert.equal(audit[brokerIndex]?.approvalTextFormat,
+      attributed === attributedCommand
+        ? "chatgpt_slack_footer_v1"
+        : "chatgpt_slack_footer_v2");
+    assert.equal(audit.some((record) => record.event === "approval_text.failed"), false);
+    const auditText = lines.join("\n");
+    for (const sensitive of [input.text, gitPlan.planHash, gitPlan.operationId, gitPlan.commitMessage]
+      .filter((value): value is string => value !== undefined)) {
+      assert.equal(auditText.includes(sensitive), false, item.expected);
+    }
   }
   }
 });

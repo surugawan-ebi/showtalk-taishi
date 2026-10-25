@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
@@ -11,6 +12,7 @@ import {
   type CommandApprovalDecision,
   type FileChangeApprovalDecision,
   type McpServerElicitationResponse,
+  type McpServerConnectionStatus,
   type ModelListParams,
   type ModelListResponse,
   type PermissionsApprovalResponse,
@@ -37,6 +39,84 @@ export interface CodexAppServerClientOptions {
   clientTitle?: string;
   clientVersion?: string;
   requestTimeoutMs?: number;
+  /** Receives only the bounded, sanitized lifecycle diagnostic shape below. */
+  onDiagnostic?: (event: CodexAppServerDiagnosticEvent) => void;
+}
+
+export type CodexAppServerDiagnosticStage =
+  | "spawn_started"
+  | "initialize_sent"
+  | "initialize_response"
+  | "initialized_notification"
+  | "thread_start_sent"
+  | "thread_start_response"
+  | "thread_resume_sent"
+  | "thread_resume_response"
+  | "mcp_server_status_list_sent"
+  | "mcp_server_status_list_response";
+
+export type CodexAppServerDiagnosticErrorClassification =
+  | "timeout"
+  | "rpc_error"
+  | "protocol_error"
+  | "client_closed"
+  | "transport_or_unknown_error";
+
+export type CodexAppServerCwdClassification =
+  | "absent"
+  | "absolute"
+  | "relative";
+
+export type CodexMcpStatusListClassification =
+  | "success"
+  | "partial_result"
+  | "empty_result"
+  | "api_unsupported"
+  | "timeout"
+  | "rpc_error"
+  | "invalid_result"
+  | "client_closed"
+  | "transport_or_unknown_error";
+
+export interface CodexEffectiveMcpRegistrationStatus {
+  readonly name: string;
+  readonly status: McpServerConnectionStatus | null;
+}
+
+export interface CodexAppServerDiagnosticEvent {
+  readonly source: "codex_app_server";
+  readonly stage: CodexAppServerDiagnosticStage;
+  readonly outcome: "started" | "sent" | "response" | "error";
+  readonly cwd?: CodexAppServerCwdClassification;
+  readonly configKeyNames?: readonly string[];
+  readonly configuredMcpRegistrationNames?: readonly string[];
+  readonly effectiveMcpRegistrations?: readonly CodexEffectiveMcpRegistrationStatus[];
+  readonly mcpStatusListClassification?: CodexMcpStatusListClassification;
+  readonly errorClassification?: CodexAppServerDiagnosticErrorClassification;
+}
+
+export interface CodexAppServerDiagnosticSnapshot {
+  readonly spawn: "not_observed" | "started";
+  readonly initialize: "not_started" | "sent" | "responded";
+  readonly initializedNotification: "not_sent" | "sent";
+  readonly threadStart?: CodexAppServerThreadDiagnosticSnapshot;
+  readonly threadResume?: CodexAppServerThreadDiagnosticSnapshot;
+  readonly mcpServerStatusList?: {
+    readonly classification: CodexMcpStatusListClassification;
+    readonly registrations: readonly CodexEffectiveMcpRegistrationStatus[];
+  };
+  readonly lastError?: {
+    readonly stage: CodexAppServerDiagnosticStage;
+    readonly classification: CodexAppServerDiagnosticErrorClassification;
+  };
+}
+
+export interface CodexAppServerThreadDiagnosticSnapshot {
+  readonly state: "sent" | "responded" | "error";
+  readonly cwd: CodexAppServerCwdClassification;
+  readonly configKeyNames: readonly string[];
+  readonly configuredMcpRegistrationNames: readonly string[];
+  readonly errorClassification?: CodexAppServerDiagnosticErrorClassification;
 }
 
 export interface CodexAppServerCloseOptions {
@@ -68,12 +148,25 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
+class CodexAppServerRequestTimeoutError extends Error {}
+
 export class CodexAppServerClient {
   readonly #events = new EventEmitter();
   readonly #pending = new Map<RpcId, PendingRequest>();
   readonly #timedOutRequestIds = new Map<RpcId, NodeJS.Timeout>();
   readonly #transport: AppServerTransport;
-  readonly #options: Required<CodexAppServerClientOptions>;
+  readonly #options: {
+    readonly clientName: string;
+    readonly clientTitle: string;
+    readonly clientVersion: string;
+    readonly requestTimeoutMs: number;
+    readonly onDiagnostic?: (event: CodexAppServerDiagnosticEvent) => void;
+  };
+  #diagnostics: CodexAppServerDiagnosticSnapshot = {
+    spawn: "not_observed",
+    initialize: "not_started",
+    initializedNotification: "not_sent",
+  };
   #nextRequestId = 1;
   #started = false;
   #closed = false;
@@ -89,6 +182,9 @@ export class CodexAppServerClient {
       clientTitle: options.clientTitle ?? "ShowTalk Taishi",
       clientVersion: options.clientVersion ?? "0.0.1",
       requestTimeoutMs: options.requestTimeoutMs ?? 30_000,
+      ...(options.onDiagnostic === undefined
+        ? {}
+        : { onDiagnostic: options.onDiagnostic }),
     };
   }
 
@@ -100,6 +196,12 @@ export class CodexAppServerClient {
       env?: NodeJS.ProcessEnv;
     } = {},
   ): Promise<CodexAppServerClient> {
+    emitDiagnostic(options.onDiagnostic, {
+      source: "codex_app_server",
+      stage: "spawn_started",
+      outcome: "started",
+      cwd: classifyCwd(options.cwd),
+    });
     const child = spawn(options.command ?? "codex", resolveCodexAppServerArgs(options.args), {
       cwd: options.cwd,
       env: options.env,
@@ -107,6 +209,7 @@ export class CodexAppServerClient {
     });
     const transport = new ChildProcessTransport(child);
     const client = new CodexAppServerClient(transport, options);
+    client.#diagnostics = { ...client.#diagnostics, spawn: "started" };
     child.once("error", (error) => client.#handleTransportError(error));
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => client.#events.emit("stderr", chunk));
@@ -130,18 +233,49 @@ export class CodexAppServerClient {
     this.#transport.input.on("error", (error) => this.#handleTransportError(error));
     this.#transport.output.on("error", (error) => this.#handleTransportError(error));
 
-    await this.request("initialize", {
-      clientInfo: {
-        name: this.#options.clientName,
-        title: this.#options.clientTitle,
-        version: this.#options.clientVersion,
-      },
-      capabilities: {
-        experimentalApi: true,
-        requestAttestation: false,
-      },
+    this.#diagnostics = { ...this.#diagnostics, initialize: "sent" };
+    this.#emitDiagnostic({
+      source: "codex_app_server",
+      stage: "initialize_sent",
+      outcome: "sent",
     });
-    this.notify("initialized", {});
+    try {
+      await this.request("initialize", {
+        clientInfo: {
+          name: this.#options.clientName,
+          title: this.#options.clientTitle,
+          version: this.#options.clientVersion,
+        },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+        },
+      });
+      this.#diagnostics = { ...this.#diagnostics, initialize: "responded" };
+      this.#emitDiagnostic({
+        source: "codex_app_server",
+        stage: "initialize_response",
+        outcome: "response",
+      });
+      this.notify("initialized", {});
+      this.#diagnostics = {
+        ...this.#diagnostics,
+        initializedNotification: "sent",
+      };
+      this.#emitDiagnostic({
+        source: "codex_app_server",
+        stage: "initialized_notification",
+        outcome: "sent",
+      });
+    } catch (error) {
+      this.#recordDiagnosticError("initialize_response", error);
+      throw error;
+    }
+  }
+
+  /** Returns already-observed state and never sends an App Server request. */
+  getDiagnosticSnapshot(): CodexAppServerDiagnosticSnapshot {
+    return structuredClone(this.#diagnostics);
   }
 
   onNotification(listener: (method: string, params: unknown) => void): () => void {
@@ -176,7 +310,9 @@ export class CodexAppServerClient {
       const timeout = setTimeout(() => {
         this.#pending.delete(id);
         this.#rememberTimedOutRequest(id);
-        reject(new Error(`Codex app-server request timed out: ${method}`));
+        reject(new CodexAppServerRequestTimeoutError(
+          `Codex app-server request timed out: ${method}`,
+        ));
       }, this.#options.requestTimeoutMs);
       this.#pending.set(id, { resolve, reject, timeout });
     });
@@ -188,7 +324,43 @@ export class CodexAppServerClient {
       this.#pending.delete(id);
       throw error;
     }
-    return promise as Promise<T>;
+    if (method !== "mcpServerStatus/list" || this.#options.onDiagnostic === undefined) {
+      return promise as Promise<T>;
+    }
+    // Observe only an ordinary request already made by the caller. Diagnostics
+    // never initiate this request or add one to thread start/resume.
+    this.#emitDiagnostic({
+      source: "codex_app_server",
+      stage: "mcp_server_status_list_sent",
+      outcome: "sent",
+    });
+    try {
+      const result = await promise;
+      const observation = sanitizeMcpServerStatusListResult(result);
+      this.#diagnostics = { ...this.#diagnostics, mcpServerStatusList: observation };
+      this.#emitDiagnostic({
+        source: "codex_app_server",
+        stage: "mcp_server_status_list_response",
+        outcome: "response",
+        effectiveMcpRegistrations: observation.registrations,
+        mcpStatusListClassification: observation.classification,
+      });
+      return result as T;
+    } catch (error) {
+      const classification = classifyMcpStatusListError(error);
+      this.#diagnostics = {
+        ...this.#diagnostics,
+        mcpServerStatusList: { classification, registrations: [] },
+      };
+      this.#emitDiagnostic({
+        source: "codex_app_server",
+        stage: "mcp_server_status_list_response",
+        outcome: "error",
+        effectiveMcpRegistrations: [],
+        mcpStatusListClassification: classification,
+      });
+      throw error;
+    }
   }
 
   notify(method: string, params: unknown): void {
@@ -205,13 +377,11 @@ export class CodexAppServerClient {
   }
 
   async startThread(params: ThreadStartParams): Promise<CodexThread> {
-    const result = await this.request<{ thread: CodexThread }>("thread/start", params);
-    return result.thread;
+    return this.#observeThreadRequest("thread/start", params, "threadStart");
   }
 
   async resumeThread(params: ThreadResumeParams): Promise<CodexThread> {
-    const result = await this.request<{ thread: CodexThread }>("thread/resume", params);
-    return result.thread;
+    return this.#observeThreadRequest("thread/resume", params, "threadResume");
   }
 
   async readThread(threadId: string, includeTurns = false): Promise<CodexThread> {
@@ -292,6 +462,84 @@ export class CodexAppServerClient {
       }
     }
     await this.#beginTransportClose();
+  }
+
+  async #observeThreadRequest(
+    method: "thread/start" | "thread/resume",
+    params: ThreadStartParams | ThreadResumeParams,
+    snapshotKey: "threadStart" | "threadResume",
+  ): Promise<CodexThread> {
+    const sentStage = method === "thread/start"
+      ? "thread_start_sent"
+      : "thread_resume_sent";
+    const responseStage = method === "thread/start"
+      ? "thread_start_response"
+      : "thread_resume_response";
+    const metadata = threadDiagnosticMetadata(params);
+    this.#diagnostics = {
+      ...this.#diagnostics,
+      [snapshotKey]: { state: "sent", ...metadata },
+    };
+    this.#emitDiagnostic({
+      source: "codex_app_server",
+      stage: sentStage,
+      outcome: "sent",
+      ...metadata,
+    });
+    try {
+      const result = await this.request<{ thread: CodexThread }>(method, params);
+      this.#diagnostics = {
+        ...this.#diagnostics,
+        [snapshotKey]: { state: "responded", ...metadata },
+      };
+      this.#emitDiagnostic({
+        source: "codex_app_server",
+        stage: responseStage,
+        outcome: "response",
+        ...metadata,
+      });
+      return result.thread;
+    } catch (error) {
+      const classification = classifyDiagnosticError(error);
+      this.#diagnostics = {
+        ...this.#diagnostics,
+        [snapshotKey]: {
+          state: "error",
+          ...metadata,
+          errorClassification: classification,
+        },
+        lastError: { stage: responseStage, classification },
+      };
+      this.#emitDiagnostic({
+        source: "codex_app_server",
+        stage: responseStage,
+        outcome: "error",
+        ...metadata,
+        errorClassification: classification,
+      });
+      throw error;
+    }
+  }
+
+  #recordDiagnosticError(
+    stage: CodexAppServerDiagnosticStage,
+    error: unknown,
+  ): void {
+    const classification = classifyDiagnosticError(error);
+    this.#diagnostics = {
+      ...this.#diagnostics,
+      lastError: { stage, classification },
+    };
+    this.#emitDiagnostic({
+      source: "codex_app_server",
+      stage,
+      outcome: "error",
+      errorClassification: classification,
+    });
+  }
+
+  #emitDiagnostic(event: CodexAppServerDiagnosticEvent): void {
+    emitDiagnostic(this.#options.onDiagnostic, event);
   }
 
   #write(message: object): void {
@@ -457,6 +705,116 @@ export class CodexAppServerClient {
     this.#closePromise ??= Promise.resolve().then(() => this.#transport.close());
     return this.#closePromise;
   }
+}
+
+function threadDiagnosticMetadata(
+  params: ThreadStartParams | ThreadResumeParams,
+): Omit<CodexAppServerThreadDiagnosticSnapshot, "state" | "errorClassification"> {
+  const config = params.config;
+  const mcpServers = isRecord(config?.mcp_servers)
+    ? config.mcp_servers
+    : undefined;
+  return {
+    cwd: classifyCwd(params.cwd),
+    configKeyNames: Object.keys(config ?? {}).sort(),
+    configuredMcpRegistrationNames: Object.keys(mcpServers ?? {}).sort(),
+  };
+}
+
+const MCP_SERVER_CONNECTION_STATUSES = new Set<McpServerConnectionStatus>([
+  "notStarted",
+  "starting",
+  "connected",
+  "authenticationRequired",
+  "failed",
+  "cancelled",
+  "disabled",
+]);
+
+function sanitizeMcpServerStatusListResult(
+  result: unknown,
+): NonNullable<CodexAppServerDiagnosticSnapshot["mcpServerStatusList"]> {
+  if (!isRecord(result) || !Array.isArray(result.data)) {
+    return { classification: "invalid_result", registrations: [] };
+  }
+  if (!(result.nextCursor === null || typeof result.nextCursor === "string")) {
+    return { classification: "invalid_result", registrations: [] };
+  }
+  const registrations: CodexEffectiveMcpRegistrationStatus[] = [];
+  for (const entry of result.data) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.name !== "string" ||
+      !(
+        entry.runtimeStatus === null ||
+        (
+          typeof entry.runtimeStatus === "string" &&
+          MCP_SERVER_CONNECTION_STATUSES.has(
+            entry.runtimeStatus as McpServerConnectionStatus,
+          )
+        )
+      )
+    ) {
+      return { classification: "invalid_result", registrations: [] };
+    }
+    registrations.push({
+      name: entry.name,
+      status: entry.runtimeStatus as McpServerConnectionStatus | null,
+    });
+  }
+  registrations.sort((left, right) =>
+    left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+  );
+  if (registrations.length === 0) {
+    return { classification: "empty_result", registrations: [] };
+  }
+  return {
+    classification: result.nextCursor === null ? "success" : "partial_result",
+    registrations,
+  };
+}
+
+function classifyMcpStatusListError(
+  error: unknown,
+): CodexMcpStatusListClassification {
+  if (error instanceof CodexRpcError && error.code === -32601) {
+    return "api_unsupported";
+  }
+  const classification = classifyDiagnosticError(error);
+  if (classification === "protocol_error") return "invalid_result";
+  return classification;
+}
+
+function classifyCwd(cwd: string | undefined): CodexAppServerCwdClassification {
+  if (cwd === undefined || cwd.length === 0) return "absent";
+  return isAbsolute(cwd) ? "absolute" : "relative";
+}
+
+function classifyDiagnosticError(
+  error: unknown,
+): CodexAppServerDiagnosticErrorClassification {
+  if (error instanceof CodexAppServerRequestTimeoutError) return "timeout";
+  if (error instanceof CodexRpcError) return "rpc_error";
+  if (error instanceof CodexProtocolError) return "protocol_error";
+  if (error instanceof Error && /client (?:is )?closed/u.test(error.message)) {
+    return "client_closed";
+  }
+  return "transport_or_unknown_error";
+}
+
+function emitDiagnostic(
+  sink: ((event: CodexAppServerDiagnosticEvent) => void) | undefined,
+  event: CodexAppServerDiagnosticEvent,
+): void {
+  try {
+    sink?.(structuredClone(event));
+  } catch {
+    // Read-only diagnostics must never change App Server client behavior.
+  }
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function isRpcMessageRecord(value: unknown): value is Record<string, unknown> {

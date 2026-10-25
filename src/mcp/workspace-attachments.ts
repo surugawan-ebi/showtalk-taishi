@@ -20,7 +20,7 @@ export interface RuntimeSlackAttachment {
   /** Immutable upload payload captured from the validated file handle. */
   readonly payload: Blob;
   readonly name: string;
-  readonly kind: "image" | "audio";
+  readonly kind: "image" | "audio" | "markdown";
   readonly title?: string;
   readonly altText?: string;
 }
@@ -140,6 +140,7 @@ const EXTENSION_KINDS = new Map<string, RuntimeSlackAttachment["kind"]>([
   [".ogg", "audio"],
   [".flac", "audio"],
   [".aac", "audio"],
+  [".md", "markdown"],
 ]);
 
 export async function withResolvedWorkspaceAttachments<T>(
@@ -192,7 +193,7 @@ export async function withResolvedWorkspaceAttachments<T>(
     }
     const kind = EXTENSION_KINDS.get(extname(candidate).toLowerCase());
     if (kind === undefined) {
-      throw invalidAttachment("Only supported image and audio files may be uploaded");
+      throw invalidAttachment("Only supported image, audio, and Markdown files may be uploaded");
     }
     const parents = await captureParentIdentities(workspace, candidate, attachment.path);
     totalBytes += details.size;
@@ -407,8 +408,20 @@ function hasExpectedMediaMagic(contents: Uint8Array, extension: string): boolean
           asciiAt(bytes, 0, "ADIF") ||
           (bytes[0] === 0xff && bytes[1] !== undefined && (bytes[1] & 0xf6) === 0xf0)
         );
+      case ".md":
+        return isUtf8Markdown(contents);
     default:
       return false;
+  }
+}
+
+function isUtf8Markdown(contents: Uint8Array): boolean {
+  if (contents.includes(0)) return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(contents);
+    return true;
+  } catch {
+    return false;
   }
 }
 

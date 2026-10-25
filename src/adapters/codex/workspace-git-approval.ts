@@ -38,9 +38,56 @@ const MAX_PATHS = 100;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_TOTAL_PATH_LENGTH = 30_000;
 
+const WORKSPACE_GIT_PLAN_TOOLS = new Set([
+  "prepare_git_publication",
+  "prepare_pull_request_operation",
+  "prepare_existing_pull_request_update",
+  "prepare_github_repository_settings",
+  "prepare_history_reset",
+  "update_repository_main",
+]);
+
+export interface WorkspaceGitPrepareCompletionNotice {
+  readonly itemId: string;
+  readonly turnId: string;
+  readonly recognizedServer: boolean;
+}
+
 export interface WorkspaceGitPlanCapture {
   readonly turnId: string;
   readonly plan: WorkspaceGitApprovalPlan;
+}
+
+/**
+ * Identifies a completed plan-producing MCP notification without reading or
+ * retaining its result payload. An unknown server spelling is still reported
+ * so delivery audits can distinguish it from a notification that never came.
+ */
+export function inspectWorkspaceGitPrepareCompletionNotice(
+  notification: unknown,
+): WorkspaceGitPrepareCompletionNotice | undefined {
+  const outer = asRecord(notification);
+  const item = asRecord(outer?.item);
+  if (
+    item?.type !== "mcpToolCall" ||
+    item.status !== "completed" ||
+    typeof item.tool !== "string" ||
+    !WORKSPACE_GIT_PLAN_TOOLS.has(item.tool) ||
+    typeof item.id !== "string" ||
+    item.id.length < 1 ||
+    item.id.length > 256 ||
+    typeof outer?.turnId !== "string" ||
+    outer.turnId.length < 1 ||
+    outer.turnId.length > 256
+  ) {
+    return undefined;
+  }
+  return {
+    itemId: item.id,
+    turnId: outer.turnId,
+    recognizedServer:
+      typeof item.server === "string" && WORKSPACE_GIT_SERVERS.has(item.server),
+  };
 }
 
 /**
@@ -57,12 +104,8 @@ export function normalizeWorkspaceGitPrepareCompletion(
     item?.type !== "mcpToolCall" ||
     typeof item.server !== "string" ||
     !WORKSPACE_GIT_SERVERS.has(item.server) ||
-    (item.tool !== "prepare_git_publication" &&
-      item.tool !== "prepare_pull_request_operation" &&
-      item.tool !== "prepare_existing_pull_request_update" &&
-      item.tool !== "prepare_github_repository_settings" &&
-      item.tool !== "prepare_history_reset" &&
-      item.tool !== "update_repository_main")
+    typeof item.tool !== "string" ||
+    !WORKSPACE_GIT_PLAN_TOOLS.has(item.tool)
   ) {
     return undefined;
   }
@@ -78,7 +121,23 @@ export function normalizeWorkspaceGitPrepareCompletion(
   const turnId = boundedString(outer?.turnId, 256, "turn ID");
   const result = asRecord(item.result);
   const output = asRecord(result?.structuredContent);
-  if (output?.status !== "awaiting_human_approval") return undefined;
+  if (output === undefined) return undefined;
+  const pendingStatus = output.status;
+  if (
+    pendingStatus !== "awaiting_human_approval" &&
+    pendingStatus !== "prepared"
+  ) {
+    return undefined;
+  }
+  const executionAuthority = output?.execution_authority;
+  if (
+    (pendingStatus === "prepared" && executionAuthority !== "caller_managed") ||
+    (pendingStatus === "awaiting_human_approval" &&
+      executionAuthority !== undefined &&
+      executionAuthority !== "human_approval")
+  ) {
+    throw new Error("workspace-git returned an invalid pending execution authority");
+  }
   const expectedExecuteTool = item.tool === "prepare_git_publication"
     ? "execute_approved_git_publication"
     : item.tool === "prepare_pull_request_operation"

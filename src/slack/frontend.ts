@@ -20,9 +20,11 @@ import type {
   PermissionApprovalDecision,
 } from "../permissions/approval-coordinator.js";
 import {
+  classifyWorkspaceGitHumanDecisionFailure,
   createWorkspaceGitHumanDecisionDeliveryId,
   isWorkspaceGitHumanDecisionBrokerError,
   type WorkspaceGitHumanDecisionBroker,
+  type WorkspaceGitHumanDecisionAuditOutcome,
 } from "../approvals/workspace-git-human-decision-broker.js";
 import {
   validateWorkspaceGitAutonomyDisableResult,
@@ -66,9 +68,12 @@ import {
   parseConversationControlAction,
   parseConversationControlActionValue,
 } from "./controls.js";
-import { ApprovalTextStore } from "./approval-text-store.js";
 import {
-  parseApprovalTextCommand, buildApprovalTextCommandHint,
+  ApprovalTextStore,
+  isApprovalTextBindingError,
+} from "./approval-text-store.js";
+import {
+  classifyApprovalTextCommand, buildApprovalTextCommandHint,
   type ApprovalTextAttributionProfile,
 } from "./approval-text-command.js";
 import {
@@ -137,7 +142,10 @@ import {
   parseWorkspaceGitAutonomyToken,
   type WorkspaceGitAutonomyCardOperation,
 } from "./workspace-git-autonomy-blocks.js";
-import { workAttentionSlackPostArguments } from "./work-attention-notification.js";
+import {
+  shouldPostWorkAttentionToSlack,
+  workAttentionSlackPostArguments,
+} from "./work-attention-notification.js";
 import {
   SlackConnectionHealth,
   type SlackConnectionStatus,
@@ -422,6 +430,7 @@ export class SlackFrontend {
     if (this.#workAttentionChannelId === undefined) {
       throw new Error("Slack work-attention channel is not configured");
     }
+    if (!shouldPostWorkAttentionToSlack(notification)) return;
     const finishHandler = this.#beginSlackHandler();
     try {
       const result = await this.#app.client.chat.postMessage(
@@ -1201,19 +1210,23 @@ export class SlackFrontend {
     decision: "approve" | "reject",
     routing: UserInputActionValue,
     source: { readonly userId: string; readonly channelId: string; readonly messageTs: string },
+    brokerAudit?: (outcome: WorkspaceGitHumanDecisionAuditOutcome) => void,
   ): Promise<void> {
     await this.#gitApprovalDetails.serialize(routing, async () => {
       const details = this.#gitApprovalDetails.get(routing);
       if (details === undefined) {
+        brokerAudit?.("decision_context_missing");
         await this.#terminalizeUnavailableGitApprovalCard(client, routing);
         return;
       }
       if (await this.#terminalizeExpiredGitApprovalCard(client, details)) {
         return;
       }
+      let brokerApplied = false;
       try {
         const koeId = this.#agentIdsByChannel.get(routing.channelId);
         if (koeId === undefined || details.sessionId === undefined) {
+          brokerAudit?.("decision_context_missing");
           throw new Error(
             "The authenticated workspace-git decision context is unavailable",
           );
@@ -1248,6 +1261,10 @@ export class SlackFrontend {
               plan: details.plan,
             },
           ),
+          () => {
+            brokerApplied = true;
+            brokerAudit?.("broker_applied");
+          },
         );
         this.#interactionAudit({
           event: "git_approval.answer_applied",
@@ -1255,6 +1272,11 @@ export class SlackFrontend {
           outcome: decision,
         });
       } catch (error) {
+        if (!brokerApplied &&
+            !(this.#agentIdsByChannel.get(routing.channelId) === undefined ||
+              details.sessionId === undefined)) {
+          brokerAudit?.(classifyWorkspaceGitHumanDecisionFailure(error));
+        }
         logger.error(error);
         if (!canSafelyRejectAfterPrivateGitDecisionFailure(error)) {
           // A timeout or transport failure can race with a durable
@@ -1363,13 +1385,27 @@ export class SlackFrontend {
       commandMessageTs: message.ts,
       actorUserId: message.user,
     };
+    let rejectionAudited = false;
+    let brokerFailureAudited = false;
     try {
       if (this.#restartPending) throw new Error("Gateway restart is in progress");
       if (parseSlackEventEnvelopeIdentity(body) === undefined) {
         throw new Error("Slack event identity is incomplete");
       }
-      const command = parseApprovalTextCommand(event, this.#approvalTextAttributionProfile);
-      if (command === undefined) throw new Error("Use only the exact approval command shown on the card, in its thread");
+      const classification = classifyApprovalTextCommand(
+        event,
+        this.#approvalTextAttributionProfile,
+      );
+      if (classification.kind === "rejected") {
+        rejectionAudited = true;
+        this.#interactionAudit({
+          event: "approval_text.classification_rejected",
+          ...auditContext,
+          outcome: classification.reason,
+        });
+        throw new Error("Use only the exact approval command shown on the card, in its thread");
+      }
+      const command = classification.command;
       auditContext = {
         ...auditContext,
         requestId: command.requestId,
@@ -1380,7 +1416,20 @@ export class SlackFrontend {
           attributionUserId: command.attribution.userId,
         }),
       };
-      const entry = this.#approvalTextStore.getForCommand(command, this.#approvers);
+      let entry: ReturnType<ApprovalTextStore["getForCommand"]>;
+      try {
+        entry = this.#approvalTextStore.getForCommand(command, this.#approvers);
+      } catch (error) {
+        if (isApprovalTextBindingError(error)) {
+          rejectionAudited = true;
+          this.#interactionAudit({
+            event: "approval_text.binding_rejected",
+            ...auditContext,
+            outcome: error.reason,
+          });
+        }
+        throw error;
+      }
       auditContext = { ...auditContext, messageTs: entry.messageTs };
       // This is a validated candidate, not proof of backend settlement. The
       // common handlers retain their own pending/replay checks and outcome logs.
@@ -1398,7 +1447,21 @@ export class SlackFrontend {
             command.decision === "approve" ? "allow_once" : "deny", command.userId);
           break;
         case "git":
-          await this.#applyGitApproval(client, logger, command.decision, entry.routing, source);
+          await this.#applyGitApproval(
+            client,
+            logger,
+            command.decision,
+            entry.routing,
+            source,
+            (outcome) => {
+              if (outcome !== "broker_applied") brokerFailureAudited = true;
+              this.#interactionAudit({
+                event: "approval_text.broker_result",
+                ...auditContext,
+                outcome,
+              });
+            },
+          );
           break;
         case "external": {
           const current = this.#choiceContinuations.getDisplayed(entry.requestId);
@@ -1414,7 +1477,9 @@ export class SlackFrontend {
         }
       }
     } catch (error) {
-      this.#interactionAudit({ event: "approval_text.failed", ...auditContext, outcome: "error" });
+      if (!rejectionAudited && !brokerFailureAudited) {
+        this.#interactionAudit({ event: "approval_text.failed", ...auditContext, outcome: "error" });
+      }
       logger.error(error);
       await client.chat.postEphemeral({
         channel: message.channel,
@@ -2954,6 +3019,7 @@ export async function recordGitDecisionBeforeAppServerResume(
     readonly sessionId: string;
   },
   resume: () => Promise<void>,
+  brokerApplied?: () => void,
 ): Promise<void> {
   if (broker === undefined) {
     throw new Error("The private workspace-git approval broker is not configured");
@@ -2964,6 +3030,7 @@ export async function recordGitDecisionBeforeAppServerResume(
     deliveryId,
     context,
   });
+  brokerApplied?.();
   await resume();
 }
 

@@ -49,10 +49,12 @@ operation.
 ### Claude Code adapter
 
 A `claude-code` Koe keeps the same boundary. `bypassPermissions` is not an
-accepted `permission_mode`, so tool use that is not covered by `allowed_tools`
-or the user's Claude settings becomes a Slack approval card. "Allow session"
-grants are session-scoped rules held by the running Claude session and never written to Claude
-settings files. The child receives the same kind of filtered environment as
+accepted `permission_mode`. In `auto` mode, Claude's model classifier may allow
+or deny a permission request; requests that still require a human decision
+become Slack approval cards. In other modes, tool use that is not covered by
+`allowed_tools` or the user's Claude settings also reaches that approval path.
+"Allow session" grants are session-scoped rules held by the running Claude
+session and never written to Claude settings files. The child receives the same kind of filtered environment as
 Codex: only `HOME`, Claude/Anthropic authentication and cloud-provider switches,
 runtime and proxy variables, and names in `env_passthrough`. Slack tokens are
 removed. The Koe's MCP bearer token is passed through an environment variable
@@ -202,10 +204,11 @@ Koe-originated uploads accept only relative paths beneath that Koe's
 configured workspace. Every symbolic-link component is rejected; the canonical
 file and each parent directory are checked again around descriptor-based reads,
 and immutable bytes are captured before Slack upload. Only regular supported
-image or audio files are allowed. A process-wide byte lease bounds concurrent
-captures until Slack finishes or compensates the upload. Uploads occur only
-after Slack write policy allows them. Model text is never scanned for paths to
-upload implicitly.
+image, audio, or Markdown files are allowed. A process-wide byte lease bounds
+concurrent captures until Slack finishes or compensates the upload. Markdown
+files are rejected if they contain invalid UTF-8 or NUL bytes. Uploads occur
+only after Slack write policy allows them. Model text is never scanned for
+paths to upload implicitly.
 
 Interactive payloads are parsed with strict action prefixes, key sets, size
 limits, channel binding, and request IDs. Only configured approver Slack user
@@ -248,6 +251,15 @@ Absolute/traversal paths, malformed fields, multiple plans, unsupported
 choices, and plans too large to display exactly are rejected. The immutable
 binding lives only while the originating App Server RPC is live, including its
 bounded same-turn binding grace period.
+
+Prepare delivery is audited at both boundaries: receipt of the completed MCP
+notification and successful insertion of its normalized plan into the
+same-turn lifecycle registry. A bounded, process-local observation window (at
+least ten seconds, no more than 64 records per session) lets a binding timeout
+distinguish no notification from a different-turn notification and an already
+expired plan. Only fixed classifiers and hashed thread/turn/request references
+are emitted; MCP result content and plan identity are never copied into the
+audit record.
 
 The Slack choice is first recorded through a model-inaccessible local
 workspace-git decision broker. The plan response supplies the exact bounded

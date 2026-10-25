@@ -9,6 +9,17 @@ export interface WorkAttentionSlackPostArguments {
 }
 
 /**
+ * Visible approval waits are expected operator interactions, not incidents that
+ * need a separate operations-channel notification. They remain in the local
+ * work-attention audit so diagnosis and lifecycle reconciliation are intact.
+ */
+export function shouldPostWorkAttentionToSlack(
+  notification: WorkAttentionNotification,
+): boolean {
+  return notification.reason !== "visible_approval_wait";
+}
+
+/**
  * Builds the stable, payload-free Slack contract consumed by external
  * notification bridges. The result is always a new root message: callers must
  * not add thread_ts or replace it with an update/delete operation.
@@ -77,4 +88,3 @@ function safeContractValue(value: string, name: string, maxLength: number): stri
   }
   return value;
 }
-
