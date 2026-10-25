@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 
 export const APPROVAL_DELIVERY_BUILD_IDENTITY =
-  "showtalk-taishi@0.0.1/approval-delivery-v2";
+  "showtalk-taishi@0.0.1/approval-delivery-v3";
 
 export type InteractionAuditEvent =
   | "approval_text.binding_validated"
+  | "approval_text.binding_rejected"
+  | "approval_text.broker_result"
+  | "approval_text.classification_rejected"
   | "approval_text.failed"
   | "approval.request_received"
   | "approval.controls_attached"
@@ -12,6 +15,9 @@ export type InteractionAuditEvent =
   | "turn_start.dispatched"
   | "turn_start.bound"
   | "turn.terminalized"
+  | "workspace_git.plan_notification_received"
+  | "workspace_git.plan_registered"
+  | "workspace_git.plan_binding_failed"
   | "structured_input.request_received"
   | "structured_input.request_deferred"
   | "structured_input.request_rejected"
@@ -39,6 +45,7 @@ export type InteractionAuditEvent =
   | "git_approval.card_posted"
   | "git_approval.action_received"
   | "git_approval.answer_applied"
+  | "git_approval.delivery_failed"
   | "git_approval.card_terminalized"
   | "git_approval.resolved_externally"
   | "git_approval.expired"
@@ -52,13 +59,23 @@ const INTERACTION_AUDIT_OUTCOMES = [
   "answered_or_cleared",
   "answers_nonempty_check",
   "approve",
+  "approver_mismatch",
+  "attribution_format_mismatch",
+  "attribution_identity_mismatch",
   "automatic_choice",
   "before_start_bound",
+  "broker_applied",
+  "broker_persist_failed",
+  "broker_result_unknown",
+  "broker_status_conflict",
+  "broker_transport_failed",
   "callback_binding_missing",
   "client_error",
   "configured",
+  "command_format_mismatch",
   "deferred_queue_full",
   "delivery_failed",
+  "decision_context_missing",
   "direct_server_request",
   "display_failed",
   "empty_answers_rejected",
@@ -74,9 +91,21 @@ const INTERACTION_AUDIT_OUTCOMES = [
   "git_answer_dispatched",
   "invalid_outcome_classifier",
   "interactive",
+  "invalid_route",
+  "message_envelope_unsupported",
+  "message_order_invalid",
   "other",
   "outside_exact_active_turn",
+  "plan_capture_invalid",
+  "plan_expired_before_binding",
+  "plan_not_received",
+  "plan_notification_received_different_turn",
+  "plan_notification_received_same_turn",
+  "plan_notification_server_unrecognized",
+  "plan_received_different_turn",
+  "plan_registered_same_turn",
   "reject",
+  "request_unavailable",
   "resolved_after_dispatch",
   "resolved_before_callback_binding",
   "resolved_before_dispatch",
@@ -84,6 +113,9 @@ const INTERACTION_AUDIT_OUTCOMES = [
   "response_deserialize_failed",
   "response_receiver_dropped",
   "response_written",
+  "responder_mismatch",
+  "route_fields_invalid",
+  "route_mismatch",
   "select",
   "sent",
   "slack_choice_callback_bound",
@@ -117,7 +149,10 @@ export interface InteractionAuditInput {
   readonly attributionUserId?: string;
   readonly attributionAppId?: string;
   /** Observed syntax only, never proof of the publisher or approver. */
-  readonly approvalTextFormat?: "plain" | "chatgpt_slack_footer_v1";
+  readonly approvalTextFormat?:
+    | "plain"
+    | "chatgpt_slack_footer_v1"
+    | "chatgpt_slack_footer_v2";
   /** Fixed classifier only; never include exception text, prompts, or answers. */
   readonly outcome?: InteractionAuditOutcome;
 }
@@ -244,7 +279,8 @@ export function createInteractionAudit(
       ...(input.approvalTextFormat === undefined
         ? {}
         : { approvalTextFormat: input.approvalTextFormat === "plain" ||
-            input.approvalTextFormat === "chatgpt_slack_footer_v1"
+            input.approvalTextFormat === "chatgpt_slack_footer_v1" ||
+            input.approvalTextFormat === "chatgpt_slack_footer_v2"
             ? input.approvalTextFormat : "invalid_format_classifier" }),
       ...(input.outcome === undefined
         ? {}

@@ -50,6 +50,31 @@ interface StoredApproval {
   readonly entry?: TextApprovalEntry;
 }
 
+export type ApprovalTextBindingRejectionReason =
+  | "approver_mismatch"
+  | "expired"
+  | "invalid_route"
+  | "message_order_invalid"
+  | "request_unavailable"
+  | "responder_mismatch"
+  | "route_mismatch";
+
+export class ApprovalTextBindingError extends Error {
+  readonly reason: ApprovalTextBindingRejectionReason;
+
+  constructor(reason: ApprovalTextBindingRejectionReason, message: string) {
+    super(message);
+    this.name = "ApprovalTextBindingError";
+    this.reason = reason;
+  }
+}
+
+export function isApprovalTextBindingError(
+  value: unknown,
+): value is ApprovalTextBindingError {
+  return value instanceof ApprovalTextBindingError;
+}
+
 /**
  * Process-local routes for successfully displayed approval cards only.
  * Callers register after Slack posting succeeds and remove terminal requests.
@@ -96,32 +121,64 @@ export class ApprovalTextStore {
     command: ApprovalTextCommandRoute,
     approvers: ReadonlySet<string>,
   ): TextApprovalEntry {
-    validateCommand(command);
-    const entry = this.get(command.requestId);
+    try {
+      validateCommand(command);
+    } catch {
+      throw new ApprovalTextBindingError("invalid_route", "Invalid approval reply route");
+    }
+    const now = this.#currentTime();
+    const stored = this.#entries.get(command.requestId);
+    const entry = stored?.entry;
     if (entry === undefined) {
-      throw new Error("Displayed approval request is unavailable or expired");
+      throw new ApprovalTextBindingError(
+        "request_unavailable",
+        "Displayed approval request is unavailable or expired",
+      );
+    }
+    if (now >= entry.expiresAt) {
+      this.#entries.delete(command.requestId);
+      throw new ApprovalTextBindingError(
+        "expired",
+        "Approval reply was sent after the approval expired",
+      );
     }
     if (
       command.channelId !== entry.channelId ||
       command.rootThreadTs !== entry.rootThreadTs
     ) {
-      throw new Error("Approval reply does not match the displayed card route");
+      throw new ApprovalTextBindingError(
+        "route_mismatch",
+        "Approval reply does not match the displayed card route",
+      );
     }
     if (!approvers.has(command.userId)) {
-      throw new Error("Approval reply author is not a configured approver");
+      throw new ApprovalTextBindingError(
+        "approver_mismatch",
+        "Approval reply author is not a configured approver",
+      );
     }
     if (
       entry.kind === "external" &&
       entry.routing.responderUserId !== undefined &&
       entry.routing.responderUserId !== command.userId
     ) {
-      throw new Error("Approval reply author is not the bound responder");
+      throw new ApprovalTextBindingError(
+        "responder_mismatch",
+        "Approval reply author is not the bound responder",
+      );
     }
     if (compareTimestamps(command.messageTs, entry.messageTs) <= 0) {
-      throw new Error("Approval reply must follow the displayed card");
+      throw new ApprovalTextBindingError(
+        "message_order_invalid",
+        "Approval reply must follow the displayed card",
+      );
     }
     if (timestampMillis(command.messageTs) >= entry.expiresAt) {
-      throw new Error("Approval reply was sent after the approval expired");
+      this.#entries.delete(command.requestId);
+      throw new ApprovalTextBindingError(
+        "expired",
+        "Approval reply was sent after the approval expired",
+      );
     }
     return entry;
   }

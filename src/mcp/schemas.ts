@@ -90,7 +90,7 @@ export const slackAttachmentPathSchema = z
 export const slackAttachmentInputSchema = z
   .object({
     path: slackAttachmentPathSchema.describe(
-      "Workspace-relative path to an image or audio file",
+      "Workspace-relative path to an image, audio, or Markdown file",
     ),
     title: boundedPlainString(
       "Attachment title",
@@ -170,7 +170,7 @@ export const slackPostInputSchema = z
     channel: channelSchema.describe("Slack channel ID or service-supported channel alias"),
     message: messageSchema.describe("Optional message to post").optional(),
     attachments: slackAttachmentsSchema
-      .describe("Workspace-relative image or audio files to upload")
+      .describe("Workspace-relative image, audio, or Markdown files to upload")
       .optional(),
   })
   .strict()
@@ -187,7 +187,7 @@ export const slackReplyInputSchema = z
       .optional(),
     message: messageSchema.describe("Optional reply to post in the thread").optional(),
     attachments: slackAttachmentsSchema
-      .describe("Workspace-relative image or audio files to upload")
+      .describe("Workspace-relative image, audio, or Markdown files to upload")
       .optional(),
   })
   .strict()

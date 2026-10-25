@@ -58,6 +58,17 @@ Requests that already carry a reserved approval label still wait through the
 short Git plan-binding grace, even with the external-action ID, so notification
 ordering cannot downgrade a late exact Git plan into a non-Git confirmation.
 
+The sanitized interaction audit traces the prepare side of this boundary as
+well as the structured-input side. `workspace_git.plan_notification_received`
+records whether a plan-producing completion was seen for the active turn, a
+different turn, or an unrecognized MCP server spelling.
+`workspace_git.plan_registered` confirms that one normalized plan reached the
+same-turn lifecycle registry. `workspace_git.plan_binding_failed` classifies a
+request as `plan_not_received`, `plan_received_different_turn`,
+`plan_expired_before_binding`, or `plan_capture_invalid`. These records contain
+only hashed routing references and fixed classifiers; they never contain the
+operation ID, plan hash, plan payload, prompt, or answer.
+
 A complex turn may request multiple external writes sequentially. Each write
 must receive a fresh blocking `external_action_approval` with its current
 Target, Scope, and Impact after the previous confirmation has resolved. Only one
@@ -165,7 +176,8 @@ ordered image inputs. MP3, M4A, WAV, OGG, FLAC, and AAC are downloaded into the
 private attachment spool and exposed as local files. Audio transcription
 depends on tools available in the Koe workspace.
 
-Koe can send supported image and audio files with `slack.post` or `slack.reply`:
+Koe can send supported image, audio, and UTF-8 Markdown (`.md`) files with
+`slack.post` or `slack.reply`:
 
 ```text
 slack.reply(
@@ -174,7 +186,8 @@ slack.reply(
   message="Rendered result and spoken summary.",
   attachments=[
     {path="artifacts/result.png", alt_text="Rendered result"},
-    {path="artifacts/summary.m4a", title="Spoken summary"}
+    {path="artifacts/summary.m4a", title="Spoken summary"},
+    {path="artifacts/report.md", title="Result report"}
   ]
 )
 ```
@@ -196,9 +209,10 @@ slack.reply(
 )
 ```
 
-Paths are relative to the authenticated Koe's configured workspace. Absolute
-paths, URLs, traversal, workspace-external symlinks, unsupported formats, and
-oversized files are rejected.
+Paths are relative to the authenticated Koe's configured workspace. Markdown
+files must contain valid UTF-8 text without NUL bytes. Absolute paths, URLs,
+traversal, workspace-external symlinks, unsupported formats, and oversized
+files are rejected.
 
 Inline images returned by App Server dynamic tools are also projected to the
 originating Slack thread. Only validated `data:image/...;base64,...` content is
@@ -288,9 +302,11 @@ occurrence number. This bounded deduplication state survives Worker replacement.
 
 Every transition also remains available as a machine-readable log record with
 `component: "showtalk.work_attention"`. When
-`slack.work_attention_channel_id` is configured, the same transition is posted
-as a new Slack root message (never an edit, delete, or thread reply) using this
-exact eight-line contract:
+`slack.work_attention_channel_id` is configured, actionable transitions are
+posted as new Slack root messages (never edits, deletes, or thread replies).
+Normal `visible_approval_wait` detection and recovery remain in the local audit
+but are not posted to Slack. Hidden waits, progress stalls, execution failures,
+connection loss, and their recoveries use this exact eight-line contract:
 
 ```text
 SHOWTALK_WORK_ATTENTION_V1

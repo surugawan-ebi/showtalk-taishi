@@ -22,6 +22,11 @@ import {
 import { renderAdminPage } from "./ui.js";
 import type { WorkspaceGitAutonomyStatus } from "../approvals/workspace-git-autonomy-control.js";
 import type { SlackConnectionStatus } from "../slack/connection-health.js";
+import {
+  LocalMcpCorrelationScopeError,
+  type LocalMcpCorrelationReadRequest,
+  type LocalMcpCorrelationReport,
+} from "../diagnostics/local-mcp-correlation-snapshot.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 1_048_576;
@@ -111,6 +116,9 @@ export interface LocalAdminServerOptions {
   readonly repository: AdminConfigPort;
   readonly modelCatalog?: AdminModelCatalogPort;
   readonly slackConnectionStatus?: () => SlackConnectionStatus | "unknown";
+  readonly localMcpCorrelation?: {
+    read(request: LocalMcpCorrelationReadRequest): LocalMcpCorrelationReport;
+  };
   readonly workspaceGitAutonomy?: {
     list(): readonly WorkspaceGitAutonomyStatus[];
     request(agentId: string, operation: "enable" | "disable"): Promise<void>;
@@ -151,6 +159,9 @@ export class LocalAdminServer {
         ...(this.#options.slackConnectionStatus === undefined
           ? {}
           : { slackConnectionStatus: this.#options.slackConnectionStatus }),
+        ...(this.#options.localMcpCorrelation === undefined
+          ? {}
+          : { localMcpCorrelation: this.#options.localMcpCorrelation }),
         ...(this.#options.workspaceGitAutonomy === undefined
           ? {}
           : { workspaceGitAutonomy: this.#options.workspaceGitAutonomy }),
@@ -278,6 +289,23 @@ async function handleRequest(
     writeJson(response, 200, await options.repository.read());
     return;
   }
+  const correlationRoute = parseLocalMcpCorrelationRoute(url.pathname);
+  if (request.method === "GET" && correlationRoute !== undefined) {
+    if (options.localMcpCorrelation === undefined) {
+      writeJson(response, 404, { error: "Diagnostic is unavailable." });
+      return;
+    }
+    try {
+      writeJson(response, 200, options.localMcpCorrelation.read(correlationRoute));
+    } catch (error) {
+      if (error instanceof LocalMcpCorrelationScopeError) {
+        writeJson(response, 403, { error: "Insufficient diagnostic evidence." });
+        return;
+      }
+      throw error;
+    }
+    return;
+  }
   const modelRoute = parseModelRoute(url.pathname);
   if (
     modelRoute !== undefined &&
@@ -398,6 +426,29 @@ function parseWorkspaceGitAutonomyRoute(
       return undefined;
     }
     return { agentId, operation };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseLocalMcpCorrelationRoute(
+  pathname: string,
+): LocalMcpCorrelationReadRequest | undefined {
+  const match = /^\/api\/agents\/([^/]+)\/channels\/([^/]+)\/diagnostics\/local-mcp-correlation$/u
+    .exec(pathname);
+  if (match === null) return undefined;
+  try {
+    const agentId = decodeURIComponent(match[1] ?? "");
+    const channelId = decodeURIComponent(match[2] ?? "");
+    if (
+      agentId.length === 0 ||
+      agentId.length > MAX_KOE_ID_LENGTH ||
+      agentId.includes("/") ||
+      channelId.length === 0 ||
+      channelId.length > 256 ||
+      channelId.includes("/")
+    ) return undefined;
+    return { agentId, channelId };
   } catch {
     return undefined;
   }

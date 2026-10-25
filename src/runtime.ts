@@ -66,6 +66,12 @@ import {
   type KoeExecutionState,
   type WorkAttentionNotification,
 } from "./diagnostics/work-stoppage-monitor.js";
+import {
+  LocalMcpCorrelationRuntimeReader,
+  LocalMcpCorrelationScopeError,
+  type LocalMcpCorrelationReadRequest,
+  type LocalMcpCorrelationReport,
+} from "./diagnostics/local-mcp-correlation-snapshot.js";
 import { createSlackMessagePresentation } from "./slack/presentation.js";
 import { WorkspaceGitApprovalDetailsStore } from "./slack/user-input-blocks.js";
 import {
@@ -89,6 +95,9 @@ export interface RunningTaishi {
   readonly router: AgentRouter;
   readonly frontend: TaishiFrontend;
   readonly mcpEndpoint: McpHttpEndpoint;
+  readLocalMcpCorrelationSnapshot(
+    request: LocalMcpCorrelationReadRequest,
+  ): LocalMcpCorrelationReport;
   listModels(
     agentId: string,
     options?: { readonly refresh?: boolean },
@@ -162,6 +171,10 @@ export interface CreateRuntimeOptions {
     options: ConstructorParameters<typeof SlackFrontend>[1],
   ) => TaishiFrontend;
   readonly onRestartRequested?: () => void;
+  /** Test seam; production always uses CodexAppServerClient.spawn. */
+  readonly appServerClientFactory?: (
+    options: NonNullable<Parameters<typeof CodexAppServerClient.spawn>[0]>,
+  ) => Promise<CodexAppServerClient>;
   /** Private hosts may inject the manual-only v1 human-decision transport. */
   readonly workspaceGitHumanDecisionBrokerFactory?: WorkspaceGitHumanDecisionBrokerFactory;
   /** Private hosts may inject an opaque provider client; OSS defaults manual. */
@@ -330,6 +343,8 @@ async function createLockedRuntime(
   });
   recentGatewayRestartReceipts = [...gatewayRestartReplayGuard.list()];
   const clients: CodexAppServerClient[] = [];
+  const codexClientsByAgent = new Map<string, CodexAppServerClient>();
+  let localMcpCorrelationReader: LocalMcpCorrelationRuntimeReader | undefined;
   const codexAdapters: CodexAdapter[] = [];
   const claudeAdapters: ClaudeCodeAdapter[] = [];
   const workspaceGitApprovalDetailsStore = new WorkspaceGitApprovalDetailsStore();
@@ -441,11 +456,24 @@ async function createLockedRuntime(
         process.env,
         adapterConfig.env_passthrough,
       );
-      const client = await CodexAppServerClient.spawn({
+      const client = await (options.appServerClientFactory ?? CodexAppServerClient.spawn)({
         command: adapterConfig.command,
         env: codexChildEnvironment,
+        onDiagnostic: (event) => console.info(JSON.stringify(event)),
       });
       clients.push(client);
+      codexClientsByAgent.set(agentId, client);
+      if (agentId === "local-mcp") {
+        localMcpCorrelationReader = new LocalMcpCorrelationRuntimeReader({
+          agentId,
+          channelId: agentConfig.slack.channel_id,
+          client,
+          resolveClient: (requestedAgentId) =>
+            codexClientsByAgent.get(requestedAgentId),
+          readExistingStatusSnapshot: () =>
+            client.getDiagnosticSnapshot().mcpServerStatusList,
+        });
+      }
       workStoppageMonitor.observeConnection(agentId, true);
       modelCatalogsByAgent.set(agentId, new CodexModelCatalog(client));
       const configuredModel = agentConfig.model ?? adapterConfig.model;
@@ -673,6 +701,12 @@ async function createLockedRuntime(
       router,
       frontend,
       mcpEndpoint,
+      readLocalMcpCorrelationSnapshot: (request) => {
+        if (localMcpCorrelationReader === undefined) {
+          throw new LocalMcpCorrelationScopeError();
+        }
+        return localMcpCorrelationReader.read(request);
+      },
       listModels: async (agentId, listOptions = {}) => {
         const catalog = modelCatalogsByAgent.get(agentId);
         if (catalog === undefined) throw new Error(`Unknown Koe: ${agentId}`);

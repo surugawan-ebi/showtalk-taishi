@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { AgentApproval } from "../../src/core/index.js";
 import {
+  ApprovalTextBindingError,
   ApprovalTextStore,
   type TextApprovalEntry,
 } from "../../src/slack/approval-text-store.js";
@@ -97,6 +98,35 @@ test("expires at the exact current-time boundary even for an earlier message eve
   now = EXPIRES;
   assert.equal(store.get(entry().requestId), undefined);
   assert.throws(() => store.getForCommand(command(), APPROVERS), /expired/u);
+});
+
+test("classifies expiry and binding mismatches without including route values", () => {
+  let now = NOW;
+  const expiredStore = new ApprovalTextStore(() => now);
+  expiredStore.remember(entry());
+  now = EXPIRES;
+  assert.throws(
+    () => expiredStore.getForCommand(command(), APPROVERS),
+    (error) => error instanceof ApprovalTextBindingError && error.reason === "expired" &&
+      !error.message.includes(entry().requestId),
+  );
+
+  const boundStore = new ApprovalTextStore(() => NOW);
+  boundStore.remember(entry());
+  assert.throws(
+    () => boundStore.getForCommand({
+      ...command(), rootThreadTs: "1710000000.000000",
+    }, APPROVERS),
+    (error) => error instanceof ApprovalTextBindingError && error.reason === "route_mismatch" &&
+      !error.message.includes(entry().requestId),
+  );
+  assert.throws(
+    () => boundStore.getForCommand({
+      ...command(), userId: "U5555555555",
+    }, APPROVERS),
+    (error) => error instanceof ApprovalTextBindingError && error.reason === "approver_mismatch" &&
+      !error.message.includes("U5555555555"),
+  );
 });
 
 test("rejects an event at or after expiry independent of the injected current time", () => {

@@ -65,6 +65,7 @@ import type {
   AppOpsApprovalProofSigner,
 } from "../../approvals/appops-approval-proof.js";
 import {
+  inspectWorkspaceGitPrepareCompletionNotice,
   normalizeWorkspaceGitPrepareCompletion,
   toolRequestUserInputParams,
   validateWorkspaceGitPlanQuestion,
@@ -257,11 +258,12 @@ interface PendingChoiceUserInput {
 type PendingUserInput = PendingGitUserInput | PendingChoiceUserInput;
 
 interface DispatchedChoiceUserInput {
+  readonly kind: "choice" | "git_approval";
   readonly requestId: string;
   readonly rpcId: RpcId;
   readonly sessionId: string;
   readonly turnId: string;
-  readonly itemId: string;
+  readonly itemId?: string;
   readonly queue: AsyncEventQueue;
 }
 
@@ -308,6 +310,17 @@ interface PendingWorkspaceGitAutomation {
   readonly turnId: string;
   readonly plan: WorkspaceGitApprovalPlan;
   readonly abortController: AbortController;
+}
+
+interface WorkspaceGitPlanNotificationObservation {
+  readonly turnId: string;
+  readonly observedAt: number;
+  readonly outcome:
+    | "received"
+    | "server_unrecognized"
+    | "registered"
+    | "expired"
+    | "invalid";
 }
 
 export interface CodexAdapterOptions {
@@ -455,6 +468,10 @@ export class CodexAdapter implements AgentAdapter {
     PendingWorkspaceGitAutomation
   >();
   readonly #workspaceGitApprovals = new WorkspaceGitApprovalLifecycle();
+  readonly #workspaceGitPlanNotifications = new Map<
+    string,
+    WorkspaceGitPlanNotificationObservation[]
+  >();
   readonly #activeQueues = new Map<string, AsyncEventQueue>();
   readonly #deferredServerRequestsBySession = new Map<
     string,
@@ -781,6 +798,8 @@ export class CodexAdapter implements AgentAdapter {
       readonly method: string;
       readonly params: unknown;
     }> = [];
+    const observedWorkspaceGitNoticeItemIds = new Set<string>();
+    const capturedWorkspaceGitNoticeItemIds = new Set<string>();
     let reconciliationFailures = 0;
     let terminalWatchdog: NodeJS.Timeout | undefined;
     const clearTerminalWatchdog = () => {
@@ -919,6 +938,7 @@ export class CodexAdapter implements AgentAdapter {
         queue,
         "The Codex turn completed before its workspace-git plan could be bound",
       );
+      this.#workspaceGitPlanNotifications.delete(session.id);
       clearTerminalWatchdog();
       this.#activeTurns.delete(session.id);
       const status = turnStatus(params);
@@ -1033,8 +1053,118 @@ export class CodexAdapter implements AgentAdapter {
       });
       return true;
     };
+    const captureWorkspaceGitPlanNotification = (
+      params: unknown,
+      notice: ReturnType<typeof inspectWorkspaceGitPrepareCompletionNotice>,
+    ): void => {
+      if (notice === undefined || !notice.recognizedServer) return;
+      const activeTurnId = ownedTurnId ?? this.#activeTurns.get(session.id);
+      if (activeTurnId !== undefined && activeTurnId !== notice.turnId) return;
+      const captureKey = `${notice.turnId}\u0000${notice.itemId}`;
+      if (capturedWorkspaceGitNoticeItemIds.has(captureKey)) return;
+      capturedWorkspaceGitNoticeItemIds.add(captureKey);
+      if (capturedWorkspaceGitNoticeItemIds.size > 64) {
+        const oldest = capturedWorkspaceGitNoticeItemIds.values().next().value;
+        if (oldest !== undefined) capturedWorkspaceGitNoticeItemIds.delete(oldest);
+      }
+      const notification = asRecord(params);
+      const item = asRecord(notification?.item);
+      const startedItem = typeof item?.id === "string"
+        ? this.#startedItems.get(itemKey(session.id, item.id))
+        : undefined;
+      try {
+        const capture = normalizeWorkspaceGitPrepareCompletion(
+          params,
+          startedItem,
+        );
+        if (capture === undefined) return;
+        this.#rememberWorkspaceGitPlan(session.id, capture.turnId, capture.plan);
+        const expired = Date.parse(capture.plan.expiresAt) <= Date.now();
+        this.#recordWorkspaceGitPlanNotification(
+          session.id,
+          capture.turnId,
+          expired ? "expired" : "registered",
+        );
+        this.#interactionAudit?.({
+          event: expired
+            ? "workspace_git.plan_binding_failed"
+            : "workspace_git.plan_registered",
+          requestId: clientUserMessageId,
+          sessionId: session.id,
+          turnId: capture.turnId,
+          outcome: expired
+            ? "plan_expired_before_binding"
+            : "plan_registered_same_turn",
+        });
+        this.#queueExternallyResolvedUserInputPlans(
+          session.id,
+          capture.turnId,
+        );
+      } catch (error) {
+        this.#recordWorkspaceGitPlanNotification(
+          session.id,
+          notice.turnId,
+          "invalid",
+        );
+        this.#interactionAudit?.({
+          event: "workspace_git.plan_binding_failed",
+          requestId: clientUserMessageId,
+          sessionId: session.id,
+          turnId: notice.turnId,
+          outcome: "plan_capture_invalid",
+        });
+        queue.push({
+          type: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "An approval prepare tool returned an invalid pending plan",
+          code: "INVALID_EXTERNAL_APPROVAL_PLAN",
+        });
+      }
+    };
     const processNotification = (method: string, params: unknown) => {
       if (!belongsToThread(params, session.id)) return;
+      const workspaceGitNotice = method === "item/completed"
+        ? inspectWorkspaceGitPrepareCompletionNotice(params)
+        : undefined;
+      if (
+        workspaceGitNotice !== undefined &&
+        !observedWorkspaceGitNoticeItemIds.has(
+          `${workspaceGitNotice.turnId}\u0000${workspaceGitNotice.itemId}`,
+        )
+      ) {
+        observedWorkspaceGitNoticeItemIds.add(
+          `${workspaceGitNotice.turnId}\u0000${workspaceGitNotice.itemId}`,
+        );
+        if (observedWorkspaceGitNoticeItemIds.size > 64) {
+          const oldest = observedWorkspaceGitNoticeItemIds.values().next().value;
+          if (oldest !== undefined) observedWorkspaceGitNoticeItemIds.delete(oldest);
+        }
+        const activeTurnId = ownedTurnId ?? this.#activeTurns.get(session.id);
+        const noticeOutcome = !workspaceGitNotice.recognizedServer
+          ? "plan_notification_server_unrecognized" as const
+          : activeTurnId !== undefined && activeTurnId !== workspaceGitNotice.turnId
+            ? "plan_notification_received_different_turn" as const
+            : "plan_notification_received_same_turn" as const;
+        this.#recordWorkspaceGitPlanNotification(
+          session.id,
+          workspaceGitNotice.turnId,
+          workspaceGitNotice.recognizedServer ? "received" : "server_unrecognized",
+        );
+        this.#interactionAudit?.({
+          event: "workspace_git.plan_notification_received",
+          requestId: clientUserMessageId,
+          sessionId: session.id,
+          turnId: workspaceGitNotice.turnId,
+          outcome: noticeOutcome,
+        });
+      }
+      // Capture the immutable public plan before turn-correlation deferral.
+      // Binding still requires the exact active session+turn below, but a
+      // received same-turn completion must not remain absent from the registry
+      // merely because turn/start acknowledgement is still in flight.
+      captureWorkspaceGitPlanNotification(params, workspaceGitNotice);
       let claimedTurn = false;
       if (isTurnScopedNotification(method)) {
         const notifiedTurnId = notificationTurnId(params);
@@ -1083,23 +1213,6 @@ export class CodexAdapter implements AgentAdapter {
         this.#observeApprovedGitExecution(session.id, item, queue);
         const startedItem = this.#startedItems.get(itemKey(session.id, item.id));
         try {
-          const capture = normalizeWorkspaceGitPrepareCompletion(
-            params,
-            startedItem,
-          );
-          if (capture !== undefined) {
-            this.#rememberWorkspaceGitPlan(session.id, capture.turnId, capture.plan);
-            this.#queueExternallyResolvedUserInputPlans(
-              session.id,
-              capture.turnId,
-            );
-            // Let adjacent App Server completion notifications settle before
-            // deciding that exactly one plan exists. This preserves the
-            // fail-closed rule when parallel prepares complete together.
-            setImmediate(() => {
-              this.#retryPendingUserInputBindings(session.id, capture.turnId);
-            });
-          }
           const appOpsCapture = normalizeAppOpsPrepareCompletion(
             params,
             startedItem,
@@ -1434,7 +1547,7 @@ export class CodexAdapter implements AgentAdapter {
       if (!("optionId" in response)) {
         throw new Error("Git approval requires one fixed approval decision");
       }
-      this.#settleGitUserInput(response.requestId, pending, response.optionId);
+      await this.#settleGitUserInput(response.requestId, pending, response.optionId);
       this.#resumeAfterUserInput(session.id);
       return;
     }
@@ -2135,6 +2248,15 @@ export class CodexAdapter implements AgentAdapter {
           : receivedAt + question.autoResolutionMs - now,
       );
       if (!Number.isFinite(planExpiry) || timeoutMs <= 0) {
+        this.#auditStructuredInput(
+          "workspace_git.plan_binding_failed",
+          serverRequest.id,
+          {
+            sessionId,
+            turnId: params.turnId,
+            outcome: "plan_expired_before_binding",
+          },
+        );
         throw new RepreparableGitApprovalError(
           "The workspace-git plan has already expired",
         );
@@ -2811,6 +2933,22 @@ export class CodexAdapter implements AgentAdapter {
       const pending = this.#pendingUserInputBindings.get(key);
       if (pending === undefined) return;
       this.#pendingUserInputBindings.delete(key);
+      if (
+        this.#activeTurns.get(pending.sessionId) !== pending.turnId ||
+        this.#activeQueues.get(pending.sessionId) !== pending.queue
+      ) {
+        this.#rejectUserInputBinding(
+          pending.serverRequest,
+          pending.sessionId,
+          pending.turnId,
+          pending.queue,
+          new Error(
+            "The exact active turn changed before its workspace-git plan could be bound",
+          ),
+        );
+        return;
+      }
+      this.#auditWorkspaceGitPlanBindingFailure(pending);
       this.#handleUserInputRequest(
         pending.serverRequest,
         pending.sessionId,
@@ -3121,6 +3259,7 @@ export class CodexAdapter implements AgentAdapter {
     this.#pendingUserInputBindings.clear();
     this.#externalActionApprovalRepairStates.clear();
     this.#appOpsPlansByTurn.clear();
+    this.#workspaceGitPlanNotifications.clear();
     this.#workspaceGitApprovals.clearAll();
     this.#startedItems.clear();
   }
@@ -3181,7 +3320,9 @@ export class CodexAdapter implements AgentAdapter {
     }
     if (dispatched !== undefined) {
       dispatched.queue.push({
-        type: "choice.server_request_resolved",
+        ...(dispatched.kind === "git_approval"
+          ? { type: "git_approval.server_request_resolved" as const }
+          : { type: "choice.server_request_resolved" as const }),
         requestId: dispatched.requestId,
       });
     }
@@ -3297,7 +3438,11 @@ export class CodexAdapter implements AgentAdapter {
       }
     }
     this.#userInputDeliveries.removeWhere(
-      (receipt) => receipt.sessionId === sessionId,
+      // A Git answer can start the bounded continuation before App Server emits
+      // serverRequest/resolved. Keep only that opaque receipt for the tracker's
+      // bounded TTL; ordinary choice receipts remain turn-scoped.
+      (receipt) =>
+        receipt.sessionId === sessionId && receipt.kind !== "git_approval",
     );
     for (const [key, correlation] of this.#structuredInputCorrelationIds) {
       if (correlation.sessionId === sessionId) {
@@ -3401,11 +3546,11 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
-  #settleGitUserInput(
+  async #settleGitUserInput(
     requestId: string,
     pending: PendingGitUserInput,
     optionId: AgentGitApprovalInputResponse["optionId"],
-  ): void {
+  ): Promise<void> {
     const label = optionId === "approve" ? pending.approveLabel : pending.rejectLabel;
     let executionStarted = false;
     if (optionId === "approve") {
@@ -3424,15 +3569,15 @@ export class CodexAdapter implements AgentAdapter {
     clearTimeout(pending.expirationTimer);
     this.#pendingUserInputs.delete(requestId);
     try {
-      this.#dispatchUntrackedUserInputResponse(
+      await this.#dispatchGitUserInputResponse(
         pending.rpcId,
         pending.sessionId,
         pending.turnId,
         requestId,
+        this.#activeQueues.get(pending.sessionId),
         {
           answers: { [pending.questionId]: { answers: [label] } },
         },
-        "git_answer_dispatched",
       );
     } catch (error) {
       if (executionStarted) {
@@ -3443,6 +3588,60 @@ export class CodexAdapter implements AgentAdapter {
       }
       throw error;
     }
+  }
+
+  async #dispatchGitUserInputResponse(
+    rpcId: RpcId,
+    sessionId: string,
+    turnId: string,
+    requestId: string,
+    queue: AsyncEventQueue | undefined,
+    response: ToolRequestUserInputResponse,
+  ): Promise<void> {
+    this.#auditStructuredInput(
+      "structured_input.answer_dispatch_started",
+      rpcId,
+      { requestId, sessionId, turnId, outcome: "answers_nonempty_check" },
+    );
+    if (classifyUserInputResponseShape(response) === "answers_empty") {
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        rpcId,
+        { requestId, sessionId, turnId, outcome: "empty_answers_rejected" },
+      );
+      throw new Error("Structured input response has no answers");
+    }
+    if (queue === undefined) {
+      throw new Error("Structured input turn is no longer active");
+    }
+    this.#userInputDeliveries.record(rpcId, {
+      kind: "git_approval",
+      requestId,
+      rpcId,
+      sessionId,
+      turnId,
+      queue,
+    });
+    try {
+      if (this.#client.respondToUserInputAndDrain !== undefined) {
+        await this.#client.respondToUserInputAndDrain(rpcId, response);
+      } else {
+        this.#client.respondToUserInput(rpcId, response);
+      }
+    } catch (error) {
+      this.#auditStructuredInput(
+        "structured_input.answer_dispatch_failed",
+        rpcId,
+        { requestId, sessionId, turnId, outcome: "transport_write_failed" },
+      );
+      this.#userInputDeliveries.remove(rpcId);
+      throw error;
+    }
+    this.#auditStructuredInput(
+      "structured_input.answer_dispatch_succeeded",
+      rpcId,
+      { requestId, sessionId, turnId, outcome: "git_answer_dispatched" },
+    );
   }
 
   #dispatchUntrackedUserInputResponse(
@@ -3640,6 +3839,7 @@ export class CodexAdapter implements AgentAdapter {
       throw new Error("Structured input turn is no longer active");
     }
     const receipt: DispatchedChoiceUserInput = {
+      kind: "choice",
       requestId,
       rpcId: pending.rpcId,
       sessionId: pending.sessionId,
@@ -3746,7 +3946,9 @@ export class CodexAdapter implements AgentAdapter {
         },
       );
       failure.receipt.queue.push({
-        type: "choice.delivery_failed",
+        ...(failure.receipt.kind === "git_approval"
+          ? { type: "git_approval.delivery_failed" as const }
+          : { type: "choice.delivery_failed" as const }),
         requestId: failure.receipt.requestId,
         reason: failure.reason,
       });
@@ -3878,6 +4080,56 @@ export class CodexAdapter implements AgentAdapter {
     plan: WorkspaceGitApprovalPlan,
   ): void {
     this.#workspaceGitApprovals.rememberPlan(sessionId, turnId, plan);
+  }
+
+  #recordWorkspaceGitPlanNotification(
+    sessionId: string,
+    turnId: string,
+    outcome: WorkspaceGitPlanNotificationObservation["outcome"],
+  ): void {
+    const now = Date.now();
+    const retentionMs = Math.max(this.#options.gitPlanBindingGraceMs * 2, 10_000);
+    const current = (this.#workspaceGitPlanNotifications.get(sessionId) ?? [])
+      .filter((observation) => now - observation.observedAt <= retentionMs);
+    current.push({ turnId, observedAt: now, outcome });
+    if (current.length > 64) current.splice(0, current.length - 64);
+    this.#workspaceGitPlanNotifications.set(sessionId, current);
+  }
+
+  #auditWorkspaceGitPlanBindingFailure(
+    pending: PendingUserInputBinding,
+  ): void {
+    if (!hasWorkspaceGitApprovalQuestionId(pending.serverRequest.params)) return;
+    const observations = this.#workspaceGitPlanNotifications.get(
+      pending.sessionId,
+    ) ?? [];
+    const relevant = observations.filter(
+      (observation) => observation.observedAt >= pending.receivedAt,
+    );
+    const sameTurn = observations.filter(
+      (observation) => observation.turnId === pending.turnId,
+    );
+    const outcome: InteractionAuditOutcome = sameTurn.some(
+        (observation) => observation.outcome === "expired",
+      )
+      ? "plan_expired_before_binding"
+      : sameTurn.some(
+          (observation) => observation.outcome === "invalid" ||
+            observation.outcome === "received",
+        )
+        ? "plan_capture_invalid"
+      : relevant.some((observation) => observation.turnId !== pending.turnId)
+        ? "plan_received_different_turn"
+        : "plan_not_received";
+    this.#auditStructuredInput(
+      "workspace_git.plan_binding_failed",
+      pending.rpcId,
+      {
+        sessionId: pending.sessionId,
+        turnId: pending.turnId,
+        outcome,
+      },
+    );
   }
 
   #respondToPendingApproval(

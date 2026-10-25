@@ -6,6 +6,7 @@ import {
   CodexAppServerClient,
   DEFAULT_CODEX_APP_SERVER_ARGS,
   resolveCodexAppServerArgs,
+  type CodexAppServerDiagnosticEvent,
   type AppServerTransport,
 } from "../../../src/adapters/codex/app-server-client.js";
 import { CodexRpcError } from "../../../src/adapters/codex/protocol.js";
@@ -80,18 +81,6 @@ async function connectClient(): Promise<{
   return { client, transport };
 }
 
-async function connectClientWithTimeout(requestTimeoutMs: number) {
-  const transport = new TestTransport();
-  const client = new CodexAppServerClient(transport, { requestTimeoutMs });
-  const starting = client.start();
-  await new Promise((resolve) => setImmediate(resolve));
-  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
-  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
-  await starting;
-  transport.readOutput();
-  return { client, transport };
-}
-
 test("performs initialize handshake before normal requests", async () => {
   const transport = new TestTransport();
   const client = new CodexAppServerClient(transport);
@@ -119,6 +108,346 @@ test("performs initialize handshake before normal requests", async () => {
     method: "initialized",
     params: {},
   });
+  await client.close();
+});
+
+test("records thread/start without issuing a diagnostic status request", async () => {
+  const diagnostics: CodexAppServerDiagnosticEvent[] = [];
+  const transport = new TestTransport();
+  const client = new CodexAppServerClient(transport, {
+    onDiagnostic: (event) => diagnostics.push(event),
+  });
+  const starting = client.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+  transport.readOutput();
+  const pending = client.startThread({ cwd: "/workspace" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const requests = transport.readOutput();
+  assert.equal(requests.length, 1);
+  const request = JSON.parse(requests[0] ?? "null") as { id: number; method: string };
+  assert.equal(request.method, "thread/start");
+  transport.input.write(`${JSON.stringify({
+    id: request.id,
+    result: { thread: { id: "thread-secret" } },
+  })}\n`);
+  assert.equal((await pending).id, "thread-secret");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(transport.readOutput(), [], "diagnostics sent an extra RPC");
+  assert.deepEqual(diagnostics.map((event) => [event.stage, event.outcome]), [
+    ["initialize_sent", "sent"],
+    ["initialize_response", "response"],
+    ["initialized_notification", "sent"],
+    ["thread_start_sent", "sent"],
+    ["thread_start_response", "response"],
+  ]);
+  assert.deepEqual(client.getDiagnosticSnapshot(), {
+    spawn: "not_observed",
+    initialize: "responded",
+    initializedNotification: "sent",
+    threadStart: {
+      state: "responded",
+      cwd: "absolute",
+      configKeyNames: [],
+      configuredMcpRegistrationNames: [],
+    },
+  });
+  assert.equal(JSON.stringify(diagnostics).includes("thread-secret"), false);
+  await client.close();
+});
+
+test("records successful thread/resume using the existing request and hides identifiers", async () => {
+  const diagnostics: CodexAppServerDiagnosticEvent[] = [];
+  const diagnosticTransport = new TestTransport();
+  const diagnosticClient = new CodexAppServerClient(diagnosticTransport, {
+    onDiagnostic: (event) => diagnostics.push(event),
+  });
+  const starting = diagnosticClient.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(diagnosticTransport.readOutput()[0] ?? "null") as { id: number };
+  diagnosticTransport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+  diagnosticTransport.readOutput();
+
+  const pending = diagnosticClient.resumeThread({
+    threadId: "thread-secret",
+    cwd: "relative-workspace",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const requests = diagnosticTransport.readOutput();
+  assert.equal(requests.length, 1);
+  const request = JSON.parse(requests[0] ?? "null") as { id: number; method: string };
+  assert.equal(request.method, "thread/resume");
+  diagnosticTransport.input.write(
+    `${JSON.stringify({ id: request.id, result: { thread: { id: "thread-secret" } } })}\n`,
+  );
+  await pending;
+
+  assert.deepEqual(diagnosticTransport.readOutput(), [], "resume sent an extra RPC");
+
+  const resumeDiagnostics = diagnostics.filter((event) =>
+    event.stage.startsWith("thread_resume")
+  );
+  assert.deepEqual(resumeDiagnostics.map((event) => [event.stage, event.outcome]), [
+    ["thread_resume_sent", "sent"],
+    ["thread_resume_response", "response"],
+  ]);
+  assert.equal(JSON.stringify(resumeDiagnostics).includes("thread-secret"), false);
+  assert.equal(diagnosticClient.getDiagnosticSnapshot().threadResume?.cwd, "relative");
+  assert.equal(diagnosticClient.getDiagnosticSnapshot().mcpServerStatusList, undefined);
+  await diagnosticClient.close();
+});
+
+test("records configured and effective MCP names but never secret fields", async () => {
+  const diagnostics: CodexAppServerDiagnosticEvent[] = [];
+  const transport = new TestTransport();
+  const client = new CodexAppServerClient(transport, {
+    onDiagnostic: (event) => diagnostics.push(event),
+  });
+  const starting = client.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+  transport.readOutput();
+
+  const pending = client.startThread({
+    config: {
+      features: { code_mode: { enabled: false } },
+      mcp_servers: {
+        safe_registration: {
+          url: "https://secret.example.invalid/private",
+          bearer_token_env_var: "SECRET_TOKEN_ENV",
+          env: { SECRET_TOKEN_ENV: "secret-value" },
+          command: "private-command --secret-argument",
+        },
+      },
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+  transport.input.write(
+    `${JSON.stringify({ id: request.id, result: { thread: { id: "thread-secret" } } })}\n`,
+  );
+  await pending;
+  assert.deepEqual(transport.readOutput(), []);
+  const statusPending = client.request("mcpServerStatus/list", {
+    limit: 1_000, detail: "toolsAndAuthOnly", threadId: "thread-secret",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const statusRequest = JSON.parse(transport.readOutput()[0] ?? "null") as {
+    id: number;
+    method: string;
+  };
+  assert.equal(statusRequest.method, "mcpServerStatus/list");
+  transport.input.write(`${JSON.stringify({
+    id: statusRequest.id,
+    result: {
+      data: [{
+        name: "effective_registration",
+        runtimeStatus: "failed",
+        pluginId: "private-plugin-id",
+        serverInfo: { title: "private-server-title" },
+        tools: { private_tool: {} },
+        resources: [{ uri: "https://private-resource.invalid" }],
+        resourceTemplates: [],
+        authStatus: "oAuth",
+      }],
+      nextCursor: null,
+    },
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await statusPending;
+  const serialized = JSON.stringify(diagnostics);
+  assert.match(serialized, /safe_registration/u);
+  assert.match(serialized, /effective_registration/u);
+  assert.match(serialized, /features/u);
+  assert.match(serialized, /mcp_servers/u);
+  for (const secret of [
+    "secret.example.invalid",
+    "SECRET_TOKEN_ENV",
+    "secret-value",
+    "private-command",
+    "secret-argument",
+    "thread-secret",
+    "private-plugin-id",
+    "private-server-title",
+    "private_tool",
+    "private-resource.invalid",
+    "oAuth",
+  ]) {
+    assert.equal(serialized.includes(secret), false, `diagnostics leaked ${secret}`);
+  }
+  assert.deepEqual(diagnostics.at(-1), {
+    source: "codex_app_server",
+    stage: "mcp_server_status_list_response",
+    outcome: "response",
+    effectiveMcpRegistrations: [
+      { name: "effective_registration", status: "failed" },
+    ],
+    mcpStatusListClassification: "success",
+  });
+  await client.close();
+});
+
+for (const diagnosticCase of [
+  {
+    name: "classifies unsupported mcpServerStatus/list",
+    error: { code: -32601, message: "secret unsupported detail" },
+    classification: "api_unsupported",
+  },
+  {
+    name: "classifies other mcpServerStatus/list RPC errors",
+    error: { code: -32000, message: "secret RPC detail" },
+    classification: "rpc_error",
+  },
+] as const) {
+  test(diagnosticCase.name, async () => {
+    const diagnostics: CodexAppServerDiagnosticEvent[] = [];
+    const transport = new TestTransport();
+    const client = new CodexAppServerClient(transport, {
+      onDiagnostic: (event) => diagnostics.push(event),
+    });
+    const starting = client.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+    transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+    await starting;
+    transport.readOutput();
+
+    const threadPending = client.startThread({ cwd: "/workspace" });
+    await new Promise((resolve) => setImmediate(resolve));
+    const threadRequest = JSON.parse(transport.readOutput()[0] ?? "null") as {
+      id: number;
+      method: string;
+    };
+    assert.equal(threadRequest.method, "thread/start");
+    transport.input.write(`${JSON.stringify({
+      id: threadRequest.id,
+      result: { thread: { id: "private-thread-id" } },
+    })}\n`);
+    await threadPending;
+    assert.deepEqual(transport.readOutput(), []);
+    const statusPending = client.request("mcpServerStatus/list", {
+      limit: 1_000, detail: "toolsAndAuthOnly", threadId: "private-thread-id",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const requests = transport.readOutput().map((line) =>
+      JSON.parse(line) as { id: number; method: string }
+    );
+    assert.deepEqual(requests.map((request) => request.method), [
+      "mcpServerStatus/list",
+    ]);
+    transport.input.write(`${JSON.stringify({
+      id: requests[0]?.id,
+      error: diagnosticCase.error,
+    })}\n`);
+    await assert.rejects(statusPending);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(client.getDiagnosticSnapshot().mcpServerStatusList, {
+      classification: diagnosticCase.classification,
+      registrations: [],
+    });
+    const statusDiagnostic = diagnostics.at(-1);
+    assert.equal(statusDiagnostic?.mcpStatusListClassification, diagnosticCase.classification);
+    assert.equal(JSON.stringify(statusDiagnostic).includes("secret"), false);
+    assert.equal(JSON.stringify(statusDiagnostic).includes("private-thread-id"), false);
+    await client.close();
+  });
+}
+
+test("classifies an mcpServerStatus/list timeout without changing thread success", async () => {
+  const diagnostics: CodexAppServerDiagnosticEvent[] = [];
+  let resolveStatusDiagnostic!: () => void;
+  const statusDiagnostic = new Promise<void>((resolve) => {
+    resolveStatusDiagnostic = resolve;
+  });
+  const transport = new TestTransport();
+  const client = new CodexAppServerClient(transport, {
+    requestTimeoutMs: 20,
+    onDiagnostic: (event) => {
+      diagnostics.push(event);
+      if (event.stage === "mcp_server_status_list_response") {
+        resolveStatusDiagnostic();
+      }
+    },
+  });
+  const starting = client.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+  transport.readOutput();
+
+  const threadPending = client.resumeThread({ threadId: "private-thread-id" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const threadRequest = JSON.parse(transport.readOutput()[0] ?? "null") as {
+    id: number;
+    method: string;
+  };
+  transport.input.write(`${JSON.stringify({
+    id: threadRequest.id,
+    result: { thread: { id: "private-thread-id" } },
+  })}\n`);
+  assert.equal((await threadPending).id, "private-thread-id");
+  assert.deepEqual(transport.readOutput(), []);
+  const statusPending = client.request("mcpServerStatus/list", {
+    limit: 1_000, detail: "toolsAndAuthOnly", threadId: "private-thread-id",
+  });
+  const statusRejected = assert.rejects(statusPending, /timed out/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  const statusRequests = transport.readOutput().map((line) =>
+    JSON.parse(line) as { method: string }
+  );
+  assert.deepEqual(statusRequests.map((request) => request.method), [
+    "mcpServerStatus/list",
+  ]);
+
+  await statusDiagnostic;
+  await statusRejected;
+  assert.deepEqual(client.getDiagnosticSnapshot().mcpServerStatusList, {
+    classification: "timeout",
+    registrations: [],
+  });
+  assert.equal(JSON.stringify(diagnostics).includes("private-thread-id"), false);
+  await client.close();
+});
+
+test("never initiates status queries across repeated lifecycle requests", async () => {
+  const transport = new TestTransport();
+  const diagnostics: CodexAppServerDiagnosticEvent[] = [];
+  const client = new CodexAppServerClient(transport, {
+    onDiagnostic: (event) => diagnostics.push(event),
+  });
+  const starting = client.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+  transport.readOutput();
+  for (const method of ["start", "resume", "resume"] as const) {
+    const pending = method === "start"
+      ? client.startThread({ cwd: "/workspace" })
+      : client.resumeThread({ threadId: "private-thread-id" });
+    await new Promise((resolve) => setImmediate(resolve));
+    const requests = transport.readOutput();
+    assert.equal(requests.length, 1);
+    const request = JSON.parse(requests[0] ?? "null") as { id: number; method: string };
+    assert.equal(request.method, method === "start" ? "thread/start" : "thread/resume");
+    transport.input.write(`${JSON.stringify({
+      id: request.id, result: { thread: { id: "private-thread-id" } },
+    })}\n`);
+    await pending;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(transport.readOutput(), []);
+  }
+  assert.equal(client.getDiagnosticSnapshot().mcpServerStatusList, undefined);
+  assert.equal(diagnostics.some((event) => event.stage.startsWith("mcp_server_status")), false);
   await client.close();
 });
 
@@ -394,7 +723,18 @@ test("lists one typed page of Codex app-server models", async () => {
 });
 
 test("times out an app-server request that never receives a response", async () => {
-  const { client, transport } = await connectClientWithTimeout(100);
+  const lifecycle: CodexAppServerDiagnosticEvent[] = [];
+  const transport = new TestTransport();
+  const client = new CodexAppServerClient(transport, {
+    requestTimeoutMs: 100,
+    onDiagnostic: (event) => lifecycle.push(event),
+  });
+  const starting = client.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const initialize = JSON.parse(transport.readOutput()[0] ?? "null") as { id: number };
+  transport.input.write(`${JSON.stringify({ id: initialize.id, result: {} })}\n`);
+  await starting;
+  transport.readOutput();
   const pending = client.startThread({ cwd: "/workspace" });
   await new Promise((resolve) => setImmediate(resolve));
   const [rawRequest] = transport.readOutput();
@@ -402,6 +742,19 @@ test("times out an app-server request that never receives a response", async () 
   await assert.rejects(
     pending,
     /request timed out: thread\/start/,
+  );
+  assert.deepEqual(lifecycle.at(-1), {
+    source: "codex_app_server",
+    stage: "thread_start_response",
+    outcome: "error",
+    cwd: "absolute",
+    configKeyNames: [],
+    configuredMcpRegistrationNames: [],
+    errorClassification: "timeout",
+  });
+  assert.equal(
+    client.getDiagnosticSnapshot().threadStart?.errorClassification,
+    "timeout",
   );
   const diagnostics: Error[] = [];
   client.onProtocolError((error) => diagnostics.push(error));

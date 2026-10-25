@@ -253,6 +253,9 @@ export async function runGatewayWorker(
         accessToken: adminToken!,
         repository: adminRepository!,
         slackConnectionStatus: () => runtime.slackConnectionStatus(),
+        localMcpCorrelation: {
+          read: (request) => runtime.readLocalMcpCorrelationSnapshot(request),
+        },
         modelCatalog: {
           list: async (agentId, listOptions = {}) => {
             const catalog = await runtime.listModels(agentId, listOptions);

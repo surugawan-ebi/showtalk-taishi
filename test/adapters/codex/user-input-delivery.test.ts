@@ -95,3 +95,31 @@ test("does not attribute an explicitly different RPC id to a singleton receipt",
   );
   assert.equal(tracker.markServerResolved(21), "receipt-21");
 });
+
+test("expires retained delivery receipts after a bounded correlation window", () => {
+  let now = 1_000;
+  const tracker = new UserInputDeliveryTracker<string>({
+    receiptTtlMs: 50,
+    now: () => now,
+  });
+  tracker.record(31, "receipt-31");
+  now = 1_049;
+  assert.equal(tracker.markServerResolved(31), "receipt-31");
+  now = 1_050;
+  assert.equal(tracker.markServerResolved(31), undefined);
+  assert.deepEqual(
+    tracker.observeStderr("could not notify callback for 31: receiver dropped\n"),
+    [{ reason: "response_receiver_dropped" }],
+  );
+});
+
+test("evicts the oldest receipt when the correlation limit is reached", () => {
+  const tracker = new UserInputDeliveryTracker<string>({ receiptLimit: 2 });
+  tracker.record(41, "oldest");
+  tracker.record(42, "middle");
+  tracker.record(43, "newest");
+
+  assert.equal(tracker.markServerResolved(41), undefined);
+  assert.equal(tracker.markServerResolved(42), "middle");
+  assert.equal(tracker.markServerResolved(43), "newest");
+});

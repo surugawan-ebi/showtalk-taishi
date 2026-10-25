@@ -652,7 +652,7 @@ test("passes cwd, model, effort, permission mode, tools, MCP server, and system 
   const { adapter, calls } = adapterWith([simpleTurn as Script], {
     model: "sonnet",
     reasoningEffort: "high",
-    permissionMode: "acceptEdits",
+    permissionMode: "auto",
     allowedTools: ["Read", "Bash(git status:*)"],
     settingSources: ["user"],
     maxTurns: 7,
@@ -676,7 +676,7 @@ test("passes cwd, model, effort, permission mode, tools, MCP server, and system 
   assert.equal(options.cwd, workspace);
   assert.equal(options.model, "sonnet");
   assert.equal(options.effort, "high");
-  assert.equal(options.permissionMode, "acceptEdits");
+  assert.equal(options.permissionMode, "auto");
   assert.deepEqual(options.allowedTools, ["Read", "Bash(git status:*)"]);
   assert.equal(options.allowedTools?.includes("mcp__showtalk_taishi"), false);
   assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);

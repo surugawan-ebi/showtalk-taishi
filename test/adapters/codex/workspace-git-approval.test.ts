@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   captureWorkspaceGitPlan,
+  inspectWorkspaceGitPrepareCompletionNotice,
   validateWorkspaceGitPlanQuestion,
 } from "../../../src/adapters/codex/workspace-git-approval.js";
 
@@ -57,6 +58,35 @@ test("keeps PR-read B distinct from receipt T and reverses both exact approval f
   assert.equal(capture.plan.approvalScope?.expected_base_sha, "7".repeat(40));
   assert.equal(capture.plan.approvalScope?.expected_pull_request_base_sha, "8".repeat(40));
   assert.equal(Object.hasOwn(notification.item.arguments, "expected_pull_request_base_sha"), false);
+});
+
+test("caller-managed base-sync retains distinct B/T bindings and rejects authority drift", () => {
+  const notification = existingPullRequestBaseSyncNotification();
+  const output = notification.item.result.structuredContent;
+  output.status = "prepared";
+  Object.assign(output, { execution_authority: "caller_managed" });
+  for (const key of ["scope", "approval_scope"] as const) {
+    Reflect.set(output[key], "expected_pull_request_base_sha", "8".repeat(40));
+  }
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "existing_pull_request_update");
+  assert.equal(capture?.plan.approvalScope?.expected_base_sha, "7".repeat(40));
+  assert.equal(capture?.plan.approvalScope?.expected_pull_request_base_sha, "8".repeat(40));
+  Object.assign(output, { execution_authority: "human_approval" });
+  assert.throws(() => captureWorkspaceGitPlan(notification), /invalid pending execution authority/u);
+});
+
+test("caller-managed Dependabot merge retains exact evidence and rejects authority drift", () => {
+  const notification = dependencyMergeNotification();
+  const output = notification.item.result.structuredContent;
+  output.status = "prepared";
+  Object.assign(output, { execution_authority: "caller_managed" });
+  const capture = captureWorkspaceGitPlan(notification);
+  assert.equal(capture?.plan.operation, "pull_request_merge");
+  assert.deepEqual(capture?.plan.approvalScope, output.approval_scope);
+  assert.ok(Object.isFrozen(capture?.plan.dependabotMerge));
+  Object.assign(output, { execution_authority: "human_approval" });
+  assert.throws(() => captureWorkspaceGitPlan(notification), /invalid pending execution authority/u);
 });
 
 test("base-merge compatibility rejects missing, malformed, substituted or unknown B fields", () => {
@@ -226,6 +256,42 @@ function publicationNotification() {
     },
   };
 }
+
+test("inspects plan completion delivery without retaining its result", () => {
+  const notification = publicationNotification();
+  assert.deepEqual(inspectWorkspaceGitPrepareCompletionNotice(notification), {
+    itemId: "mcp_1",
+    turnId: "turn_1",
+    recognizedServer: true,
+  });
+  const unknownServer = structuredClone(notification);
+  unknownServer.item.server = "mcp__workspace_git";
+  assert.deepEqual(inspectWorkspaceGitPrepareCompletionNotice(unknownServer), {
+    itemId: "mcp_1",
+    turnId: "turn_1",
+    recognizedServer: false,
+  });
+  const unrelated = structuredClone(notification);
+  unrelated.item.tool = "get_repository_status";
+  assert.equal(inspectWorkspaceGitPrepareCompletionNotice(unrelated), undefined);
+});
+
+test("captures a caller-managed prepared plan and rejects mismatched authority", () => {
+  const notification = publicationNotification();
+  notification.item.result.structuredContent.status = "prepared";
+  Object.assign(notification.item.result.structuredContent, {
+    execution_authority: "caller_managed",
+  });
+  assert.equal(captureWorkspaceGitPlan(notification)?.turnId, "turn_1");
+
+  Object.assign(notification.item.result.structuredContent, {
+    execution_authority: "human_approval",
+  });
+  assert.throws(
+    () => captureWorkspaceGitPlan(notification),
+    /invalid pending execution authority/u,
+  );
+});
 
 function repositorySettingsNotification() {
   return {

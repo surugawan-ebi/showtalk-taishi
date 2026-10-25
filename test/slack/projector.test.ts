@@ -1374,7 +1374,7 @@ test("terminalizes a Git approval card resolved by another App Server client", a
   });
 
   const terminal = updates.at(-1);
-  assert.match(String(terminal?.text), /別のCodexクライアント/u);
+  assert.match(String(terminal?.text), /App Server側で終了しました/u);
   assert.doesNotMatch(
     JSON.stringify(terminal?.blocks),
     /承認して実行|拒否・保留|"type":"button"/u,

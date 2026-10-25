@@ -20,6 +20,18 @@ export type UserInputDeliveryObservation<T> = {
   >;
 };
 
+const DEFAULT_RECEIPT_TTL_MS = 5 * 60 * 1_000;
+const DEFAULT_RECEIPT_LIMIT = 1_024;
+
+export interface UserInputDeliveryTrackerOptions {
+  /** Correlation window measured from the successful response write attempt. */
+  readonly receiptTtlMs?: number;
+  /** Hard cap across all still-correlatable response receipts. */
+  readonly receiptLimit?: number;
+  /** Test seam for deterministic expiry checks. */
+  readonly now?: () => number;
+}
+
 /**
  * Keeps only short-lived, opaque correlation receipts for structured-input
  * responses. Raw stderr, prompts, answers, and RPC payloads never leave this
@@ -29,18 +41,50 @@ export class UserInputDeliveryTracker<T> {
   readonly #receipts = new Map<string, {
     readonly rpcId: RpcId;
     readonly receipt: T;
+    readonly expiresAt: number;
   }>();
+  readonly #receiptTtlMs: number;
+  readonly #receiptLimit: number;
+  readonly #now: () => number;
   #stderrRemainder = "";
 
+  constructor(options: UserInputDeliveryTrackerOptions = {}) {
+    this.#receiptTtlMs = options.receiptTtlMs ?? DEFAULT_RECEIPT_TTL_MS;
+    this.#receiptLimit = options.receiptLimit ?? DEFAULT_RECEIPT_LIMIT;
+    this.#now = options.now ?? Date.now;
+    if (
+      !Number.isSafeInteger(this.#receiptTtlMs) ||
+      this.#receiptTtlMs < 1 ||
+      !Number.isSafeInteger(this.#receiptLimit) ||
+      this.#receiptLimit < 1
+    ) {
+      throw new TypeError(
+        "Structured-input delivery receipt bounds must be positive integers",
+      );
+    }
+  }
+
   record(rpcId: RpcId, receipt: T): void {
+    const now = this.#now();
+    this.#pruneExpired(now);
     const key = rpcKey(rpcId);
     if (this.#receipts.has(key)) {
       throw new Error("Structured-input delivery receipt already exists");
     }
-    this.#receipts.set(key, { rpcId, receipt });
+    this.#receipts.set(key, {
+      rpcId,
+      receipt,
+      expiresAt: now + this.#receiptTtlMs,
+    });
+    while (this.#receipts.size > this.#receiptLimit) {
+      const oldest = this.#receipts.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#receipts.delete(oldest);
+    }
   }
 
   markServerResolved(rpcId: RpcId): T | undefined {
+    this.#pruneExpired(this.#now());
     return this.#receipts.get(rpcKey(rpcId))?.receipt;
   }
 
@@ -52,12 +96,14 @@ export class UserInputDeliveryTracker<T> {
   }
 
   removeWhere(predicate: (receipt: T) => boolean): void {
+    this.#pruneExpired(this.#now());
     for (const [key, current] of this.#receipts) {
       if (predicate(current.receipt)) this.#receipts.delete(key);
     }
   }
 
   observeStderr(chunk: string): readonly UserInputDeliveryObservation<T>[] {
+    this.#pruneExpired(this.#now());
     if (chunk.length === 0) return [];
     const bounded = `${this.#stderrRemainder}${chunk}`.slice(-16_384);
     const lines = bounded.split(/\r?\n/u);
@@ -82,6 +128,12 @@ export class UserInputDeliveryTracker<T> {
     );
     if (explicitlyMatched.length === 1) return explicitlyMatched[0];
     return undefined;
+  }
+
+  #pruneExpired(now: number): void {
+    for (const [key, current] of this.#receipts) {
+      if (current.expiresAt <= now) this.#receipts.delete(key);
+    }
   }
 }
 

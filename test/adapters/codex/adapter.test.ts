@@ -65,6 +65,7 @@ class FakeAppServer implements CodexAppServer {
     id: RpcId;
     response: ToolRequestUserInputResponse;
   }> = [];
+  readonly drainedUserInputResponses: RpcId[] = [];
   readonly mcpElicitationResponses: Array<{
     id: RpcId;
     response: McpServerElicitationResponse;
@@ -279,6 +280,14 @@ class FakeAppServer implements CodexAppServer {
       throw this.userInputResponseError;
     }
     this.userInputResponses.push({ id, response });
+  }
+
+  async respondToUserInputAndDrain(
+    id: RpcId,
+    response: ToolRequestUserInputResponse,
+  ): Promise<void> {
+    this.respondToUserInput(id, response);
+    this.drainedUserInputResponses.push(id);
   }
 
   respondToMcpServerElicitation(
@@ -531,6 +540,8 @@ function notifyPublicationPlan(
     readonly planHash?: string;
     readonly expiresAt?: string;
     readonly environment?: string;
+    readonly status?: "awaiting_human_approval" | "prepared";
+    readonly executionAuthority?: "human_approval" | "caller_managed";
   } = {},
 ): void {
   const itemId = overrides.itemId ?? "mcp-plan-1";
@@ -576,7 +587,10 @@ function notifyPublicationPlan(
       status: "completed",
       result: {
         structuredContent: {
-          status: "awaiting_human_approval",
+          status: overrides.status ?? "awaiting_human_approval",
+          ...(overrides.executionAuthority === undefined
+            ? {}
+            : { execution_authority: overrides.executionAuthority }),
           operation_id:
             overrides.operationId ?? "11111111-1111-4111-8111-111111111111",
           approval_expires_at:
@@ -3435,6 +3449,7 @@ test("bridges ordinary structured choices without projecting Git recovery", asyn
       },
     },
   ]);
+  assert.deepEqual(server.drainedUserInputResponses, [90]);
   assert.equal(
     events.filter((event) => event.type === "choice.answer_dispatched").length,
     1,
@@ -4562,7 +4577,7 @@ test("keeps a reserved external-action request in the Git binding grace", async 
     params: externalActionQuestion(),
   });
   notifyPublicationPlan(server);
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 55));
   server.notify("turn/completed", {
     threadId: "thr_1",
     turn: { id: "turn_1", status: "completed" },
@@ -5133,7 +5148,11 @@ test("terminates a malformed Git-looking approval without offering recovery", as
 
 test("rejects structured input that is not bound to one exact workspace-git plan", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 10,
+    interactionAudit: (event) => audit.push(event),
+  });
   const consuming = (async () => {
     for await (const event of adapter.sendMessage(
       { id: "thr_1" },
@@ -5156,9 +5175,86 @@ test("rejects structured input that is not bound to one exact workspace-git plan
     /REPREPARE_REQUIRED.*Do not call request_user_input again.*End this turn.*new explicit Git request.*Only in that new turn.*plan operation/u,
   );
   assert.equal(recovery?.type, "git_approval.reprepare_required");
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_binding_failed" &&
+    event.outcome === "plan_not_received" &&
+    event.rpcId === 8
+  ));
 });
 
-test("bridges one exact workspace-git publication choice to the same App Server request", async () => {
+test("audits a prepare notification delivered for a different turn", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 15,
+    interactionAudit: (event) => audit.push(event),
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Audit cross-turn plan delivery", source: { type: "human" } },
+    )) {
+      if (event.type === "git_approval.reprepare_required") return;
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 801,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestionForTurn("turn_1"),
+  });
+  notifyPublicationPlan(server, { itemId: "mcp-plan-other-turn", turnId: "turn_2" });
+  await consuming;
+
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_notification_received" &&
+    event.outcome === "plan_notification_received_different_turn" &&
+    event.turnId === "turn_2"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_binding_failed" &&
+    event.outcome === "plan_received_different_turn" &&
+    event.rpcId === 801
+  ));
+});
+
+test("audits a same-turn prepare plan that expired before binding", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 15,
+    interactionAudit: (event) => audit.push(event),
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Audit expired plan delivery", source: { type: "human" } },
+    )) {
+      if (event.type === "git_approval.reprepare_required") return;
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 802,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestionForTurn("turn_1"),
+  });
+  notifyPublicationPlan(server, {
+    itemId: "mcp-plan-expired",
+    expiresAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  await consuming;
+
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_binding_failed" &&
+    event.outcome === "plan_expired_before_binding" &&
+    event.turnId === "turn_1"
+  ));
+});
+
+test("binds a Git approval when its exact plan arrives before structured input", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server);
   const session = { id: "thr_1" };
@@ -5207,6 +5303,7 @@ test("bridges one exact workspace-git publication choice to the same App Server 
       },
     },
   ]);
+  assert.deepEqual(server.drainedUserInputResponses, [81]);
 
   server.notify("turn/completed", {
     threadId: "thr_1",
@@ -5219,6 +5316,201 @@ test("bridges one exact workspace-git publication choice to the same App Server 
   });
   await consuming;
   assert.equal(server.turnStarts.length, 1);
+});
+
+test("registers a same-turn plan before turn acknowledgement and binds the deferred input", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  let releaseTurnStart!: () => void;
+  const turnStartGate = new Promise<void>((resolve) => {
+    releaseTurnStart = resolve;
+  });
+  server.startTurnBehavior = async () => {
+    await turnStartGate;
+    return { id: "turn_1", status: "inProgress" };
+  };
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 10,
+    interactionAudit: (event) => audit.push(event),
+  });
+  const session = { id: "thr_1" };
+  let releaseRequest!: (
+    event: Extract<AgentEvent, { type: "user_input.requested" }>,
+  ) => void;
+  const requestReady = new Promise<
+    Extract<AgentEvent, { type: "user_input.requested" }>
+  >((resolve) => {
+    releaseRequest = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Publish after the exact plan is captured",
+      source: { type: "human" },
+    })) {
+      if (event.type === "user_input.requested") releaseRequest(event);
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server, { itemId: "mcp-plan-before-turn-bind" });
+  server.request({
+    id: 811,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestionForTurn("turn_1"),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  const notificationIndex = audit.findIndex((event) =>
+    event.event === "workspace_git.plan_notification_received" &&
+    event.outcome === "plan_notification_received_same_turn"
+  );
+  const registrationIndex = audit.findIndex((event) =>
+    event.event === "workspace_git.plan_registered" &&
+    event.outcome === "plan_registered_same_turn"
+  );
+  const turnBoundIndex = audit.findIndex((event) =>
+    event.event === "turn_start.bound"
+  );
+  assert.ok(notificationIndex >= 0);
+  assert.ok(registrationIndex > notificationIndex);
+  assert.equal(turnBoundIndex, -1);
+  assert.deepEqual(server.errorResponses, []);
+
+  releaseTurnStart();
+  const requested = await requestReady;
+  assert.equal(
+    requested.plan.operationId,
+    "11111111-1111-4111-8111-111111111111",
+  );
+  assert.equal(audit.some((event) =>
+    event.event === "workspace_git.plan_binding_failed" &&
+    event.outcome === "plan_not_received" &&
+    event.rpcId === 811
+  ), false);
+
+  await adapter.respondToUserInput(session, {
+    requestId: requested.requestId,
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.deepEqual(server.userInputResponses, [{
+    id: 811,
+    response: {
+      answers: { git_approval: { answers: ["拒否・保留"] } },
+    },
+  }]);
+});
+
+test("registers a caller-managed prepared plan in the same turn", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    interactionAudit: (event) => audit.push(event),
+  });
+  const session = { id: "thr_1" };
+  let releaseRequest!: (
+    event: Extract<AgentEvent, { type: "user_input.requested" }>,
+  ) => void;
+  const requestReady = new Promise<
+    Extract<AgentEvent, { type: "user_input.requested" }>
+  >((resolve) => {
+    releaseRequest = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Bind caller-managed prepared plan",
+      source: { type: "human" },
+    })) {
+      if (event.type === "user_input.requested") releaseRequest(event);
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server, {
+    status: "prepared",
+    executionAuthority: "caller_managed",
+  });
+  server.request({
+    id: 812,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestionForTurn("turn_1"),
+  });
+
+  const requested = await requestReady;
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_registered" &&
+    event.outcome === "plan_registered_same_turn"
+  ));
+  await adapter.respondToUserInput(session, {
+    requestId: requested.requestId,
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+});
+
+test("tracks a Git approval receiver drop after the answer is dispatched", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    interactionAudit: (event) => audit.push(event),
+  });
+  const events: AgentEvent[] = [];
+  let requested!: Extract<AgentEvent, { type: "user_input.requested" }>;
+  let releaseRequest!: () => void;
+  const requestReady = new Promise<void>((resolve) => {
+    releaseRequest = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(
+      { id: "thr_1" },
+      { text: "Track Git approval delivery", source: { type: "human" } },
+    )) {
+      events.push(event);
+      if (event.type === "user_input.requested") {
+        requested = event;
+        releaseRequest();
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  notifyPublicationPlan(server);
+  server.request({
+    id: 82,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestion(),
+  });
+  await requestReady;
+  await adapter.respondToUserInput({ id: "thr_1" }, {
+    requestId: requested.requestId,
+    optionId: "approve",
+  });
+  server.emitStderr("could not notify callback for 82: receiver dropped\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.deepEqual(server.drainedUserInputResponses, [82]);
+  assert.ok(events.some((event) =>
+    event.type === "git_approval.delivery_failed" &&
+    event.reason === "response_receiver_dropped"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.answer_dispatch_failed" &&
+    event.outcome === "response_receiver_dropped"
+  ));
 });
 
 test("returns a fresh Git approval answer after a previous turn was rejected", async () => {
@@ -5930,7 +6222,10 @@ test("projects and completes an exact GitHub repository settings approval", asyn
 
 test("continues one bounded turn when an approved Git plan was not executed", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server);
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    interactionAudit: (event) => audit.push(event),
+  });
   const session = { id: "thr_1" };
   let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
   let releaseRequest!: () => void;
@@ -5996,6 +6291,17 @@ test("continues one bounded turn when an approved Git plan was not executed", as
     requested?.plan,
   );
 
+  server.notify("serverRequest/resolved", {
+    threadId: "thr_1",
+    requestId: 94,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(audit.some((event) =>
+    event.event === "structured_input.request_terminalized" &&
+    event.rpcId === 94 &&
+    event.outcome === "resolved_after_dispatch"
+  ));
+
   server.notify("turn/completed", {
     threadId: "thr_1",
     turnId: "turn_2",
@@ -6007,6 +6313,10 @@ test("continues one bounded turn when an approved Git plan was not executed", as
     },
   });
   const events = await consuming;
+  assert.ok(events.some((event) =>
+    event.type === "git_approval.server_request_resolved" &&
+    event.requestId === requested?.requestId
+  ));
   assert.equal(
     events.some(
       (event) => event.type === "error" &&
@@ -6530,9 +6840,9 @@ test("bridges an exact initial push plan instead of projecting recovery", async 
   ]);
 });
 
-test("waits briefly when structured input arrives before its same-turn Git plan", async () => {
+test("binds a Git approval when structured input arrives before its same-turn plan", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server);
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 20 });
   const session = { id: "thr_1" };
   let requested: Extract<AgentEvent, { type: "user_input.requested" }> | undefined;
   let releaseRequest!: () => void;
@@ -6583,6 +6893,75 @@ test("waits briefly when structured input arrives before its same-turn Git plan"
       },
     },
   ]);
+});
+
+test("binds a delayed same-turn Git plan that arrives within the grace window", async () => {
+  const server = new FakeAppServer();
+  const audit: InteractionAuditInput[] = [];
+  const adapter = new CodexAdapter(server, {
+    gitPlanBindingGraceMs: 80,
+    interactionAudit: (event) => audit.push(event),
+  });
+  const session = { id: "thr_1" };
+  let approvalProjected = false;
+  let releaseRequest!: (
+    event: Extract<AgentEvent, { type: "user_input.requested" }>,
+  ) => void;
+  const requestReady = new Promise<
+    Extract<AgentEvent, { type: "user_input.requested" }>
+  >((resolve) => {
+    releaseRequest = resolve;
+  });
+  const consuming = (async () => {
+    for await (const event of adapter.sendMessage(session, {
+      text: "Publish after delayed plan delivery",
+      source: { type: "human" },
+    })) {
+      if (event.type === "user_input.requested") {
+        approvalProjected = true;
+        releaseRequest(event);
+      }
+    }
+  })();
+
+  await new Promise((resolve) => setImmediate(resolve));
+  server.request({
+    id: 841,
+    method: "item/tool/requestUserInput",
+    params: workspaceGitQuestionForTurn("turn_1"),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(approvalProjected, false);
+  assert.deepEqual(server.errorResponses, []);
+
+  notifyPublicationPlan(server);
+  const requested = await requestReady;
+  assert.equal(requested.plan.operationId, "11111111-1111-4111-8111-111111111111");
+  await adapter.respondToUserInput(session, {
+    requestId: requested.requestId,
+    optionId: "reject",
+  });
+  server.notify("turn/completed", {
+    threadId: "thr_1",
+    turn: { id: "turn_1", status: "completed" },
+  });
+  await consuming;
+
+  assert.deepEqual(server.errorResponses, []);
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_notification_received" &&
+    event.outcome === "plan_notification_received_same_turn"
+  ));
+  assert.ok(audit.some((event) =>
+    event.event === "workspace_git.plan_registered" &&
+    event.outcome === "plan_registered_same_turn"
+  ));
+  assert.deepEqual(server.userInputResponses, [{
+    id: 841,
+    response: {
+      answers: { git_approval: { answers: ["拒否・保留"] } },
+    },
+  }]);
 });
 
 test("durably closes a late Git plan after its waiting request was resolved externally", async () => {
@@ -6724,7 +7103,7 @@ test("durably closes every delayed plan after one waiting request was resolved e
   assert.deepEqual(server.errorResponses, []);
 });
 
-test("does not bind a structured request to a Git plan from another turn", async () => {
+test("rejects a Git approval when only a different-turn plan arrives within grace", async () => {
   const server = new FakeAppServer();
   const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 10 });
   const eventsPromise = collectEvents(
@@ -6800,7 +7179,7 @@ test("fails closed when two different Git plans precede one structured question"
 
 test("fails closed when two Git plans race an early structured request", async () => {
   const server = new FakeAppServer();
-  const adapter = new CodexAdapter(server);
+  const adapter = new CodexAdapter(server, { gitPlanBindingGraceMs: 30 });
   const eventsPromise = collectEvents(
     adapter.sendMessage(
       { id: "thr_1" },
@@ -6819,7 +7198,7 @@ test("fails closed when two Git plans race an early structured request", async (
     operationId: "22222222-2222-4222-8222-222222222222",
     planHash: "d".repeat(64),
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 35));
   server.notify("turn/completed", {
     threadId: "thr_1",
     turn: { id: "turn_1", status: "completed" },

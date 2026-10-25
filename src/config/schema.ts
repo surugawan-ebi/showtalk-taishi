@@ -264,7 +264,9 @@ const claudeAdapterSchema = z
     command: z.string().min(1).optional(),
     model: modelIdSchema.optional(),
     reasoning_effort: claudeReasoningEffortSchema.optional(),
-    permission_mode: z.enum(["default", "acceptEdits", "plan"]).default("default"),
+    permission_mode: z
+      .enum(["default", "acceptEdits", "auto", "plan"])
+      .default("default"),
     allowed_tools: z.array(claudeToolRuleSchema).max(128).default([]),
     setting_sources: z
       .array(z.enum(["user", "project", "local"]))

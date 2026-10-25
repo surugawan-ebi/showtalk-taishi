@@ -32,6 +32,29 @@ export function isWorkspaceGitHumanDecisionBrokerError(
   return value instanceof WorkspaceGitHumanDecisionBrokerError;
 }
 
+export type WorkspaceGitHumanDecisionAuditOutcome =
+  | "decision_context_missing"
+  | "broker_transport_failed"
+  | "broker_status_conflict"
+  | "broker_persist_failed"
+  | "broker_applied"
+  | "broker_result_unknown";
+
+/** Fixed, payload-free classification for failures before App Server dispatch. */
+export function classifyWorkspaceGitHumanDecisionFailure(
+  error: unknown,
+): Exclude<
+  WorkspaceGitHumanDecisionAuditOutcome,
+  "decision_context_missing" | "broker_applied"
+> {
+  if (!isWorkspaceGitHumanDecisionBrokerError(error)) {
+    return "broker_transport_failed";
+  }
+  if (error.code === "decision_outcome_unknown") return "broker_result_unknown";
+  if (error.code === "status_conflict") return "broker_status_conflict";
+  return "broker_persist_failed";
+}
+
 export interface WorkspaceGitHumanDecisionContext {
   readonly callerId: string;
   readonly koeId: string;
