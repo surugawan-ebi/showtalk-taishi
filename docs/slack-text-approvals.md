@@ -70,8 +70,15 @@ active ID is rejected. The registry is not restored across Gateway restarts.
 Unknown, expired, malformed, or unsupported command attempts do not become new
 coding-agent turns.
 
-For an external-action confirmation, the original requester restriction still
-applies as well as membership in the configured approver list.
+For an external-action confirmation from a direct human or verified connector,
+the original requester restriction still applies as well as membership in the
+configured approver list. For an explicitly trusted bot tuple, the request
+origin remains that bot for audit, while the responder is the tuple's explicit
+`external_action_responder_user_id`. That ID must name one configured human
+approver and must differ from the bot-side user ID. If it is absent or invalid,
+no actionable external-action card is displayed. Neither buttons nor text
+commands may be answered by the bot, another approver, a display-name match, or
+an identity claimed in message content.
 
 ## Supported decisions
 

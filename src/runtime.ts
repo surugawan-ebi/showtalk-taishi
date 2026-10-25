@@ -563,6 +563,12 @@ async function createLockedRuntime(
           workspaceId: source.workspace_id,
           userId: source.user_id,
           botId: source.bot_id,
+          ...(source.external_action_responder_user_id === undefined
+            ? {}
+            : {
+                externalActionResponderUserId:
+                  source.external_action_responder_user_id,
+              }),
         }),
       ),
       agentChannelIds: Object.values(config.agents).map(

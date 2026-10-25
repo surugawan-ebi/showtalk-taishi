@@ -84,6 +84,7 @@ test("loads an explicit trusted bot message source separately from approvers", a
       "    - workspace_id: TTESTWORKSPACE\n" +
       "      user_id: UTESTBOTUSER\n" +
       "      bot_id: BTESTBOTID\n" +
+      "      external_action_responder_user_id: U123\n" +
       "  approver_user_ids:",
     ),
   );
@@ -97,8 +98,41 @@ test("loads an explicit trusted bot message source separately from approvers", a
     workspace_id: "TTESTWORKSPACE",
     user_id: "UTESTBOTUSER",
     bot_id: "BTESTBOTID",
+    external_action_responder_user_id: "U123",
   }]);
   assert.deepEqual(config.slack.approver_user_ids, ["U123"]);
+});
+
+test("trusted bot external-action responder must be a distinct configured approver", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "taishi-config-"));
+  const path = join(directory, "config.yaml");
+  const configuredSource = (responder: string) => source.replace(
+    "  approver_user_ids:",
+    "  trusted_bot_message_sources:\n" +
+    "    - workspace_id: TTESTWORKSPACE\n" +
+    "      user_id: UTESTBOTUSER\n" +
+    "      bot_id: BTESTBOTID\n" +
+    `      external_action_responder_user_id: ${responder}\n` +
+    "  approver_user_ids:",
+  );
+  const environment = {
+    STATE_FILE: "/tmp/state.json",
+    APP_TOKEN: "xapp-test",
+    BOT_TOKEN: "xoxb-test",
+    WORKSPACE: "/tmp/project",
+  };
+
+  await writeFile(path, configuredSource("UTESTBOTUSER"));
+  await assert.rejects(
+    () => loadConfig(path, environment),
+    /must differ from the bot user/u,
+  );
+
+  await writeFile(path, configuredSource("UNOTAPPROVER"));
+  await assert.rejects(
+    () => loadConfig(path, environment),
+    /must be a configured Slack approver/u,
+  );
 });
 
 test("rejects duplicate or malformed trusted bot message sources", async () => {
